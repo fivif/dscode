@@ -77,7 +77,7 @@ class DeepSeekClient:
             d: dict[str, Any] = {"role": m.role}
             if m.content is not None:
                 d["content"] = m.content
-            if m.name is not None:
+            if m.name is not None and m.role == "user":
                 d["name"] = m.name
             if m.tool_call_id is not None:
                 d["tool_call_id"] = m.tool_call_id

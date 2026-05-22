@@ -1,59 +1,49 @@
-"""Textual TUI 入口（基础占位版）。
+"""Textual TUI    --          
 
-v1 设计：
-- 三区布局：左侧 magi 轮次树（占位 Static）+ 中央 RichLog（事件流）+ 底部状态栏。
-- statusline 每 2 秒从 `.dscode/telemetry.json` 读一次，实时显示缓存命中率/已节省。
-- 通过 `stream_events(...)` 订阅 Forge yield 的 StreamEvent，渲染到中央面板。
-- v2 计划：把左侧换成 textual.widgets.Tree，加进度条与轮次切换。
+  :
+-    Header
+-    :  70% ChatPanel +   30% ActivityPanel
+-    Input     + StatusBar    
+
+   :Input   ChatSession.send()   AsyncGenerator[SessionEvent]   widgets
 """
 from __future__ import annotations
 
-import json
-from collections.abc import AsyncIterable
+import asyncio
 from pathlib import Path
 from typing import ClassVar
 
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal
+from textual.containers import Container
 from textual.reactive import reactive
-from textual.widgets import Footer, Header, RichLog, Static
+from textual.widgets import Header, Input
 
-from dscode.core.types import StreamEvent, StreamEventType
+from dscode.tui.chat import ChatPanel
+from dscode.tui.activity import ActivityPanel
+from dscode.tui.status import StatusBar
+from dscode.tui.events import SessionEventType
+try:
+    from dscode.tui.session import ChatSession  # noqa: F811
+except ImportError:
+    ChatSession = None  # type: ignore[assignment]
 
 
 class DSCodeApp(App[None]):
-    """DS Code 基础 TUI。
+    """DS Code     TUI 
 
-    3 区布局：左侧 magi 轮次树 + 中央流式事件 + 底部状态栏。
-    v1 简化：只做事件流 + 状态栏，左侧树留占位。
+         +     +     
+       ChatSession     SessionEvent   
     """
 
-    CSS = """
-    Screen {
-        layout: vertical;
-    }
-    #main {
-        height: 1fr;
-    }
-    #side-tree {
-        width: 28;
-        border: solid grey;
-        padding: 1 1;
-    }
-    #event-log {
-        border: solid grey;
-        padding: 0 1;
-    }
-    #statusbar {
-        height: 1;
-        background: $boost;
-        color: $text;
-    }
-    """
+    CSS_PATH: ClassVar[str | Path] = "dscode.tcss"
 
-    BINDINGS: ClassVar[list] = []
+    BINDINGS: ClassVar[list] = [
+        ("ctrl+c", "interrupt", "Stop"),
+        ("ctrl+l", "clear", "Clear"),
+        ("ctrl+d", "quit", "Quit"),
+    ]
 
-    # 实时统计（reactive，绑定到状态栏）
+    #     (reactive     watcher   
     cache_hit_rate: reactive[float] = reactive(0.0)
     saved_cny: reactive[float] = reactive(0.0)
     call_count: reactive[int] = reactive(0)
@@ -63,136 +53,207 @@ class DSCodeApp(App[None]):
     def __init__(
         self,
         project_root: Path,
+        model: str | None = None,
         telemetry_path: Path | None = None,
-        refresh_interval: float = 2.0,
     ) -> None:
         super().__init__()
-        self.project_root = project_root
+        self.project_root = Path(project_root)
+        self.model = model
         self.telemetry_path = telemetry_path or (
             project_root / ".dscode" / "telemetry.json"
         )
-        self.refresh_interval = refresh_interval
-        self._log: RichLog | None = None
-        self._status: Static | None = None
+        self._chat: ChatPanel | None = None
+        self._activity: ActivityPanel | None = None
+        self._status: StatusBar | None = None
+        self._input: Input | None = None
+        self._session: ChatSession | None = None
+        self._process_task: asyncio.Task | None = None
 
-    # ------------------------------------------------------------
-    # 布局
-    # ------------------------------------------------------------
+    # ------------------------------------------------------------------
+    #   
+    # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Container(id="main"):
-            with Horizontal():
-                yield Static("MAGI 轮次\n(待执行)", id="side-tree")
-                yield RichLog(highlight=True, markup=True, id="event-log")
-        yield Static("[ready]", id="statusbar")
-        yield Footer()
+            yield ChatPanel(id="chat")
+            yield ActivityPanel(id="activity")
+        yield Input(placeholder="Type a message... (Ctrl+D quit, Ctrl+L clear)", id="input")
+        yield StatusBar(id="status")
 
     def on_mount(self) -> None:
-        self._log = self.query_one("#event-log", RichLog)
-        self._status = self.query_one("#statusbar", Static)
-        self._log.write(f"[dim]project_root={self.project_root}[/dim]")
-        self._log.write("[bold cyan]DS Code TUI ready.[/bold cyan]")
-        # 立即刷新一次 + 周期刷新
-        self.refresh_telemetry()
-        self.set_interval(self.refresh_interval, self.refresh_telemetry)
-        self._render_status()
+        self._chat = self.query_one("#chat", ChatPanel)
+        self._activity = self.query_one("#activity", ActivityPanel)
+        self._status = self.query_one("#status", StatusBar)
+        self._input = self.query_one("#input", Input)
 
-    # ------------------------------------------------------------
-    # Telemetry 刷新
-    # ------------------------------------------------------------
-
-    def refresh_telemetry(self) -> None:
-        """从 telemetry.json 读取最新缓存命中数据。
-
-        文件不存在或读取失败时静默忽略（保持上一次的值）。
-        """
+        #      
         try:
-            data = json.loads(self.telemetry_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, ValueError):
+            self._session = ChatSession(self.project_root, self.model)
+        except Exception:
+            self._session = None
+
+        #        
+        self._status.render_status()
+
+        #      +     
+        self._refresh_telemetry()
+        self.set_interval(2.0, self._refresh_telemetry)
+
+        #     
+        self._chat.add_system("DS Code interactive mode started")
+        self._chat.add_system("Type /help for command list")
+
+        #      
+        if self._input is not None:
+            self._input.focus()
+
+    # ------------------------------------------------------------------
+    #     
+    # ------------------------------------------------------------------
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """       """
+        if self._input is None or self._chat is None:
+            return
+        text = event.value.strip()
+        if not text:
+            return
+
+        self._input.clear()
+
+        #     
+        if text.startswith("/"):
+            self._handle_command(text)
+            return
+
+        #     
+        self._chat.add_user_message(text)
+
+        if self._session is not None:
+            self._process_task = asyncio.create_task(self._process(text))
+
+    def _handle_command(self, text: str) -> None:
+        """   /         """
+        if self._chat is None:
+            return
+        cmd = text.lower()
+        if cmd in ("/help", "/?"):
+            self._chat.add_system("Commands:")
+            self._chat.add_system("  /help   - Show help")
+            self._chat.add_system("  /clear  - Clear chat")
+            self._chat.add_system("  /quit   - Quit TUI")
+            self._chat.add_system("  Ctrl+C  - Interrupt")
+            self._chat.add_system("  Ctrl+L  - Clear screen")
+            self._chat.add_system("  Ctrl+D  - Quit")
+        elif cmd == "/clear":
+            self.action_clear()
+        elif cmd == "/quit":
+            self.action_quit()
+        else:
+            self._chat.add_system(f"Unknown command: {text}, type /help for help")
+
+    async def _process(self, text: str) -> None:
+        """            ChatSession     """
+        if self._session is None:
+            self._chat.add_system("[red]Session not initialized[/]")
             return
         try:
-            self.cache_hit_rate = float(data.get("hit_rate") or 0.0)
-            self.saved_cny = float(data.get("total_saved_cny") or 0.0)
-            self.call_count = int(data.get("call_count") or 0)
-        except (TypeError, ValueError):
-            return
-        self._render_status()
+            async for evt in self._session.send(text):
+                self._dispatch_event(evt)
+        except asyncio.CancelledError:
+            self._chat.add_system("Interrupted")
+        except Exception as e:
+            if self._chat is not None:
+                self._chat.add_system(f"[red]Error: {e}[/]")
+        finally:
+            if self._chat is not None:
+                self._chat.add_assistant_end()
 
-    def update_phase(self, round_number: int, phase: str) -> None:
-        """外部把当前 MAGI 轮次/阶段推到状态栏。"""
-        self.current_round = round_number
-        self.current_phase = phase
-        self._render_status()
+    # ------------------------------------------------------------------
+    #     
+    # ------------------------------------------------------------------
 
-    def _render_status(self) -> None:
-        if self._status is None:
-            return
-        hit_pct = self.cache_hit_rate * 100
-        round_label = (
-            f"R{self.current_round}" if self.current_round > 0 else "—"
-        )
-        line = (
-            f"\\[ {round_label} | phase={self.current_phase} | "
-            f"cache={hit_pct:.1f}% | saved=¥{self.saved_cny:.2f} | "
-            f"calls={self.call_count} \\]"
-        )
-        self._status.update(line)
+    def _dispatch_event(self, evt) -> None:
+        """            widget """
+        etype = evt.type
+        data = evt.data
 
-    # ------------------------------------------------------------
-    # 事件流
-    # ------------------------------------------------------------
+        if etype == SessionEventType.CHAT_STREAM:
+            if self._chat is not None:
+                self._chat.add_assistant_stream(data.get("content", ""))
+        elif etype == SessionEventType.CHAT_CHUNK:
+            if self._chat is not None:
+                self._chat.add_assistant_end()
+        elif etype == SessionEventType.TOOL_START:
+            if self._activity is not None:
+                self._activity.add_tool_start(
+                    data.get("tool_name", ""),
+                    data.get("args", ""),
+                )
+        elif etype == SessionEventType.TOOL_END:
+            if self._activity is not None:
+                self._activity.add_tool_end(
+                    data.get("tool_name", ""),
+                    status=data.get("status", "success"),
+                    result=data.get("result", ""),
+                    elapsed_ms=data.get("elapsed_ms", 0),
+                )
+        elif etype == SessionEventType.PHASE_CHANGE:
+            if self._activity is not None:
+                self._activity.add_phase_change(
+                    phase=data.get("phase", ""),
+                    round_num=data.get("round_num", 0),
+                    summary=data.get("summary", ""),
+                )
+        elif etype == SessionEventType.STATUS_UPDATE:
+            if self._status is not None:
+                self._status.render_status(
+                    model=data.get("model", ""),
+                    cache_hit_rate=data.get("cache_hit_rate", 0.0),
+                    cost_saved=data.get("cost_saved", 0.0),
+                    round_num=data.get("round_num", 0),
+                    phase=data.get("phase", "idle"),
+                    call_count=data.get("call_count", 0),
+                )
+        elif etype == SessionEventType.SYSTEM:
+            if self._chat is not None:
+                self._chat.add_system(data.get("content", ""))
+        elif etype == SessionEventType.INTERRUPTED:
+            if self._chat is not None:
+                self._chat.add_system("Task interrupted")
 
-    async def stream_events(self, events: AsyncIterable[StreamEvent]) -> None:
-        """订阅 Forge stream events，渲染到中央面板。"""
-        async for event in events:
-            self.render_event(event)
+        #      UI
+        self.refresh()
 
-    def render_event(self, event: StreamEvent) -> None:
-        """单条 StreamEvent → 富文本行。"""
-        if self._log is None:
-            return
-        color = _COLOR_BY_TYPE.get(event.type, "white")
-        line = f"[{color}][{event.type.value}][/{color}] {_short_payload(event)}"
-        self._log.write(line)
-        # 同时刷新一次状态栏（事件触发的轻量刷新）
-        self.refresh_telemetry()
+    # ------------------------------------------------------------------
+    # Key Bindings
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------
-    # 工具方法
-    # ------------------------------------------------------------
+    def action_interrupt(self) -> None:
+        """Ctrl+C:         """
+        if self._process_task is not None and not self._process_task.done():
+            self._process_task.cancel()
+            if self._chat is not None:
+                self._chat.add_system("User interrupted")
 
-    def log_line(self, text: str) -> None:
-        """外部直接打印一行（测试 / 调试用）。"""
-        if self._log is not None:
-            self._log.write(text)
+    def action_clear(self) -> None:
+        """Ctrl+L:       """
+        if self._chat is not None:
+            self._chat.clear()
 
+    def action_quit(self) -> None:
+        """Ctrl+D:   TUI """
+        self.exit()
 
-_COLOR_BY_TYPE: dict[StreamEventType, str] = {
-    StreamEventType.THOUGHT: "white",
-    StreamEventType.TOOL_START: "cyan",
-    StreamEventType.TOOL_RESULT: "green",
-    StreamEventType.SAFETY_BLOCK: "yellow",
-    StreamEventType.ERROR: "red",
-    StreamEventType.COMPLETE: "magenta",
-    StreamEventType.USAGE: "blue",
-}
+    # ------------------------------------------------------------------
+    #   
+    # ------------------------------------------------------------------
 
-
-def _short_payload(event: StreamEvent) -> str:
-    data = event.data
-    if not data:
-        return ""
-    # 选若干常用键展示；其余截断
-    parts: list[str] = []
-    for key in ("name", "content", "status", "error", "summary"):
-        val_raw = data.get(key)
-        if val_raw:
-            val = str(val_raw).replace("\n", " ")
-            if len(val) > 120:
-                val = val[:117] + "..."
-            parts.append(f"{key}={val}")
-    return " ".join(parts) if parts else str(data)[:200]
+    def _refresh_telemetry(self) -> None:
+        """  telemetry.json                """
+        if self._status is not None and self.telemetry_path is not None:
+            self._status.refresh_from_file(self.telemetry_path)
 
 
 __all__ = ["DSCodeApp"]

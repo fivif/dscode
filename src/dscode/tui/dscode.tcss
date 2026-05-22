@@ -1,0 +1,65 @@
+/* dscode.tcss -- DS Code TUI     */
+
+Screen {
+    layout: vertical;
+    background: $surface;
+}
+
+/* ----    Header ---- */
+Header {
+    dock: top;
+    height: 1;
+}
+
+/* ----     :chat(70%) | activity(30%) ---- */
+#main {
+    height: 1fr;
+    layout: horizontal;
+}
+
+#chat {
+    width: 7fr;
+    border: solid $primary;
+    padding: 1 1;
+}
+
+#activity {
+    width: 3fr;
+    border: solid $primary;
+    padding: 1 1;
+    border-left: solid $primary;
+}
+
+/* ----      :      3 ---- */
+#input {
+    dock: bottom;
+    height: 3;
+    margin: 0 1;
+}
+
+/* ----    :      1 ---- */
+#status {
+    dock: bottom;
+    height: 1;
+    margin: 0 1;
+}
+
+/* ---- ChatPanel / ActivityPanel       ---- */
+ChatPanel, ActivityPanel {
+    overflow-y: auto;
+    scrollbar-size: 1 0;
+}
+
+/* ---- Input       ---- */
+Input {
+    border: solid $primary-darken-1;
+}
+
+Input:focus {
+    border: solid $accent;
+}
+
+/* ---- Footer   (  StatusBar    ---- */
+Footer {
+    display: none;
+}

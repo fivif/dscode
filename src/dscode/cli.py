@@ -671,7 +671,16 @@ def status(
 def tui(
     project_root: Path = typer.Option(Path.cwd(), "--project-root", "-p"),
 ) -> None:
-    """启动 Textual TUI（基础占位版）。"""
+    """Launch the interactive Textual TUI."""
+    import os
+    import sys
+
+    if sys.stdout.encoding and "utf" not in sys.stdout.encoding.lower():
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr.encoding and "utf" not in sys.stderr.encoding.lower():
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
     from dscode.tui.app import DSCodeApp
 
     DSCodeApp(project_root=project_root.resolve()).run()
