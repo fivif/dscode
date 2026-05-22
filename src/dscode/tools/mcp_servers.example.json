@@ -1,0 +1,26 @@
+{
+    "$schema": "https://github.com/modelcontextprotocol/spec",
+    "_comment": "复制到 ~/.dscode/mcp_servers.json 并按需修改。dscode 启动时会读取并尝试连接每个 server；连接失败的 server 不会阻断主流程。",
+    "servers": [
+        {
+            "name": "filesystem",
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "/tmp"
+            ],
+            "env": {}
+        },
+        {
+            "name": "git",
+            "command": "uvx",
+            "args": [
+                "mcp-server-git",
+                "--repository",
+                "."
+            ],
+            "env": {}
+        }
+    ]
+}

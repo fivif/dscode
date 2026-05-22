@@ -1,0 +1,532 @@
+[
+  {
+    "id": "A1",
+    "category": "project_ops",
+    "title": "给现有 Python 项目添加 logging",
+    "description": "在 app.py 中引入标准 logging 模块：配置 root logger，将关键路径加上 logger.info/debug。保持现有行为不变。",
+    "setup": {
+      "files": [
+        {
+          "path": "app.py",
+          "content": "def add(a, b):\n    return a + b\n\nif __name__ == '__main__':\n    print(add(1, 2))\n"
+        },
+        {
+          "path": "tests/test_app.py",
+          "content": "from app import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["app.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 8000
+  },
+  {
+    "id": "A2",
+    "category": "project_ops",
+    "title": "把 print 全部替换为 logging（保留语义）",
+    "description": "扫描所有 .py，把 print(...) 替换为 logger.info(...)，并在模块顶部初始化 logger = logging.getLogger(__name__)。测试必须仍然通过。",
+    "setup": {
+      "files": [
+        {
+          "path": "service.py",
+          "content": "def greet(name):\n    print(f'Hello {name}')\n    return name\n"
+        },
+        {
+          "path": "tests/test_service.py",
+          "content": "from service import greet\n\ndef test_greet():\n    assert greet('world') == 'world'\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_grep", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["service.py"],
+      "must_not_contain_patterns": ["print\\("]
+    },
+    "token_budget": 8000
+  },
+  {
+    "id": "A3",
+    "category": "project_ops",
+    "title": "给 CLI 工具加 --verbose flag",
+    "description": "在 cli.py 中通过 argparse 添加 --verbose / -v flag。verbose 模式下打印额外日志（用 logging.DEBUG 级别）。",
+    "setup": {
+      "files": [
+        {
+          "path": "cli.py",
+          "content": "import argparse\n\ndef main(argv=None):\n    parser = argparse.ArgumentParser()\n    parser.add_argument('name')\n    args = parser.parse_args(argv)\n    return args.name\n\nif __name__ == '__main__':\n    print(main())\n"
+        },
+        {
+          "path": "tests/test_cli.py",
+          "content": "from cli import main\n\ndef test_basic():\n    assert main(['alice']) == 'alice'\n\ndef test_verbose_flag():\n    assert main(['--verbose', 'bob']) == 'bob'\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["cli.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 8000
+  },
+  {
+    "id": "A4",
+    "category": "project_ops",
+    "title": "从 requirements.txt 迁移到 pyproject.toml",
+    "description": "把 requirements.txt 中的依赖迁移到 pyproject.toml 的 [project].dependencies。保留版本约束，删除 requirements.txt。",
+    "setup": {
+      "files": [
+        {
+          "path": "requirements.txt",
+          "content": "httpx>=0.27\npydantic>=2.8\n"
+        },
+        {
+          "path": "tests/test_pyproject.py",
+          "content": "import tomllib\nfrom pathlib import Path\n\ndef test_has_pyproject():\n    p = Path('pyproject.toml')\n    assert p.exists()\n    data = tomllib.loads(p.read_text())\n    deps = data['project']['dependencies']\n    assert any('httpx' in d for d in deps)\n    assert any('pydantic' in d for d in deps)\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["pyproject.toml"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000
+  },
+  {
+    "id": "A5",
+    "category": "project_ops",
+    "title": "给项目加 pre-commit hook（black + ruff）",
+    "description": "创建 .pre-commit-config.yaml，配置 black 和 ruff 钩子。验收文件存在并包含正确的 repo 配置。",
+    "setup": {
+      "files": [
+        {
+          "path": "src/foo.py",
+          "content": "x = 1\n"
+        },
+        {
+          "path": "tests/test_precommit.py",
+          "content": "from pathlib import Path\nimport yaml\n\ndef test_precommit_config():\n    p = Path('.pre-commit-config.yaml')\n    assert p.exists()\n    data = yaml.safe_load(p.read_text())\n    repos = data.get('repos', [])\n    repo_strs = ' '.join(r.get('repo', '') for r in repos)\n    assert 'black' in repo_strs.lower() or any('black' in str(h) for r in repos for h in r.get('hooks', []))\n    assert 'ruff' in repo_strs.lower() or any('ruff' in str(h) for r in repos for h in r.get('hooks', []))\n"
+        }
+      ],
+      "deps": ["pytest", "pyyaml"]
+    },
+    "tools_expected": ["do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": [".pre-commit-config.yaml"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 8000
+  },
+  {
+    "id": "B1",
+    "category": "bugfix_refactor",
+    "title": "修复 3 个隐式 bug",
+    "description": "math_utils.py 含三个 bug：off-by-one、错误的 mutable default、整数除法误用浮点。修复让 tests 全过。",
+    "setup": {
+      "files": [
+        {
+          "path": "math_utils.py",
+          "content": "def sum_range(n):\n    total = 0\n    for i in range(1, n):\n        total += i\n    return total\n\ndef append_to(value, lst=[]):\n    lst.append(value)\n    return lst\n\ndef average(nums):\n    return sum(nums) // len(nums)\n"
+        },
+        {
+          "path": "tests/test_math.py",
+          "content": "from math_utils import sum_range, append_to, average\n\ndef test_sum_range_inclusive():\n    assert sum_range(5) == 15\n\ndef test_append_to_no_shared_default():\n    a = append_to(1)\n    b = append_to(2)\n    assert b == [2]\n\ndef test_average_float():\n    assert average([1, 2, 4]) == 7 / 3\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["math_utils.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000
+  },
+  {
+    "id": "B2",
+    "category": "bugfix_refactor",
+    "title": "重构循环为生成器",
+    "description": "把 build_list_until_limit 从一次性构造列表，重构为生成器函数 stream_until_limit。保留语义，并增加 lazy 行为。",
+    "setup": {
+      "files": [
+        {
+          "path": "streams.py",
+          "content": "def build_list_until_limit(items, limit):\n    out = []\n    for x in items:\n        if x > limit:\n            break\n        out.append(x * 2)\n    return out\n"
+        },
+        {
+          "path": "tests/test_streams.py",
+          "content": "from streams import build_list_until_limit\n\ndef test_lazy_or_list_equivalent():\n    result = list(build_list_until_limit([1, 2, 3, 100, 4], 10))\n    assert result == [2, 4, 6]\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["streams.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 8000
+  },
+  {
+    "id": "B3",
+    "category": "bugfix_refactor",
+    "title": "提取重复代码为函数",
+    "description": "reports.py 中 generate_daily / generate_weekly / generate_monthly 有大量重复格式化逻辑。提取为 _format_report 私有函数。",
+    "setup": {
+      "files": [
+        {
+          "path": "reports.py",
+          "content": "def generate_daily(data):\n    header = '=== Report ===\\n'\n    body = '\\n'.join(f'- {k}: {v}' for k, v in data.items())\n    footer = '\\n=== End ==='\n    return header + body + footer\n\ndef generate_weekly(data):\n    header = '=== Report ===\\n'\n    body = '\\n'.join(f'- {k}: {v}' for k, v in data.items())\n    footer = '\\n=== End ==='\n    return header + body + footer\n\ndef generate_monthly(data):\n    header = '=== Report ===\\n'\n    body = '\\n'.join(f'- {k}: {v}' for k, v in data.items())\n    footer = '\\n=== End ==='\n    return header + body + footer\n"
+        },
+        {
+          "path": "tests/test_reports.py",
+          "content": "from reports import generate_daily, generate_weekly, generate_monthly\n\ndef test_all_three_consistent():\n    d = {'x': 1}\n    a = generate_daily(d)\n    b = generate_weekly(d)\n    c = generate_monthly(d)\n    assert a == b == c\n    assert 'Report' in a\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_grep", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["reports.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 8000
+  },
+  {
+    "id": "B4",
+    "category": "bugfix_refactor",
+    "title": "处理 Race Condition",
+    "description": "counter.py 中 increment() 在并发下丢失更新。用 threading.Lock 修复。",
+    "setup": {
+      "files": [
+        {
+          "path": "counter.py",
+          "content": "class Counter:\n    def __init__(self):\n        self.value = 0\n\n    def increment(self):\n        self.value += 1\n"
+        },
+        {
+          "path": "tests/test_counter.py",
+          "content": "import threading\nfrom counter import Counter\n\ndef test_concurrent_increment():\n    c = Counter()\n    threads = [threading.Thread(target=lambda: [c.increment() for _ in range(1000)]) for _ in range(8)]\n    for t in threads: t.start()\n    for t in threads: t.join()\n    assert c.value == 8000\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["counter.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000
+  },
+  {
+    "id": "B5",
+    "category": "bugfix_refactor",
+    "title": "修复内存泄漏",
+    "description": "cache.py 中的 LRUCache 永远不淘汰旧 entry。实现 max_size 限制，超过容量时 evict 最旧的项。",
+    "setup": {
+      "files": [
+        {
+          "path": "cache.py",
+          "content": "class LRUCache:\n    def __init__(self, max_size=100):\n        self.max_size = max_size\n        self.store = {}\n\n    def set(self, key, value):\n        self.store[key] = value\n\n    def get(self, key):\n        return self.store.get(key)\n"
+        },
+        {
+          "path": "tests/test_cache.py",
+          "content": "from cache import LRUCache\n\ndef test_eviction():\n    c = LRUCache(max_size=2)\n    c.set('a', 1)\n    c.set('b', 2)\n    c.set('c', 3)\n    assert len(c.store) == 2\n    assert c.get('a') is None\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["cache.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000
+  },
+  {
+    "id": "C1a",
+    "category": "isomorphic",
+    "title": "给 Flask 项目加 JWT 认证",
+    "description": "在现有 Flask app 上添加 JWT 认证中间件。/login 颁发 token，/protected 需要 Authorization: Bearer <token>。",
+    "setup": {
+      "files": [
+        {
+          "path": "flask_app.py",
+          "content": "from flask import Flask, jsonify\n\napp = Flask(__name__)\n\n@app.route('/health')\ndef health():\n    return jsonify({'ok': True})\n"
+        },
+        {
+          "path": "tests/test_flask_jwt.py",
+          "content": "import pytest\n\n@pytest.mark.skipif(True, reason='skeleton — real test injected by runner')\ndef test_jwt_flow():\n    pass\n"
+        }
+      ],
+      "deps": ["pytest", "flask", "pyjwt"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["flask_app.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 12000,
+    "isomorphic_group": "C1"
+  },
+  {
+    "id": "C1b",
+    "category": "isomorphic",
+    "title": "给 FastAPI 项目加 JWT 认证",
+    "description": "在现有 FastAPI app 上添加 JWT 认证依赖。/login 颁发 token，/protected 需要 Authorization: Bearer <token>。与 C1a 同模式。",
+    "setup": {
+      "files": [
+        {
+          "path": "fastapi_app.py",
+          "content": "from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get('/health')\ndef health():\n    return {'ok': True}\n"
+        },
+        {
+          "path": "tests/test_fastapi_jwt.py",
+          "content": "import pytest\n\n@pytest.mark.skipif(True, reason='skeleton — real test injected by runner')\ndef test_jwt_flow():\n    pass\n"
+        }
+      ],
+      "deps": ["pytest", "fastapi", "pyjwt", "httpx"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["fastapi_app.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 12000,
+    "isomorphic_group": "C1"
+  },
+  {
+    "id": "C2a",
+    "category": "isomorphic",
+    "title": "用 requests 实现带 retry 的 HTTP 客户端",
+    "description": "封装一个 fetch(url, max_retries=3) 函数：用 requests，遇到 5xx / 网络异常时指数退避重试。",
+    "setup": {
+      "files": [
+        {
+          "path": "http_requests.py",
+          "content": "import requests\n\ndef fetch(url):\n    return requests.get(url).text\n"
+        },
+        {
+          "path": "tests/test_requests.py",
+          "content": "from http_requests import fetch\n\ndef test_signature_exists():\n    assert callable(fetch)\n"
+        }
+      ],
+      "deps": ["pytest", "requests"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["http_requests.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000,
+    "isomorphic_group": "C2"
+  },
+  {
+    "id": "C2b",
+    "category": "isomorphic",
+    "title": "用 httpx 实现带 retry 的 HTTP 客户端",
+    "description": "封装一个 fetch(url, max_retries=3) 函数：用 httpx（async），遇到 5xx / 网络异常时指数退避重试。与 C2a 同模式。",
+    "setup": {
+      "files": [
+        {
+          "path": "http_httpx.py",
+          "content": "import httpx\n\nasync def fetch(url):\n    async with httpx.AsyncClient() as client:\n        r = await client.get(url)\n        return r.text\n"
+        },
+        {
+          "path": "tests/test_httpx.py",
+          "content": "from http_httpx import fetch\n\ndef test_signature_exists():\n    assert callable(fetch)\n"
+        }
+      ],
+      "deps": ["pytest", "httpx"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["http_httpx.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000,
+    "isomorphic_group": "C2"
+  },
+  {
+    "id": "C3a",
+    "category": "isomorphic",
+    "title": "用 pandas 把 CSV 加载进 SQLite",
+    "description": "写一个 load_csv_to_db(csv_path, db_path, table) 函数，用 pandas.read_csv + DataFrame.to_sql 完成。",
+    "setup": {
+      "files": [
+        {
+          "path": "loader_pandas.py",
+          "content": "def load_csv_to_db(csv_path, db_path, table):\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_pandas_loader.py",
+          "content": "from loader_pandas import load_csv_to_db\n\ndef test_signature_exists():\n    assert callable(load_csv_to_db)\n"
+        }
+      ],
+      "deps": ["pytest", "pandas"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["loader_pandas.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000,
+    "isomorphic_group": "C3"
+  },
+  {
+    "id": "C3b",
+    "category": "isomorphic",
+    "title": "用纯 sqlite3 + csv 把 CSV 加载进 SQLite",
+    "description": "写一个 load_csv_to_db(csv_path, db_path, table) 函数，只用 stdlib（csv + sqlite3），不依赖 pandas。与 C3a 同模式。",
+    "setup": {
+      "files": [
+        {
+          "path": "loader_stdlib.py",
+          "content": "def load_csv_to_db(csv_path, db_path, table):\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_stdlib_loader.py",
+          "content": "from loader_stdlib import load_csv_to_db\n\ndef test_signature_exists():\n    assert callable(load_csv_to_db)\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["loader_stdlib.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 10000,
+    "isomorphic_group": "C3"
+  },
+  {
+    "id": "C4a",
+    "category": "isomorphic",
+    "title": "用 dataclass 实现配置加载",
+    "description": "写一个 load_config(path: str) -> Config 函数。Config 是 dataclass，包含 host:str / port:int / debug:bool 三字段。从 YAML 加载。",
+    "setup": {
+      "files": [
+        {
+          "path": "config_dc.py",
+          "content": "from dataclasses import dataclass\n\n@dataclass\nclass Config:\n    host: str = 'localhost'\n    port: int = 8000\n    debug: bool = False\n\ndef load_config(path):\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_config_dc.py",
+          "content": "from config_dc import load_config, Config\n\ndef test_signature():\n    assert callable(load_config)\n    c = Config()\n    assert c.host == 'localhost'\n"
+        }
+      ],
+      "deps": ["pytest", "pyyaml"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["config_dc.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 9000,
+    "isomorphic_group": "C4"
+  },
+  {
+    "id": "C4b",
+    "category": "isomorphic",
+    "title": "用 Pydantic BaseModel 实现配置加载",
+    "description": "写一个 load_config(path: str) -> Config 函数。Config 是 Pydantic BaseModel，包含 host:str / port:int / debug:bool 三字段。从 YAML 加载。与 C4a 同模式。",
+    "setup": {
+      "files": [
+        {
+          "path": "config_pyd.py",
+          "content": "from pydantic import BaseModel\n\nclass Config(BaseModel):\n    host: str = 'localhost'\n    port: int = 8000\n    debug: bool = False\n\ndef load_config(path):\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_config_pyd.py",
+          "content": "from config_pyd import load_config, Config\n\ndef test_signature():\n    assert callable(load_config)\n    c = Config()\n    assert c.host == 'localhost'\n"
+        }
+      ],
+      "deps": ["pytest", "pydantic", "pyyaml"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["config_pyd.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 9000,
+    "isomorphic_group": "C4"
+  },
+  {
+    "id": "C5a",
+    "category": "isomorphic",
+    "title": "用 threading 实现并发下载器",
+    "description": "写一个 download_all(urls: list[str]) -> list[str] 函数，用 threading.ThreadPoolExecutor 并发下载，返回 body 列表。",
+    "setup": {
+      "files": [
+        {
+          "path": "dl_threading.py",
+          "content": "def download_all(urls):\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_dl_threading.py",
+          "content": "from dl_threading import download_all\n\ndef test_signature():\n    assert callable(download_all)\n"
+        }
+      ],
+      "deps": ["pytest"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["dl_threading.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 9000,
+    "isomorphic_group": "C5"
+  },
+  {
+    "id": "C5b",
+    "category": "isomorphic",
+    "title": "用 asyncio 实现并发下载器",
+    "description": "写一个 async def download_all(urls: list[str]) -> list[str] 函数，用 asyncio.gather + httpx 并发下载，返回 body 列表。与 C5a 同模式。",
+    "setup": {
+      "files": [
+        {
+          "path": "dl_asyncio.py",
+          "content": "async def download_all(urls):\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_dl_asyncio.py",
+          "content": "from dl_asyncio import download_all\n\ndef test_signature():\n    assert callable(download_all)\n"
+        }
+      ],
+      "deps": ["pytest", "httpx"]
+    },
+    "tools_expected": ["do_file_read", "do_file_patch", "do_test"],
+    "acceptance": {
+      "test_command": "pytest tests/ -q",
+      "must_contain_files": ["dl_asyncio.py"],
+      "must_not_contain_patterns": []
+    },
+    "token_budget": 9000,
+    "isomorphic_group": "C5"
+  }
+]

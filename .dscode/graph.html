@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>DS Code Memory Graph</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1117; color: #e6e8ed; }
+  #app { display: grid; grid-template-columns: 1fr 320px; height: 100vh; }
+  #graph { background: #0f1117; }
+  #sidebar { background: #161922; padding: 16px 18px; overflow-y: auto; border-left: 1px solid #2a2f3d; box-sizing: border-box; }
+  h1 { font-size: 16px; margin: 0 0 8px 0; color: #d6d9e0; }
+  h2 { font-size: 13px; margin: 18px 0 6px 0; color: #9ba1b0; text-transform: uppercase; letter-spacing: 0.05em; }
+  ul { padding-left: 18px; margin: 4px 0; font-size: 12px; line-height: 1.55; }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12.5px; color: #c2c6d0; border-bottom: 1px dotted #2a2f3d; }
+  .stat strong { color: #fff; font-weight: 600; }
+  #info { font-size: 12px; line-height: 1.55; word-break: break-word; color: #c2c6d0; min-height: 60px; }
+  #info .empty { color: #5b6072; font-style: italic; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 8px; background: #2a2f3d; color: #b6bccc; font-size: 11px; margin-right: 4px; }
+  code { background: #1f2330; padding: 1px 5px; border-radius: 3px; font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="graph"></div>
+  <aside id="sidebar">
+    <h1>DS Code Memory Graph</h1>
+    <div class="stat"><span>节点</span><strong>0</strong></div>
+    <div class="stat"><span>边</span><strong>0</strong></div>
+    <div class="stat"><span>社区</span><strong>0</strong></div>
+
+    <h2>洞察</h2>
+    <ul id="insights">
+      <li><em>暂无洞察</em></li>
+    </ul>
+
+    <h2>当前节点</h2>
+    <div id="info"><span class="empty">点击或悬停节点查看详情</span></div>
+
+    <h2>说明</h2>
+    <ul>
+      <li>滚轮缩放 / 拖拽平移</li>
+      <li>颜色 = Louvain 社区</li>
+      <li>节点大小 = confidence × sample_count</li>
+      <li>边粗细 = 4 信号加权</li>
+    </ul>
+  </aside>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/graphology-layout-forceatlas2@0.10.1/build/graphology-layout-forceatlas2.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sigma@3.0.0/build/sigma.min.js"></script>
+<script id="graph-data" type="application/json">{"nodes": [], "edges": [], "communities": {}, "insights": []}</script>
+<script>
+(function () {
+  var raw;
+  try {
+    raw = JSON.parse(document.getElementById('graph-data').textContent);
+  } catch (e) {
+    console.error('[dscode] graph data parse failed', e);
+    return;
+  }
+
+  if (typeof graphology === 'undefined' || typeof Sigma === 'undefined') {
+    console.warn('[dscode] sigma.js / graphology CDN not loaded');
+    return;
+  }
+
+  var Graph = graphology.Graph || graphology.default || graphology;
+  var graph = new Graph();
+
+  // 初始随机布局，让 ForceAtlas2 有发力空间
+  raw.nodes.forEach(function (n, i) {
+    var theta = (i / raw.nodes.length) * Math.PI * 2;
+    var r = 5 + Math.sqrt(i);
+    var attrs = Object.assign({
+      x: Math.cos(theta) * r,
+      y: Math.sin(theta) * r,
+      size: 5,
+      color: '#88a',
+      label: n.key
+    }, n.attributes || {});
+    graph.addNode(n.key, attrs);
+  });
+  raw.edges.forEach(function (e) {
+    if (!graph.hasNode(e.source) || !graph.hasNode(e.target)) return;
+    try {
+      graph.addEdgeWithKey(e.key, e.source, e.target, e.attributes || {});
+    } catch (_) { /* ignore duplicate */ }
+  });
+
+  // ForceAtlas2 几百轮 —— 静态导出，运行一次后定型
+  if (typeof forceAtlas2 !== 'undefined') {
+    var settings = forceAtlas2.inferSettings(graph);
+    forceAtlas2.assign(graph, { iterations: 200, settings: settings });
+  }
+
+  var renderer = new Sigma(graph, document.getElementById('graph'), {
+    renderEdgeLabels: false,
+    defaultEdgeColor: '#3a4054',
+    labelColor: { color: '#d6d9e0' },
+    labelSize: 11
+  });
+
+  var info = document.getElementById('info');
+
+  function showNode(nodeId) {
+    if (!nodeId) {
+      info.innerHTML = '<span class="empty">点击或悬停节点查看详情</span>';
+      return;
+    }
+    var a = graph.getNodeAttributes(nodeId);
+    var parts = [];
+    parts.push('<div><span class="pill">' + (a.type || '?') + '</span>');
+    if (a.pattern_type) parts.push('<span class="pill">' + a.pattern_type + '</span>');
+    parts.push('<span class="pill">c#' + (a.community != null ? a.community : '?') + '</span></div>');
+    parts.push('<div style="margin-top:6px;"><code>' + nodeId + '</code></div>');
+    parts.push('<div style="margin-top:6px;">' + (a.label || '') + '</div>');
+    if (a.metadata) {
+      parts.push('<pre style="white-space:pre-wrap;font-size:11px;color:#9ba1b0;background:#1f2330;padding:6px;border-radius:4px;margin-top:8px;">' + JSON.stringify(a.metadata, null, 2) + '</pre>');
+    }
+    info.innerHTML = parts.join('');
+  }
+
+  renderer.on('enterNode', function (e) { showNode(e.node); });
+  renderer.on('clickNode', function (e) { showNode(e.node); });
+  renderer.on('leaveNode', function () { /* keep last */ });
+})();
+</script>
+</body>
+</html>
