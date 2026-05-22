@@ -58,7 +58,7 @@ class DSCodeApp(App[None]):
     ) -> None:
         super().__init__()
         self.project_root = Path(project_root)
-        self.model = model
+        self.model = model or "deepseek-v4-flash"
         self.telemetry_path = telemetry_path or (
             project_root / ".dscode" / "telemetry.json"
         )
