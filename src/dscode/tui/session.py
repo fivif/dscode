@@ -104,12 +104,16 @@ class ChatSession:
     # ============================================================
 
     async def send(self, content: str) -> AsyncGenerator[SessionEvent, None]:
-        """             
-
-              (``/``          
-                Scribe L1 RawEvent 
         """
-        await self._ensure_initialized()
+
+              (``/``
+                Scribe L1 RawEvent
+        """
+        try:
+            await self._ensure_initialized()
+        except ValueError as e:
+            yield system_msg(str(e))
+            return
 
         if content.startswith("/"):
             async for ev in self._handle_command(content):
@@ -198,6 +202,7 @@ class ChatSession:
                     if chunk.finish_reason:
                         finish_reason = chunk.finish_reason
             except Exception as exc:
+                import traceback
                 yield system_msg(f"Error: {exc}")
                 return
 

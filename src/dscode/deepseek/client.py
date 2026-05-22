@@ -54,8 +54,15 @@ class DeepSeekClient:
         """
         key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not key:
-            # 允许延迟报错：实际调用时再抛
             key = "sk-placeholder"
+        # 检查 API key 是否包含非 ASCII 字符（HTTP header 必须是 ASCII）
+        try:
+            key.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError(
+                f"DEEPSEEK_API_KEY contains non-ASCII characters. "
+                f"Please use a real API key from https://platform.deepseek.com/api_keys"
+            ) from None
         self.api_key = key
         self.base_url = base_url
         self._client = AsyncOpenAI(
