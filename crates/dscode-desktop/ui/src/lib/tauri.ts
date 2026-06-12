@@ -63,9 +63,12 @@ export function onStreamEvent(
   sessionId: string,
   callback: (event: StreamEvent) => void
 ): () => void {
-  const unlisten = listen<StreamEvent & { session_id?: string }>('stream-event', (event) => {
-    if (!event.payload.session_id || event.payload.session_id !== sessionId) return;
-    callback(event.payload);
+  const unlisten = listen<any>('stream-event', (event) => {
+    const payload = event.payload;
+    const sid = payload?.session_id;
+    const ev = payload?.event;
+    if (!sid || sid !== sessionId) return;
+    if (ev) callback(ev as StreamEvent);
   });
   return () => {
     unlisten.then((fn) => fn());

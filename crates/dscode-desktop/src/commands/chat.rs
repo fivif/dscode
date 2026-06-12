@@ -263,7 +263,7 @@ pub async fn send_message(
                             }
                             // Release sm_guard before emitting event.
                             drop(sm_guard);
-                            events::emit_event(&app_handle_clone, ev);
+                            events::emit_event(&app_handle_clone, ev, &persist_sid);
                         }
                         None => break, // Channel closed, forge finished.
                     }

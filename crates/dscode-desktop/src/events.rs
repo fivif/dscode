@@ -11,10 +11,14 @@ pub use dscode_core::agent::stream::{StreamEvent, ToolStatus, UsageInfo};
 
 /// Emit a [`StreamEvent`] to the frontend via the Tauri event system.
 ///
-/// The event name is `"stream-event"` and the payload is the serialized
-/// [`StreamEvent`]. Failures are logged (the frontend may have disconnected).
-pub fn emit_event(app_handle: &tauri::AppHandle, event: &StreamEvent) {
-    if let Err(e) = app_handle.emit("stream-event", event) {
+/// Includes the `session_id` in the payload so the frontend can filter
+/// events for the active session only.
+pub fn emit_event(app_handle: &tauri::AppHandle, event: &StreamEvent, session_id: &str) {
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "event": event,
+    });
+    if let Err(e) = app_handle.emit("stream-event", payload) {
         warn!(%e, "Failed to emit stream-event to frontend");
     }
 }
