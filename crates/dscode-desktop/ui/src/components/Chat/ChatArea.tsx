@@ -16,11 +16,14 @@ export default function ChatArea() {
     if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current);
     scrollRaf.current = requestAnimationFrame(() => {
       const container = containerRef.current;
-      if (container) {
+      if (!container) return;
+      if (isStreaming) {
+        // Always follow during streaming
+        bottomRef.current?.scrollIntoView({ behavior: 'auto' });
+      } else {
         const { scrollTop, scrollHeight, clientHeight } = container;
-        const isNearBottom = scrollHeight - scrollTop - clientHeight < 80;
-        if (isNearBottom) {
-          bottomRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' });
+        if (scrollHeight - scrollTop - clientHeight < 80) {
+          bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
         }
       }
     });
