@@ -22,16 +22,13 @@ export interface ChatStore {
 let _streamTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
 export const useChatStore = create<ChatStore>((set, get) => {
-  function patchStreamingMsg(msgId: string, patch: any) {
-    set((s) => ({
-      messages: s.messages.map((m) => (m.id === msgId ? { ...m, ...patch } : m)),
-    }));
-  }
-
   return {
     messages: [], activeSessionId: null, isStreaming: false, streamError: null, _stream: null,
 
-    setActiveSession(id) { set({ activeSessionId: id, messages: [], streamError: null }); },
+    setActiveSession(id) {
+      if (_streamTimeoutId) { clearTimeout(_streamTimeoutId); _streamTimeoutId = null; }
+      set({ activeSessionId: id, messages: [], isStreaming: false, streamError: null, _stream: null });
+    },
     async loadSessionMessages(id: string) {
       try {
         const session = await getSession(id);
@@ -55,6 +52,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     clearMessages() { set({ messages: [], streamError: null }); },
 
     startStream(sid, userMsg) {
+      if (get().isStreaming) return;
       if (_streamTimeoutId) { clearTimeout(_streamTimeoutId); _streamTimeoutId = null; }
       const id = genId();
       const asst: Message = { id, session_id: sid, role: 'assistant', content: '', created_at: Math.floor(Date.now() / 1000), thinking_blocks: [], tool_calls: [], stream_state: { text: '', thinking: [], tool_calls: [] } };
@@ -132,7 +130,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
           break;
         }
 
-        case 'error': set({ streamError: event.content }); break;
+        case 'error': {
+          if (_streamTimeoutId) { clearTimeout(_streamTimeoutId); _streamTimeoutId = null; }
+          set({ streamError: event.content, isStreaming: false, _stream: null });
+          break;
+        }
         case 'fact': break;
 
         case 'complete': {

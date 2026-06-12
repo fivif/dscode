@@ -14,6 +14,7 @@ export default function SkillsPage({ onBack }: Props) {
   const [editDesc, setEditDesc] = useState('');
   const [editBody, setEditBody] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   const loadSkills = () => {
     tauri.listSkills().then((s) => { setSkills(s); setLoading(false); }).catch(() => setLoading(false));
@@ -29,15 +30,27 @@ export default function SkillsPage({ onBack }: Props) {
   const handleSave = async () => {
     if (!editName.trim()) return;
     setSaving(true);
-    await tauri.saveSkill(editName.trim(), editDesc.trim(), editBody.trim());
-    setSaving(false); setShowAdd(false);
-    loadSkills();
+    setError('');
+    try {
+      await tauri.saveSkill(editName.trim(), editDesc.trim(), editBody.trim());
+      setShowAdd(false);
+      loadSkills();
+    } catch (e: any) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleDelete = async (name: string) => {
     if (!confirm(`删除 skill "${name}"？`)) return;
-    await tauri.deleteSkill(name);
-    loadSkills();
+    setError('');
+    try {
+      await tauri.deleteSkill(name);
+      loadSkills();
+    } catch (e: any) {
+      setError(String(e));
+    }
   };
 
   return (
@@ -55,6 +68,11 @@ export default function SkillsPage({ onBack }: Props) {
           + 添加
         </button>
       </div>
+
+      {/* 错误信息 */}
+      {error && (
+        <div className="mx-8 mt-4 p-3 bg-red-900/15 border border-red-900/30 rounded-lg text-red-400 text-xs">{error}</div>
+      )}
 
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-xl mx-auto px-8 py-6 space-y-3">

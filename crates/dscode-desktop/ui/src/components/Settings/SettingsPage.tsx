@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { useConfigStore } from '@/stores/configStore';
 import { KNOWN_MODELS } from '@/lib/types';
 import * as tauri from '@/lib/tauri';
@@ -26,9 +26,14 @@ export default function SettingsPage({ onBack }: Props) {
   const { config, updateConfig, updateProvider, error } = useConfigStore();
   const [activeTab, setActiveTab] = useState<string>('deepseek');
   const [fetchedModels, setFetchedModels] = useState<Record<string, string[]>>({});
-  const [fetching, setFetching] = useState(false);
+  const [fetchingProvider, setFetchingProvider] = useState<string | null>(null);
   const [fetchMsg, setFetchMsg] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+  const [localTemp, setLocalTemp] = useState(config.temperature);
+
+  useEffect(() => {
+    setLocalTemp(config.temperature);
+  }, [config.temperature]);
 
   const debouncedUpdate = useCallback((patch: Partial<AppConfig>) => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -38,7 +43,7 @@ export default function SettingsPage({ onBack }: Props) {
   }, [updateConfig]);
 
   const handleFetchModels = async (provider: string) => {
-    setFetching(true);
+    setFetchingProvider(provider);
     setFetchMsg(null);
     try {
       const models = await tauri.fetchModels(provider);
@@ -47,7 +52,7 @@ export default function SettingsPage({ onBack }: Props) {
     } catch (e: any) {
       setFetchMsg(String(e));
     }
-    setFetching(false);
+    setFetchingProvider(null);
   };
 
   const getModelOptions = (provider: string) => {
@@ -95,9 +100,16 @@ export default function SettingsPage({ onBack }: Props) {
                   value={config.default_model}
                   onChange={(e) => updateConfig({ default_model: e.target.value })}
                 >
-                  {PROVIDER_KEYS.filter((p) => config.providers[p]?.enabled).flatMap((p) => getModelOptions(p)).map((m) => (
-                    <option key={m.id} value={m.id}>{m.label}</option>
-                  ))}
+                  {(() => {
+                    const opts = PROVIDER_KEYS.filter((p) => config.providers[p]?.enabled).flatMap((p) => getModelOptions(p));
+                    const hasCurrent = opts.some((m) => m.id === config.default_model);
+                    if (!hasCurrent && config.default_model) {
+                      opts.unshift({ id: config.default_model, label: config.default_model });
+                    }
+                    return opts.map((m) => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ));
+                  })()}
                 </select>
               </Row>
 
@@ -134,7 +146,11 @@ export default function SettingsPage({ onBack }: Props) {
                     type="number" className="w-28 bg-card border border-border rounded-lg px-3 py-2.5 text-sm text-gray-200 focus:outline-none focus:border-gray-500 mt-2"
                     min={256} max={128000}
                     value={config.max_tokens}
-                    onChange={(e) => debouncedUpdate({ max_tokens: parseInt(e.target.value) || 8192 })}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const num = val === '' ? 0 : parseInt(val);
+                      debouncedUpdate({ max_tokens: isNaN(num) ? 8192 : num });
+                    }}
                   />
                 )}
               </Row>
@@ -142,10 +158,14 @@ export default function SettingsPage({ onBack }: Props) {
               {/* 温度 */}
               <Row label="温度">
                 <div className="flex items-center gap-3">
-                  <input type="range" min={0} max={2} step={0.1} value={config.temperature}
-                    onChange={(e) => debouncedUpdate({ temperature: parseFloat(e.target.value) })}
+                  <input type="range" min={0} max={2} step={0.1} value={localTemp}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setLocalTemp(v);
+                      debouncedUpdate({ temperature: v });
+                    }}
                     className="w-36 accent-gray-400" />
-                  <span className="text-xs text-gray-500 font-mono w-6">{config.temperature.toFixed(1)}</span>
+                  <span className="text-xs text-gray-500 font-mono w-6">{localTemp.toFixed(1)}</span>
                 </div>
               </Row>
 
@@ -236,8 +256,8 @@ export default function SettingsPage({ onBack }: Props) {
 
                   <Row label="模型" action={
                     <button className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
-                      onClick={() => handleFetchModels(k)} disabled={fetching}>
-                      {fetching ? '获取中...' : (fetchedModels[k]?.length ? `已加载 ${fetchedModels[k].length} 个` : '获取列表')}
+                      onClick={() => handleFetchModels(k)} disabled={fetchingProvider === k}>
+                      {fetchingProvider === k ? '获取中...' : (fetchedModels[k]?.length ? `已加载 ${fetchedModels[k].length} 个` : '获取列表')}
                     </button>
                   }>
                     <select

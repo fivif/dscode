@@ -12,6 +12,7 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
   const [showInput, setShowInput] = useState(false);
   const [customPath, setCustomPath] = useState('');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     getLastSession().then((s) => {
@@ -21,12 +22,20 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
 
   const handleCreate = async (workspace: string) => {
     setLoading(true);
-    const t = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-    const session = await createSession(`对话 ${t}`, workspace);
-    setLoading(false);
-    if (session) {
-      onCreated(session.id);
-      onClose();
+    setError('');
+    try {
+      const t = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      const session = await createSession(`对话 ${t}`, workspace);
+      if (session) {
+        onCreated(session.id);
+        onClose();
+      } else {
+        setError('创建会话失败，请重试');
+      }
+    } catch (e: any) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -46,6 +55,11 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
     <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center" onClick={onClose}>
       <div className="bg-card border border-border rounded-xl w-full max-w-sm p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <h3 className="text-base font-medium text-gray-200 mb-5">新建对话</h3>
+
+        {/* Error message */}
+        {error && (
+          <div className="mb-3 p-2 bg-red-900/15 border border-red-900/30 rounded text-red-400 text-xs">{error}</div>
+        )}
 
         {/* Inherit last workspace */}
         {lastWorkspace && (
@@ -76,7 +90,7 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
               placeholder="/path/to/project"
               value={customPath}
               onChange={(e) => setCustomPath(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && customPath) handleCreate(customPath); }}
+              onKeyDown={(e) => { if (e.key === 'Enter' && customPath.trim()) handleCreate(customPath.trim()); }}
               autoFocus
             />
           </div>
