@@ -268,8 +268,12 @@ fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
             if let Some(ref tool_calls) = m.tool_calls {
                 value["tool_calls"] = serde_json::to_value(tool_calls).unwrap();
             }
-            if let Some(ref tc_id) = m.tool_call_id {
-                value["tool_call_id"] = serde_json::Value::String(tc_id.clone());
+            // tool_call_id belongs ONLY on Role::Tool messages per OpenAI protocol.
+            // Assistant messages carry tool call IDs exclusively in tool_calls[].id.
+            if m.role == Role::Tool {
+                if let Some(ref tc_id) = m.tool_call_id {
+                    value["tool_call_id"] = serde_json::Value::String(tc_id.clone());
+                }
             }
             if let Some(ref reasoning) = m.reasoning_content {
                 value["reasoning_content"] = serde_json::Value::String(reasoning.clone());

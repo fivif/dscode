@@ -60,9 +60,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
       _streamTimeoutId = setTimeout(() => {
         const state = get();
         if (state.isStreaming) {
-          state.endStream('Stream timed out - no complete event received after 5 minutes');
+          state.endStream('Stream timed out - no complete event received after 10 minutes');
         }
-      }, 300000);
+      }, 600000);
     },
 
     handleStreamEvent(event) {

@@ -20,12 +20,12 @@ export default function ChatArea() {
         const { scrollTop, scrollHeight, clientHeight } = container;
         const isNearBottom = scrollHeight - scrollTop - clientHeight < 80;
         if (isNearBottom) {
-          bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+          bottomRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' });
         }
       }
     });
     return () => { if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current); };
-  }, [messages]);
+  }, [messages, isStreaming]);
 
   if (messages.length === 0) {
     return (

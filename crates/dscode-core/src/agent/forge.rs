@@ -336,28 +336,6 @@ impl Forge {
             // (a) Call the LLM provider with a snapshot of the cleaned messages.
             let snapshot = messages.clone();
             let validated = validate_tool_chain_for_provider(snapshot);
-
-            // Debug: log message chain structure before provider call
-            // This helps diagnose DeepSeek 400 "insufficient tool messages" errors
-            if iteration == 1 {
-                info!(session = %session_id, validated_count = validated.len(), "Forge: pre-call message dump");
-                for (i, m) in validated.iter().enumerate() {
-                    let tc_ids: Vec<String> = m.tool_calls.as_ref()
-                        .map(|tc| tc.iter().map(|t| t.id.chars().take(12).collect()).collect())
-                        .unwrap_or_default();
-                    let has_tc = !tc_ids.is_empty();
-                    let tci = m.tool_call_id.as_ref().map(|s| s.chars().take(12).collect::<String>()).unwrap_or_default();
-                    let role_str = match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant if has_tc => "assistant(tc!)",
-                        Role::Assistant => "assistant",
-                        Role::Tool => "tool",
-                    };
-                    info!(session = %session_id, idx = i, %role_str, tc = ?tc_ids, tci = %tci, "Forge: msg-dump");
-                }
-            }
-
             let response = match self.provider.chat(validated, tools.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
