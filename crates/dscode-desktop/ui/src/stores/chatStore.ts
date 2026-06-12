@@ -52,10 +52,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
             prevWithToolCalls = m.tool_calls?.length > 0 ? m : null;
             continue;
           }
-          // tool_calls → tool card message
+          // tool_calls → tool card message with proper names
           if (m.tool_calls?.length > 0) {
-            msgs.push(m);
-            prevWithToolCalls = m;
+            const namedTC = m.tool_calls.map((tc: any) => ({
+              id: tc.id, name: tc.function?.name || tc.name || 'tool',
+              description: tc.description || '', status: 'success' as const, result: tc.result || ''
+            }));
+            msgs.push({ ...m, tool_calls: namedTC });
+            prevWithToolCalls = { ...m, tool_calls: namedTC };
             continue;
           }
           // regular message
