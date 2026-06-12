@@ -20,7 +20,7 @@
 
 ---
 
-## 🏗 架构 Architecture
+## 架构 Architecture
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -42,45 +42,45 @@
 └──────────────────────────────────────────────────────┘
 ```
 
-## ✨ 功能 Features
+## 功能 Features
 
-### 🧠 核心引擎 Core Engine
+### 核心引擎 Core Engine
 - **ReAct 智能体循环** — 流式推理 + 工具调用，内建死循环检测
 - **上下文窗口** — 可配置最高 1M tokens，支持阈值触发自动压缩
 - **工具链校验** — 加载时 + 运行时自动清理孤立工具调用，杜绝 400 错误
 - **多模型支持** — DeepSeek V4、OpenAI、Anthropic Claude、本地 Ollama
 
-### 🔮 MAGI 三脑自动螺旋 /auto
-- **审查** → **执行** → **提炼** 三脑循环，全自动完成任务
+### MAGI 三脑自动螺旋 /auto
+- **审查** -> **执行** -> **提炼** 三脑循环，全自动完成任务
 - 任务自动拆解 + 进度评分
 - 停滞检测 + 自动重新拆解
 
-### 📋 /plan 五阶段需求评审
-- 深度访谈：范围 → 需求 → 设计 → 风险 → 质量
+### /plan 五阶段需求评审
+- 深度访谈：范围 -> 需求 -> 设计 -> 风险 -> 质量
 - 自动识别项目文件和目录结构
 - 生成结构化 PRD 文档
 
-### 🤖 /auto 任务拆解与执行
+### /auto 任务拆解与执行
 - LLM 驱动的大任务自动拆解为子任务
 - 并行执行 + 停滞检测
 - 失败自动重组
 
-### 👥 /teams 多智能体协作
+### /teams 多智能体协作
 - 无限子 Agent 分发，实时监控进度
 - 按角色分配工具权限
 - 结果聚合与合并指令
 
-### 📚 Wiki 双层知识图谱
+### Wiki 双层知识图谱
 - **全局层** — 跨项目模式、事实、决策沉淀
 - **会话层** — 单次会话的文件编辑、工具输出、推理过程
 - FTS5 全文检索 + 归纳式主题聚类
 - 兼容 Quartz 导出
 
-### 🔌 扩展生态 Extensions
+### 扩展生态 Extensions
 - **MCP** — Model Context Protocol 服务端（连接 + 工具调用）
 - **SKILLS** — YAML 前置元数据的技能文件，按触发器路由
 
-## ⚡ 快速开始 Quick Start
+## 快速开始 Quick Start
 
 ### 环境要求 Prerequisites
 - Rust 1.85+
@@ -103,7 +103,7 @@ cd .. && cargo tauri dev
 cargo run -p dscode-cli -- "分析 src/main.rs"
 ```
 
-## ⚙️ 配置 Configuration
+## 配置 Configuration
 
 配置文件位于 `~/.dscode/config.toml`：
 
@@ -128,7 +128,7 @@ reasoning_effort = "medium"
 tool_timeout_secs = 120    # 工具执行超时
 ```
 
-## 📂 项目结构 Project Structure
+## 项目结构 Project Structure
 
 ```
 DS_code/
@@ -143,7 +143,7 @@ DS_code/
 └── README.md
 ```
 
-## 🛠 技术栈 Tech Stack
+## 技术栈 Tech Stack
 
 | 层 Layer | 技术 Technology |
 |---|---|
@@ -154,6 +154,6 @@ DS_code/
 | Markdown | react-markdown + remark-gfm |
 | 配置 | serde + TOML |
 
-## 📄 许可证 License
+## 许可证 License
 
 MIT
