@@ -32,42 +32,37 @@ export const useChatStore = create<ChatStore>((set, get) => {
     async loadSessionMessages(id: string) {
       try {
         const session = await getSession(id);
-        const raw = (session?.messages || []) as any[];
-        const merged: any[] = [];
-        let i = 0;
-        while (i < raw.length) {
-          const m = raw[i];
-          // user messages always standalone
-          if (m.role === 'user') { merged.push(m); i++; continue; }
-          // assistant with content (not tool_calls) is standalone
-          if (m.role === 'assistant' && m.content && !m.tool_calls?.length) {
-            merged.push(m); i++; continue;
-          }
-          // Start of a turn: collect consecutive assistant/tool messages
-          const turnMsg = { ...m, role: 'assistant', content: '', thinking_blocks: [] as any[], tool_calls: [] as any[], created_at: m.created_at, id: m.id };
-          while (i < raw.length && raw[i].role !== 'user') {
-            const cm = raw[i];
-            if (cm.reasoning_content) {
-              turnMsg.thinking_blocks!.push({ step: turnMsg.thinking_blocks!.length, content: cm.reasoning_content });
-            }
-            if (cm.content && cm.content.trim()) {
-              turnMsg.content = turnMsg.content ? turnMsg.content + '\n' + cm.content : cm.content;
-            }
-            if (cm.tool_calls?.length > 0) {
-              for (const tc of cm.tool_calls) {
-                turnMsg.tool_calls!.push({ id: tc.id, name: tc.function?.name || 'tool', description: '', status: 'success', result: '' });
+        // Each DB row becomes one renderable item (thinking, text, or tool card).
+        // Tool results are attached to their preceding tool_calls message.
+        let prevWithToolCalls: any = null;
+        const msgs: any[] = [];
+        for (const m of (session?.messages || [])) {
+          if (m.role === 'tool') {
+            // Attach tool result to the preceding tool_calls message
+            if (prevWithToolCalls?.tool_calls) {
+              for (const tc of prevWithToolCalls.tool_calls) {
+                if (tc.id === m.tool_call_id) { tc.result = m.content || ''; break; }
               }
             }
-            if (cm.role === 'tool' && cm.tool_call_id) {
-              for (const tc of turnMsg.tool_calls!) {
-                if (tc.id === cm.tool_call_id) { tc.result = cm.content || ''; break; }
-              }
-            }
-            i++;
+            continue;
           }
-          merged.push(turnMsg);
+          // reasoning_content → thinking block
+          if (m.reasoning_content) {
+            msgs.push({ ...m, thinking_blocks: [{ step: 0, content: m.reasoning_content }] });
+            prevWithToolCalls = m.tool_calls?.length > 0 ? m : null;
+            continue;
+          }
+          // tool_calls → tool card message
+          if (m.tool_calls?.length > 0) {
+            msgs.push(m);
+            prevWithToolCalls = m;
+            continue;
+          }
+          // regular message
+          msgs.push(m);
+          prevWithToolCalls = null;
         }
-        set({ messages: merged });
+        set({ messages: msgs });
       } catch { set({ messages: [] }); }
     },
     setMessages(messages) { set({ messages }); },
