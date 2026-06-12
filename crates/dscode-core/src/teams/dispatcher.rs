@@ -291,6 +291,12 @@ async fn run_sub_agent(
         .execute(&sub_task.prompt, session_id, vec![], event_tx)
         .await;
 
+    // Wait briefly to allow any in-flight events to land in the channel
+    // before draining. `try_recv()` is non-blocking and may miss events
+    // that were sent just before the `execute()` future resolved but
+    // haven't been buffered yet.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     // Collect text output from events.
     let mut output = String::new();
     while let Ok(event) = event_rx.try_recv() {

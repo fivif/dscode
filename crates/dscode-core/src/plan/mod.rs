@@ -70,9 +70,13 @@ pub async fn run_plan_interview(
         let action = engine.next_action().await;
         match action {
             InterviewAction::AskQuestion { question, .. } => {
-                // In a real implementation, this would prompt the user.
-                // For automated runs, we accept the recommended answer.
-                engine.answer_current(&question.recommended_answer);
+                // In a real interactive run, this would prompt the user via stdin.
+                // For non-interactive / automated runs, use the user's original
+                // message to influence the answer — extract relevant keywords
+                // and match them against the question text. Falls back to the
+                // recommended answer when no clear match is found.
+                let answer = auto_answer_for(&question, user_message);
+                engine.answer_current(&answer);
                 state.question_asked();
             }
             InterviewAction::PhaseComplete { .. } => {
@@ -95,7 +99,8 @@ pub async fn run_plan_interview(
         let action = engine.next_action().await;
         match action {
             InterviewAction::AskQuestion { question, .. } => {
-                engine.answer_current(&question.recommended_answer);
+                let answer = auto_answer_for(&question, user_message);
+                engine.answer_current(&answer);
                 state.question_asked();
             }
             InterviewAction::PhaseComplete { .. } => {
@@ -120,4 +125,40 @@ pub async fn run_plan_interview(
     let _prd_path = generator.persist(&prd, task_id)?;
 
     Ok(state)
+}
+
+/// Produce a best-effort answer for a question when running non-interactively.
+///
+/// Uses the user's original message to extract keywords and match them against
+/// the question text. Falls back to the question's recommended answer when no
+/// relevant keywords from the user message are found.
+fn auto_answer_for(question: &interview::Question, user_message: &str) -> String {
+    let question_lower = question.text.to_lowercase();
+    let msg_lower = user_message.to_lowercase();
+
+    // Split the user message into meaningful tokens
+    let tokens: Vec<&str> = msg_lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .collect();
+
+    // If the user message directly addresses topics in the question,
+    // build a tailored answer from the message content.
+    let relevant: Vec<&&str> = tokens
+        .iter()
+        .filter(|t| question_lower.contains(*t))
+        .collect();
+
+    if relevant.is_empty() {
+        // No overlap — fall back to the recommended answer.
+        question.recommended_answer.clone()
+    } else {
+        // Use the user's message as contextual input, trimmed to a reasonable length.
+        let excerpt: String = user_message.chars().take(500).collect();
+        format!(
+            "Based on user request: \"{}\"\nRecommended: {}",
+            excerpt,
+            question.recommended_answer
+        )
+    }
 }

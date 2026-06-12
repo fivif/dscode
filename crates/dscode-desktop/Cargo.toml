@@ -24,3 +24,4 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
+tokio-util = { workspace = true }

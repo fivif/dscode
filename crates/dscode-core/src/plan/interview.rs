@@ -259,7 +259,9 @@ impl InterviewEngine {
 
     /// Record an answer for the current question and advance.
     ///
-    /// Also records follow-up questions from the decision tree.
+    /// If the question is part of a decision tree, resolves the matching branch
+    /// and inserts the next node's question into the queue at the current
+    /// position so it can be asked immediately.
     pub fn answer_current(&mut self, answer: impl Into<String>) {
         let answer = answer.into();
         if self.cursor < self.questions.len() {
@@ -269,11 +271,22 @@ impl InterviewEngine {
 
             // If the question has follow-ups in the decision tree, inject them.
             if let Some(node) = self.decision_tree.get(&q.id) {
-                for (pattern, _next_id) in &node.branches {
-                    if answer.to_lowercase().contains(&pattern.to_lowercase()) {
-                        // Find the follow-up question and insert it after current.
-                        // We lazily just set the next question from the tree.
-                        break;
+                // Find the branch that matches the user's answer.
+                let matched_next = node
+                    .branches
+                    .iter()
+                    .find(|(pattern, _)| answer.to_lowercase().contains(&pattern.to_lowercase()))
+                    .map(|(_, next_id)| next_id.clone())
+                    .or_else(|| node.default_branch.clone());
+
+                // If we found a next node in the decision tree, look up its
+                // question and insert it right after the current position.
+                if let Some(next_id) = matched_next {
+                    if let Some(next_node) = self.decision_tree.get(&next_id) {
+                        let insert_pos = self.cursor + 1;
+                        if insert_pos <= self.questions.len() {
+                            self.questions.insert(insert_pos, next_node.question.clone());
+                        }
                     }
                 }
             }

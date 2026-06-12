@@ -5,16 +5,18 @@
 //! a convenience helper for emitting events through a Tauri [`AppHandle`].
 
 use tauri::Emitter;
+use tracing::warn;
 
 pub use dscode_core::agent::stream::{StreamEvent, ToolStatus, UsageInfo};
 
 /// Emit a [`StreamEvent`] to the frontend via the Tauri event system.
 ///
 /// The event name is `"stream-event"` and the payload is the serialized
-/// [`StreamEvent`]. Failures are silently ignored (the frontend may have
-/// disconnected).
+/// [`StreamEvent`]. Failures are logged (the frontend may have disconnected).
 pub fn emit_event(app_handle: &tauri::AppHandle, event: &StreamEvent) {
-    let _ = app_handle.emit("stream-event", event);
+    if let Err(e) = app_handle.emit("stream-event", event) {
+        warn!(%e, "Failed to emit stream-event to frontend");
+    }
 }
 
 /// Emit a [`StreamEvent`] to a specific Tauri window.

@@ -23,13 +23,14 @@ export default function Sidebar({ onOpenSettings, onOpenMcp, onOpenSkills, width
   useEffect(() => { loadSessions(); }, [loadSessions]);
 
   const handleSelect = useCallback((id: string) => {
+    if (id === activeSessionId) return;
     setActiveSession(id);
     loadSessionMessages(id);
-  }, [setActiveSession, loadSessionMessages]);
+  }, [setActiveSession, loadSessionMessages, activeSessionId]);
 
   const handleDelete = useCallback(async (id: string) => {
     await deleteSession(id);
-    if (activeSessionId === id) { setActiveSession(''); }
+    if (activeSessionId === id) { setActiveSession(null); }
   }, [deleteSession, activeSessionId, setActiveSession]);
 
   const handleSessionCreated = useCallback((sessionId: string) => {

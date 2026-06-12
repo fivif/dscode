@@ -89,8 +89,11 @@ impl SessionManager {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
 
-        // Migration: add workspace column if missing
-        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''");
+        // Migration: add workspace column if missing (non-fatal if already exists)
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''").ok();
+
+        // Migration: add name column to messages if missing (non-fatal if already exists)
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN name TEXT").ok();
 
         let mgr = Self {
             conn,
@@ -237,6 +240,9 @@ impl SessionManager {
 
     /// Delete a session and all its messages (CASCADE).
     pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        // SM3: Ensure foreign keys are enforced for CASCADE delete.
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
+
         let affected = self
             .conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
@@ -250,6 +256,19 @@ impl SessionManager {
 
     /// Append a message to a session. Also bumps `updated_at`.
     pub fn add_message(&self, session_id: &str, msg: &Message) -> Result<(), String> {
+        // SM4: Pre-check that the session exists before inserting.
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Session check error: {}", e))?;
+        if count == 0 {
+            return Err(format!("Session {} not found", session_id));
+        }
+
         let role_str = role_to_str(&msg.role);
         let content_json =
             serde_json::to_string(&msg.content).map_err(|e| format!("Serialize content: {}", e))?;
@@ -258,26 +277,53 @@ impl SessionManager {
             .as_ref()
             .map(|tc| serde_json::to_string(tc).map_err(|e| format!("Serialize tool_calls: {}", e)))
             .transpose()?;
-        // Note: Message.name is not persisted (rarely used outside CLI context).
+        let name = msg.name.as_deref();
         let tool_call_id = msg.tool_call_id.as_deref();
         let reasoning = msg.reasoning_content.as_deref();
+        // SM5: Use msg.created_at if set, otherwise use current time.
+        let created_at = if msg.created_at > 0 {
+            msg.created_at
+        } else {
+            Utc::now().timestamp()
+        };
         let now = Utc::now().timestamp();
 
+        // SM1: Wrap INSERT and UPDATE in a single transaction.
         self.conn
-            .execute(
-                "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reasoning_content, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![session_id, role_str, content_json, tool_calls_json, tool_call_id, reasoning, now],
-            )
-            .map_err(|e| format!("Insert message error: {}", e))?;
+            .execute_batch("BEGIN;")
+            .map_err(|e| format!("Begin transaction error: {}", e))?;
 
-        // Bump the session's updated_at.
+        let insert_result = self.conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reasoning_content, name, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_id,
+                role_str,
+                content_json,
+                tool_calls_json,
+                tool_call_id,
+                reasoning,
+                name,
+                created_at,
+            ],
+        );
+        if let Err(e) = insert_result {
+            self.conn.execute_batch("ROLLBACK;").ok();
+            return Err(format!("Insert message error: {}", e));
+        }
+
+        let update_result = self.conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now, session_id],
+        );
+        if let Err(e) = update_result {
+            self.conn.execute_batch("ROLLBACK;").ok();
+            return Err(format!("Update session timestamp error: {}", e));
+        }
+
         self.conn
-            .execute(
-                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
-                params![now, session_id],
-            )
-            .map_err(|e| format!("Update session timestamp error: {}", e))?;
+            .execute_batch("COMMIT;")
+            .map_err(|e| format!("Commit transaction error: {}", e))?;
 
         Ok(())
     }
@@ -305,8 +351,8 @@ impl SessionManager {
         };
 
         for sess in all {
-            // Parse the updated_at Unix timestamp into a NaiveDate.
-            let sess_date = chrono::DateTime::from_timestamp(sess.updated_at, 0)
+            // SM11: Use non-deprecated from_timestamp_millis.
+            let sess_date = chrono::DateTime::from_timestamp_millis(sess.updated_at * 1000)
                 .map(|dt| dt.date_naive())
                 .unwrap_or(today);
 
@@ -330,6 +376,13 @@ impl SessionManager {
 
     /// Remove sessions whose `updated_at` is older than `retention_days` days.
     fn purge_old_sessions(&self) -> Result<(), String> {
+        // SM13: retention_days=0 means "keep forever".
+        if self.retention_days == 0 {
+            return Ok(());
+        }
+        // SM3: Ensure foreign keys are enforced for CASCADE delete.
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;").ok();
+
         let cutoff = Utc::now().timestamp() - (self.retention_days as i64 * 86_400);
         self.conn
             .execute("DELETE FROM sessions WHERE updated_at < ?1", params![cutoff])
@@ -349,7 +402,7 @@ impl SessionManager {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT role, content, tool_calls, tool_call_id, reasoning_content, created_at
+                "SELECT role, content, tool_calls, tool_call_id, reasoning_content, name, created_at
                  FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| format!("Prepare messages query: {}", e))?;
@@ -362,60 +415,138 @@ impl SessionManager {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|e| format!("Query messages error: {}", e))?;
 
-        let mut messages = Vec::new();
-        for row in rows {
-            let (role_str, content_json, tool_calls_json, tool_call_id, reasoning_content, created_at) =
-                row.map_err(|e| format!("Row error: {}", e))?;
+        // SM7: Use iterator with filter_map to skip corrupt rows instead of failing.
+        let mut messages: Vec<Message> = rows
+            .filter_map(|row| {
+                let (role_str, content_json, tool_calls_json, tool_call_id, reasoning_content, name, created_at) =
+                    match row {
+                        Ok(tuple) => tuple,
+                        Err(e) => {
+                            eprintln!(
+                                "[SessionManager] Skipping corrupt message row: {}",
+                                e
+                            );
+                            return None;
+                        }
+                    };
 
-            let role = str_to_role(&role_str);
-            let content: MessageContent = serde_json::from_str(&content_json)
-                .map_err(|e| format!("Deserialize content: {}", e))?;
-            let tool_calls: Option<Vec<ToolCall>> = tool_calls_json
-                .map(|s| serde_json::from_str(&s).map_err(|e| format!("Deserialize tool_calls: {}", e)))
-                .transpose()?;
+                // SM10: str_to_role now returns Result; skip on unknown role.
+                let role = match str_to_role(&role_str) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[SessionManager] Skipping message with {}",
+                            e
+                        );
+                        return None;
+                    }
+                };
 
-            messages.push(Message {
-                role,
-                content,
-                name: None,
-                tool_calls,
-                tool_call_id,
-                reasoning_content,
-                created_at,
-            });
-        }
+                let content: MessageContent = match serde_json::from_str(&content_json) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "[SessionManager] Skipping message with corrupt content: {}",
+                            e
+                        );
+                        return None;
+                    }
+                };
+
+                let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
+                    Some(ref s) => match serde_json::from_str(s) {
+                        Ok(tc) => Some(tc),
+                        Err(e) => {
+                            eprintln!(
+                                "[SessionManager] Skipping message with corrupt tool_calls: {}",
+                                e
+                            );
+                            return None;
+                        }
+                    },
+                    None => None,
+                };
+
+                Some(Message {
+                    role,
+                    content,
+                    name,
+                    tool_calls,
+                    tool_call_id,
+                    reasoning_content,
+                    created_at,
+                })
+            })
+            .collect();
 
         Self::validate_tool_chain(&mut messages);
+
+        // SM9: Filter out ghost messages (empty assistant with no content/tools/reasoning).
+        messages.retain(|m| {
+            if m.role == Role::Assistant
+                && m.content.is_empty()
+                && m.tool_calls.is_none()
+                && m.reasoning_content.is_none()
+            {
+                eprintln!("[SessionManager] Removing ghost assistant message");
+                false
+            } else {
+                true
+            }
+        });
+
         Ok(messages)
     }
 
     /// Strip orphaned tool_calls and their tool messages.
     fn validate_tool_chain(messages: &mut Vec<Message>) {
-        let responded: std::collections::HashSet<String> = messages.iter()
+        let responded: std::collections::HashSet<String> = messages
+            .iter()
             .filter(|m| m.role == Role::Tool)
             .filter_map(|m| m.tool_call_id.clone())
             .collect();
         for m in messages.iter_mut() {
             if let Some(ref mut tc) = m.tool_calls {
+                // SM8: Track which tool call IDs are being orphaned.
+                let orphaned_ids: std::collections::HashSet<String> = tc
+                    .iter()
+                    .filter(|t| !responded.contains(&t.id))
+                    .map(|t| t.id.clone())
+                    .collect();
                 tc.retain(|t| responded.contains(&t.id));
                 if tc.is_empty() {
                     m.tool_calls = None;
-                    m.tool_call_id = None; // clear orphaned tool_call_id too
+                    // SM8: Only clear tool_call_id on Assistant messages when
+                    // ALL their tool_calls are orphaned AND tool_call_id matches
+                    // one of the orphaned IDs.
+                    if m.role == Role::Assistant {
+                        if let Some(ref tci) = m.tool_call_id {
+                            if orphaned_ids.contains(tci) {
+                                m.tool_call_id = None;
+                            }
+                        }
+                    }
                 }
             }
         }
-        let valid_ids: std::collections::HashSet<String> = messages.iter()
+        let valid_ids: std::collections::HashSet<String> = messages
+            .iter()
             .filter_map(|m| m.tool_calls.as_ref())
             .flat_map(|tc| tc.iter().map(|t| t.id.clone()))
             .collect();
         messages.retain(|m| {
-            if m.role != Role::Tool { return true; }
-            m.tool_call_id.as_ref().map_or(false, |id| valid_ids.contains(id))
+            if m.role != Role::Tool {
+                return true;
+            }
+            m.tool_call_id
+                .as_ref()
+                .map_or(false, |id| valid_ids.contains(id))
         });
     }
 }
@@ -431,13 +562,13 @@ fn role_to_str(role: &Role) -> &'static str {
     }
 }
 
-fn str_to_role(s: &str) -> Role {
+fn str_to_role(s: &str) -> Result<Role, String> {
     match s {
-        "system" => Role::System,
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        "tool" => Role::Tool,
-        _ => Role::User, // safe default
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        _ => Err(format!("Unknown role '{}'", s)), // SM10: error on unknown roles
     }
 }
 

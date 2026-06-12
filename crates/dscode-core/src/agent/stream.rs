@@ -22,6 +22,9 @@ pub enum StreamEvent {
         name: String,
         #[serde(default)]
         description: String,
+        /// Raw JSON arguments string as received from the LLM.
+        #[serde(default)]
+        arguments: String,
     },
     /// Streaming progress from a running tool.
     ToolProgress {

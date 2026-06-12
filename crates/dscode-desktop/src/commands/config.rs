@@ -18,10 +18,9 @@ pub async fn get_config(
 
 /// Update the application configuration.
 ///
-/// This replaces the in-memory config and persists it to disk immediately.
-/// If the save fails, the in-memory state is NOT rolled back (the error is
-/// returned, but the new config remains in memory until the next successful
-/// save).
+/// The config is first persisted to disk. If the save succeeds, the in-memory
+/// state is updated. If the save fails, the in-memory state is NOT modified
+/// (the error is returned with the original config intact).
 #[tauri::command]
 pub async fn update_config(
     state: tauri::State<'_, AppState>,
@@ -29,7 +28,13 @@ pub async fn update_config(
 ) -> Result<(), String> {
     info!("config: updating");
 
-    // Persist to disk first.
+    // BUG10: Only reset session_manager if retention_days actually changed.
+    let retention_changed = {
+        let guard = state.config.lock().await;
+        guard.session.retention_days != config.session.retention_days
+    };
+
+    // Persist to disk first. If this fails, in-memory state is untouched.
     config.save().map_err(|e| format!("Failed to save config: {}", e))?;
 
     // Update in-memory state.
@@ -38,9 +43,8 @@ pub async fn update_config(
         *guard = config;
     }
 
-    // Re-initialize the session manager with the new retention setting
-    // (the old manager will be dropped and recreated on next use).
-    {
+    // BUG10: Re-initialize the session manager only if retention_days changed.
+    if retention_changed {
         let mut guard = state.session_manager.lock().await;
         *guard = None;
     }

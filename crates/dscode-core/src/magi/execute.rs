@@ -208,12 +208,29 @@ async fn execute_balthasar_tool(
         }
     };
 
-    // Execute
+    // Create a proper event channel so tool events are consumed rather than
+    // dropped. Spawn a background task that logs or forwards events to a
+    // debug callback. This prevents the "dropped receiver" warning that
+    // occurs when tools emit events but nobody is listening.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sid = session_id.to_string();
+    let tname = tool_name.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            debug!(
+                session = %sid,
+                tool = %tname,
+                event = ?event,
+                "Balthasar: tool event consumed"
+            );
+        }
+    });
+
     let ctx = ToolContext {
         working_dir: working_dir.clone(),
         session_id: session_id.to_string(),
         tool_call_id: tc.id.clone(),
-        sender: tokio::sync::mpsc::unbounded_channel().0, // dummy sender
+        sender: tx,
     };
 
     match tools.execute(tool_name, args, &ctx).await {

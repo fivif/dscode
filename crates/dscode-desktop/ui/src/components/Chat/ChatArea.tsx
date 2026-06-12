@@ -9,9 +9,22 @@ export default function ChatArea() {
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamError = useChatStore((s) => s.streamError);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRaf = useRef<number>(0);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current);
+    scrollRaf.current = requestAnimationFrame(() => {
+      const container = containerRef.current;
+      if (container) {
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        const isNearBottom = scrollHeight - scrollTop - clientHeight < 80;
+        if (isNearBottom) {
+          bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }
+      }
+    });
+    return () => { if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current); };
   }, [messages]);
 
   if (messages.length === 0) {
@@ -26,7 +39,7 @@ export default function ChatArea() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-4">
+    <div ref={containerRef} className="flex-1 overflow-y-auto px-4 py-4">
       {messages.map((msg) => {
         const thinking = msg.thinking_blocks || [];
         const toolCalls = msg.tool_calls || [];

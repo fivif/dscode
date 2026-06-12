@@ -7,7 +7,6 @@ import { KNOWN_MODELS, type ModelDef } from '@/lib/types';
 export default function InputBox() {
   const [input, setInput] = useState('');
   const [showModelPicker, setShowModelPicker] = useState(false);
-  const [outputFormat, setOutputFormat] = useState<'markdown' | 'html'>('markdown');
   const messages = useChatStore((s) => s.messages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -146,15 +145,6 @@ export default function InputBox() {
                 </svg>
                 <span className="absolute text-[7px] text-gray-400 font-mono">{ctxUsed}</span>
               </div>
-
-              {/* Markdown / HTML toggle */}
-              <button
-                className={`text-xs px-2 py-0.5 rounded transition-colors ${outputFormat === 'markdown' ? 'text-gray-300 bg-gray-700' : 'text-gray-500 hover:text-gray-300'}`}
-                onClick={() => setOutputFormat(outputFormat === 'markdown' ? 'html' : 'markdown')}
-                title="输出格式切换"
-              >
-                {outputFormat === 'markdown' ? 'MD' : 'HTML'}
-              </button>
 
               {/* Wiki toggle */}
               <button

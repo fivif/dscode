@@ -6,6 +6,7 @@
 
 use regex::Regex;
 use std::path::{Component, Path, PathBuf};
+use tracing::warn;
 
 /// Guards against dangerous commands and path-escaping writes.
 #[derive(Debug, Clone)]
@@ -19,11 +20,21 @@ pub struct SafetyGuard {
 impl SafetyGuard {
     /// Build a new guard from a list of blocked command regex patterns.
     ///
-    /// Invalid patterns are silently skipped.
+    /// Invalid patterns are logged as warnings and skipped.
     pub fn new(blocked_commands: &[String], allow_write_outside_project: bool) -> Self {
         let blocked_patterns = blocked_commands
             .iter()
-            .filter_map(|pat| Regex::new(pat).ok())
+            .filter_map(|pat| match Regex::new(pat) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    warn!(
+                        pattern = %pat,
+                        error = %e,
+                        "SafetyGuard: skipping invalid blocked_command regex pattern"
+                    );
+                    None
+                }
+            })
             .collect();
 
         Self {

@@ -15,21 +15,53 @@ use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 
 /// Resolve `path` relative to `working_dir` and verify it stays within the
 /// working directory boundary (no path-escape attacks).
+///
+/// T6: For non-existing files, symlinks in parent directories are resolved by
+/// checking each ancestor path component with `canonicalize()`, then joining
+/// with the non-existent filename.
 fn resolve_path(path: &str, working_dir: &Path) -> Result<PathBuf, ToolError> {
     // Resolve relative to the working directory
     let candidate = working_dir.join(path);
 
     // Canonicalize to resolve symlinks and `..` components.
-    // If the path does not exist yet (e.g. for writes), we fall back to
-    // manually normalizing and checking.
     let canonical = match candidate.canonicalize() {
         Ok(p) => p,
         Err(_) => {
-            // Path doesn't exist — normalize manually and verify it would be
-            // within working_dir once created.
-            let normalized = normalize_path(&candidate);
-            let wd_normalized = normalize_path(working_dir);
-            if !normalized.starts_with(&wd_normalized) {
+            // T6: Path doesn't exist — resolve symlinks in parent directories first.
+            // Walk up from the candidate path finding the nearest existing ancestor,
+            // canonicalize it, then join the remaining non-existent components.
+            let mut existing_ancestor: Option<PathBuf> = None;
+            let mut remaining: Vec<std::path::Component<'_>> = Vec::new();
+
+            for ancestor in candidate.ancestors() {
+                if let Ok(canon) = ancestor.canonicalize() {
+                    existing_ancestor = Some(canon);
+                    break;
+                }
+                // Prepend components as we walk up
+                let comp = ancestor
+                    .file_name()
+                    .map(|_| ancestor.components().last())
+                    .flatten();
+                if let Some(c) = comp {
+                    remaining.insert(0, c);
+                }
+            }
+
+            let resolved = if let Some(ancestor) = existing_ancestor {
+                let mut result = ancestor;
+                for comp in remaining {
+                    result.push(comp.as_os_str());
+                }
+                result
+            } else {
+                // No existing ancestor found — fall back to manual normalization
+                normalize_path(&candidate)
+            };
+
+            // Verify the resolved path stays within the working directory
+            let wd_canonical = working_dir.canonicalize().unwrap_or_else(|_| working_dir.to_path_buf());
+            if !resolved.starts_with(&wd_canonical) {
                 return Err(ToolError::PathEscape(format!(
                     "Path '{}' resolves outside working directory '{}'",
                     path,

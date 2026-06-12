@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { ToolCallRecord } from '@/lib/types';
 
 interface Props { tool: ToolCallRecord; }
@@ -23,20 +23,28 @@ const ICON_COLORS: Record<ToolCallRecord['status'], string> = {
 
 export default function ToolCallCard({ tool }: Props) {
   const [expanded, setExpanded] = useState(false);
+  const userToggledRef = useRef(false);
 
   useEffect(() => {
-    if (tool.status === 'running') setExpanded(true);
-    else {
+    if (tool.status === 'running') {
+      setExpanded(true);
+      userToggledRef.current = false;
+    } else if (!userToggledRef.current) {
       const t = setTimeout(() => setExpanded(false), 4000);
       return () => clearTimeout(t);
     }
   }, [tool.status]);
 
+  const handleToggle = () => {
+    userToggledRef.current = true;
+    setExpanded(!expanded);
+  };
+
   return (
     <div className={`mb-1.5 ml-1 border ${COLORS[tool.status]} bg-card/60 rounded-md overflow-hidden transition-colors`}>
       <button
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-white/[0.03] transition-colors"
-        onClick={() => setExpanded(!expanded)}
+        onClick={handleToggle}
       >
         <span className={`text-[10px] font-mono ${ICON_COLORS[tool.status]} ${tool.status === 'running' ? 'animate-pulse' : ''}`}>
           {ICONS[tool.status]}

@@ -178,6 +178,9 @@ impl Forge {
         history: Vec<Message>,
         event_tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), ForgeError> {
+        // F4: Reset compression flag for each new execution so re-use works.
+        self.compressed.store(false, Ordering::Relaxed);
+
         // --- Build the enriched system prompt ---
         let enriched_system = format!(
             "{}\n\nCurrent working directory: {}",
@@ -235,6 +238,15 @@ impl Forge {
             "Forge: starting ReAct loop"
         );
 
+        // F5: Track message count at start of this execute() so stall
+        // detection only examines messages added during the current run.
+        let initial_msg_count = messages.len();
+
+        // F2: Sliding window of tool-call sets (order-independent) from the
+        // last 5 iterations for alternating-pattern stall detection.
+        let mut recent_tool_sets: std::collections::VecDeque<std::collections::BTreeSet<String>> =
+            std::collections::VecDeque::new();
+
         // =================================================================
         // ReAct Loop
         // =================================================================
@@ -246,29 +258,45 @@ impl Forge {
                 "Forge: calling provider"
             );
 
-            // Stall detection: if same tools called 3+ iterations with no new output, stop
-            let stall_checks = [60u32, 80, 100, 120, 150, 180];
-            if stall_checks.contains(&iteration) && iteration > 5 {
-                let recent_tool_sets: Vec<Vec<String>> = messages.iter().rev().take(20)
+            // F1+F2: Stall detection — sliding window of tool-call sets.
+            // Check every 20 iterations starting at 60, including beyond 180.
+            if iteration >= 60 && (iteration <= 180 || iteration % 20 == 0) {
+                // Only scan messages added during this execute() call (F5).
+                let run_messages = &messages[initial_msg_count..];
+                let current_set: std::collections::BTreeSet<String> = run_messages
+                    .iter()
+                    .rev()
                     .filter_map(|m| m.tool_calls.as_ref())
-                    .map(|tc| tc.iter().map(|t| t.function.name.clone()).collect::<Vec<_>>())
-                    .filter(|v| !v.is_empty())
-                    .take(3).collect();
-                if recent_tool_sets.len() >= 3
-                    && recent_tool_sets[0] == recent_tool_sets[1]
-                    && recent_tool_sets[1] == recent_tool_sets[2]
-                {
-                    let _ = event_tx.send(StreamEvent::Error {
-                        content: format!("检测到循环调用，已停止。最后重复的工具: {}", recent_tool_sets[0].join(", ")),
-                    });
-                    return Ok(());
+                    .flat_map(|tc| tc.iter().map(|t| t.function.name.clone()))
+                    .collect();
+                if !current_set.is_empty() {
+                    if recent_tool_sets.len() >= 5 {
+                        recent_tool_sets.pop_front();
+                    }
+                    recent_tool_sets.push_back(current_set.clone());
+                    // Detect if any set repeats 3+ times in the sliding window
+                    let mut counts: std::collections::HashMap<&std::collections::BTreeSet<String>, usize> =
+                        std::collections::HashMap::new();
+                    for s in recent_tool_sets.iter() {
+                        *counts.entry(s).or_insert(0) += 1;
+                    }
+                    if counts.values().any(|&c| c >= 3) {
+                        let repeated: Vec<String> = current_set.iter().cloned().collect();
+                        let _ = event_tx.send(StreamEvent::Error {
+                            content: format!("检测到循环调用，已停止。重复的工具: {}", repeated.join(", ")),
+                        });
+                        return Ok(());
+                    }
                 }
             }
 
             // (a.0) Check if context compression is needed
             if !self.compressed.load(Ordering::Relaxed) {
-                let sys_tok = count_message_tokens(&messages.iter().filter(|m| m.role == Role::System).cloned().collect::<Vec<_>>());
-                let hist_tok = count_message_tokens(&messages.iter().filter(|m| m.role != Role::System).cloned().collect::<Vec<_>>());
+                // F7: Pass reference slices instead of cloning.
+                let sys_refs: Vec<&Message> = messages.iter().filter(|m| m.role == Role::System).collect();
+                let sys_tok = count_message_tokens(&sys_refs);
+                let hist_refs: Vec<&Message> = messages.iter().filter(|m| m.role != Role::System).collect();
+                let hist_tok = count_message_tokens(&hist_refs);
                 let threshold = (self.context_config.window_tokens as f64 * self.context_config.compress_threshold) as u64;
                 if sys_tok + hist_tok > threshold {
                     info!(session = %session_id, iteration, sys_tok, hist_tok, threshold, "compression");
@@ -283,7 +311,9 @@ impl Forge {
                     }
                     if compress_count > 0 {
                         let old: Vec<_> = non_sys.iter().take(compress_count).map(|(_, m)| (*m).clone()).collect();
-                        let prompt = compression_prompt(&old);
+                        // C3: Limit compression prompt to half the context window.
+                        let half_window = (self.context_config.window_tokens / 2) as u64;
+                        let prompt = compression_prompt(&old, half_window);
                         let summary = self.provider.chat(
                             vec![Message { role: Role::User, content: MessageContent::Text(prompt), ..Default::default() }],
                             vec![],
@@ -299,12 +329,12 @@ impl Forge {
                 }
             }
 
-            // Clean orphaned tool_calls before sending (API rejects them)
-            let mut cleaned_messages = messages.clone();
-            clean_orphaned_tool_calls(&mut cleaned_messages);
+            // F10: Clean orphaned tool_calls on the original vec so the
+            // fix persists across iterations (new messages appended to original).
+            clean_orphaned_tool_calls(&mut messages);
 
-            // (a) Call the LLM provider
-            let response = match self.provider.chat(cleaned_messages, tools.clone()).await {
+            // (a) Call the LLM provider with a snapshot of the cleaned messages.
+            let response = match self.provider.chat(messages.clone(), tools.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!(session = %session_id, iteration, %e, "provider error");
@@ -350,7 +380,6 @@ impl Forge {
                 reasoning_content: response.reasoning_content.clone(),
                 created_at: 0,
             };
-            messages.push(assistant_msg);
 
             // (e) Execute tool calls if present
             if has_tool_calls {
@@ -360,6 +389,10 @@ impl Forge {
                     tool_count = response.tool_calls.len(),
                     "Forge: executing tool calls"
                 );
+
+                // F8: Push assistant message only when tool execution proceeds,
+                // and before tool results so the API sees Assistant→Tool ordering.
+                messages.push(assistant_msg);
 
                 for tc in &response.tool_calls {
                     execute_one_tool(
@@ -437,7 +470,7 @@ pub async fn compress_context(
     if compress_count == 0 { return messages.to_vec(); }
 
     let old: Vec<_> = messages.iter().filter(|m| m.role != Role::System).take(compress_count).cloned().collect();
-    let prompt = compression_prompt(&old);
+    let prompt = compression_prompt(&old, 65536);
     let summary = match provider.chat(
         vec![Message { role: Role::User, content: MessageContent::Text(prompt), ..Default::default() }],
         vec![],
@@ -521,6 +554,7 @@ async fn execute_one_tool(
         id: tool_call_id.clone(),
         name: tool_name.clone(),
         description,
+        arguments: tc.function.arguments.clone(),
     });
 
     // --- Parse arguments ---

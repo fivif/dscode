@@ -5,24 +5,26 @@ use std::path::PathBuf;
 use dscode_core::agent::forge::Forge;
 use dscode_core::agent::stream::StreamEvent;
 use dscode_core::providers::openai::OpenAiProvider;
-use dscode_core::providers::trait_def::{Message, MessageContent, Role};
+use dscode_core::providers::trait_def::{FunctionCall, Message, MessageContent, Role, ToolCall};
 use tauri::Manager;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::app_state::AppState;
+use crate::app_state::{ActiveForge, AppState};
 use crate::events;
 
 /// Send a user message to the agent and stream the response back to the
 /// frontend via `stream-event` Tauri events.
 ///
 /// # Flow
-/// 1. Reads the current config and creates an [`OpenAiProvider`].
-/// 2. Loads conversation history from the session manager.
-/// 3. Persists the user message to the session.
-/// 4. Builds a [`Forge`] with registered tools and the current working dir.
-/// 5. Spawns a background Tokio task that runs `forge.execute()` and relays
+/// 1. Acquires a per-session mutex to prevent concurrent sends to the same session.
+/// 2. Reads the current config and creates an [`OpenAiProvider`].
+/// 3. Loads conversation history from the session manager.
+/// 4. Persists the user message to the session.
+/// 5. Builds a [`Forge`] with registered tools and the current working dir.
+/// 6. Spawns a background Tokio task that runs `forge.execute()` and relays
 ///    every [`StreamEvent`] to the frontend.
-/// 6. Stores the task handle so the frontend can abort it.
+/// 7. Stores the task handle and [`CancellationToken`] so the frontend can abort it.
 #[tauri::command]
 pub async fn send_message(
     state: tauri::State<'_, AppState>,
@@ -32,8 +34,11 @@ pub async fn send_message(
 ) -> Result<(), String> {
     info!(%session_id, msg_len = message.len(), "chat: send_message");
 
+    // DB5: Per-session mutex — prevent concurrent sends to the same session.
+    let _session_guard = state.acquire_session_lock(&session_id).await;
+
     // 1. Read config and create provider.
-    let (api_key, base_url, model, max_tokens, temperature, reasoning_effort) = {
+    let (api_key, base_url, model, max_tokens, temperature, reasoning_effort, context_cfg) = {
         let config = state.config.lock().await;
         let pc = config
             .provider_for_model(&config.default_model)
@@ -45,6 +50,7 @@ pub async fn send_message(
             config.generation.max_tokens,
             config.generation.temperature,
             config.generation.reasoning_effort.clone(),
+            config.context.clone(),
         )
     };
 
@@ -65,10 +71,10 @@ pub async fn send_message(
     provider.temperature = temperature;
     provider.reasoning_effort = Some(reasoning_effort);
 
-    // 2. Ensure session manager exists and load history.
+    // DB4: Hold session_manager lock once for all session DB operations.
     state.ensure_session_manager().await?;
 
-    let history: Vec<Message> = {
+    let (history, working_dir) = {
         let sm_guard = state.session_manager.lock().await;
         let sm = sm_guard
             .as_ref()
@@ -77,16 +83,9 @@ pub async fn send_message(
         let session = sm
             .get_session(&session_id)?
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
-        session.messages
-    };
+        let history = session.messages;
 
-    // 3. Persist the user message.
-    {
-        let sm_guard = state.session_manager.lock().await;
-        let sm = sm_guard
-            .as_ref()
-            .ok_or_else(|| "Session manager not initialized".to_string())?;
-
+        // 3. Persist the user message.
         sm.add_message(
             &session_id,
             &Message {
@@ -99,23 +98,17 @@ pub async fn send_message(
                 created_at: 0,
             },
         )?;
-    }
 
-    // 4. Build the Forge using the session's workspace.
-    let working_dir = {
-        let sm_guard = state.session_manager.lock().await;
-        let sm = sm_guard.as_ref().ok_or_else(|| "Session manager not initialized".to_string())?;
-        let session = sm.get_session(&session_id)?.ok_or_else(|| format!("Session '{}' not found", session_id))?;
-        if session.workspace.is_empty() {
+        let wd = if session.workspace.is_empty() {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
         } else {
             PathBuf::from(&session.workspace)
-        }
+        };
+
+        (history, wd)
     };
-    let context_cfg = {
-        let config = state.config.lock().await;
-        config.context.clone()
-    };
+
+    // 4. Build the Forge using the session's workspace.
     let forge = Forge::new(
         Box::new(provider),
         state.tool_registry.clone(),
@@ -123,98 +116,202 @@ pub async fn send_message(
     )
     .with_context_config(context_cfg);
 
-    // 5. Spawn the agent loop in a background task.
+    // 5. Spawn the agent loop in a background task with cancellation support.
     let app_handle_clone = app_handle.clone();
     let session_id_clone = session_id.clone();
-    let session_id_for_forge = session_id.clone();
-    let message_for_forge = message.clone();
     let persist_sid = session_id.clone();
+
+    // DB2+DB3: Shared CancellationToken so abort cancels both event loop and forge.
+    let cancel = CancellationToken::new();
+    let event_loop_cancel = cancel.clone();
+    let forge_cancel = cancel.clone();
+
     let handle = tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+
+        // DB3: Forge task uses select! so cancellation aborts in-progress LLM calls.
         let forge_task = tokio::spawn(async move {
-            forge.execute(&message_for_forge, &session_id_for_forge, history, tx).await
+            tokio::select! {
+                biased;
+                _ = forge_cancel.cancelled() => Ok(()),
+                result = forge.execute(&message, &session_id_clone, history, tx) => result,
+            }
         });
 
         let mut assistant_content = String::new();
-        while let Some(event) = rx.recv().await {
-            // Persist tool calls and thinking as separate messages for history
-            let app_state = app_handle_clone.state::<AppState>();
-            let sm_guard = app_state.session_manager.lock().await;
-            if let Some(ref sm) = *sm_guard {
-                let now = chrono::Utc::now().timestamp();
-                match &event {
-                    StreamEvent::Token { content } => assistant_content.push_str(content),
-                    StreamEvent::ToolStart { id, name, .. } => {
-                        // Save accumulated text as a message before the tool
+        // DB6: Accumulate thinking content across events, persist as one message.
+        let mut thinking_buffer = String::new();
+
+        loop {
+            tokio::select! {
+                biased;
+                // DB2: On cancellation, persist accumulated content before exiting.
+                _ = event_loop_cancel.cancelled() => {
+                    let app_state = app_handle_clone.state::<AppState>();
+                    let sm_guard = app_state.session_manager.lock().await;
+                    if let Some(ref sm) = *sm_guard {
+                        let now = chrono::Utc::now().timestamp();
+                        // DB6: Persist accumulated thinking as one message.
+                        if !thinking_buffer.is_empty() {
+                            sm.add_message(&persist_sid, &Message {
+                                role: Role::Assistant,
+                                content: MessageContent::Text(String::new()),
+                                name: None, tool_calls: None, tool_call_id: None,
+                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
+                                created_at: now,
+                            }).ok();
+                        }
                         if !assistant_content.is_empty() {
                             sm.add_message(&persist_sid, &Message {
-                                role: Role::Assistant, content: MessageContent::Text(assistant_content.clone()),
+                                role: Role::Assistant,
+                                content: MessageContent::Text(std::mem::take(&mut assistant_content)),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: None, created_at: now,
                             }).ok();
-                            assistant_content.clear();
                         }
-                        let tool_msg = Message {
-                            role: Role::Assistant, content: MessageContent::Text(String::new()),
-                            name: None, tool_call_id: Some(id.clone()),
-                            tool_calls: Some(vec![dscode_core::providers::trait_def::ToolCall {
-                                id: id.clone(), call_type: "function".into(),
-                                function: dscode_core::providers::trait_def::FunctionCall { name: name.clone(), arguments: String::new() },
-                            }]),
-                            reasoning_content: None,
-                            created_at: now,
-                        };
-                        sm.add_message(&persist_sid, &tool_msg).ok();
                     }
-                    StreamEvent::ToolEnd { id, result, .. } => {
-                        let tool_end = Message {
-                            role: Role::Tool, content: MessageContent::Text(result.clone()),
-                            name: None, tool_calls: None, tool_call_id: Some(id.clone()),
-                            reasoning_content: None, created_at: now,
-                        };
-                        sm.add_message(&persist_sid, &tool_end).ok();
+                    info!(session = %persist_sid, "forge cancelled, partial content persisted");
+                    break;
+                }
+                event = rx.recv() => {
+                    match event {
+                        Some(ref ev) => {
+                            let app_state = app_handle_clone.state::<AppState>();
+                            let sm_guard = app_state.session_manager.lock().await;
+                            if let Some(ref sm) = *sm_guard {
+                                let now = chrono::Utc::now().timestamp();
+                                match ev {
+                                    StreamEvent::Token { content: ref t_content } => {
+                                        // DB6: Flush accumulated thinking before text.
+                                        if !thinking_buffer.is_empty() {
+                                            sm.add_message(&persist_sid, &Message {
+                                                role: Role::Assistant,
+                                                content: MessageContent::Text(String::new()),
+                                                name: None, tool_calls: None, tool_call_id: None,
+                                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
+                                                created_at: now,
+                                            }).ok();
+                                        }
+                                        assistant_content.push_str(t_content);
+                                    }
+                                    StreamEvent::ToolStart { id, name, arguments, .. } => {
+                                        // DB6: Flush accumulated thinking before tool.
+                                        if !thinking_buffer.is_empty() {
+                                            sm.add_message(&persist_sid, &Message {
+                                                role: Role::Assistant,
+                                                content: MessageContent::Text(String::new()),
+                                                name: None, tool_calls: None, tool_call_id: None,
+                                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
+                                                created_at: now,
+                                            }).ok();
+                                        }
+                                        // Save accumulated text as a message before the tool.
+                                        if !assistant_content.is_empty() {
+                                            sm.add_message(&persist_sid, &Message {
+                                                role: Role::Assistant,
+                                                content: MessageContent::Text(assistant_content.clone()),
+                                                name: None, tool_calls: None, tool_call_id: None,
+                                                reasoning_content: None, created_at: now,
+                                            }).ok();
+                                            assistant_content.clear();
+                                        }
+                                        // DB1: Persist tool call WITH arguments from StreamEvent.
+                                        let tool_msg = Message {
+                                            role: Role::Assistant,
+                                            content: MessageContent::Text(String::new()),
+                                            name: None,
+                                            tool_call_id: Some(id.clone()),
+                                            tool_calls: Some(vec![ToolCall {
+                                                id: id.clone(),
+                                                call_type: "function".into(),
+                                                function: FunctionCall {
+                                                    name: name.clone(),
+                                                    arguments: arguments.clone(),
+                                                },
+                                            }]),
+                                            reasoning_content: None,
+                                            created_at: now,
+                                        };
+                                        sm.add_message(&persist_sid, &tool_msg).ok();
+                                    }
+                                    StreamEvent::ToolEnd { id, result, .. } => {
+                                        // DB6: Flush accumulated thinking before tool result.
+                                        if !thinking_buffer.is_empty() {
+                                            sm.add_message(&persist_sid, &Message {
+                                                role: Role::Assistant,
+                                                content: MessageContent::Text(String::new()),
+                                                name: None, tool_calls: None, tool_call_id: None,
+                                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
+                                                created_at: now,
+                                            }).ok();
+                                        }
+                                        let tool_end = Message {
+                                            role: Role::Tool,
+                                            content: MessageContent::Text(result.clone()),
+                                            name: None, tool_calls: None,
+                                            tool_call_id: Some(id.clone()),
+                                            reasoning_content: None, created_at: now,
+                                        };
+                                        sm.add_message(&persist_sid, &tool_end).ok();
+                                    }
+                                    StreamEvent::Thinking { content: ref t_content, .. } => {
+                                        // DB6: Accumulate thinking instead of persisting each event.
+                                        thinking_buffer.push_str(t_content);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Release sm_guard before emitting event.
+                            drop(sm_guard);
+                            events::emit_event(&app_handle_clone, ev);
+                        }
+                        None => break, // Channel closed, forge finished.
                     }
-                    StreamEvent::Thinking { content, step: _ } => {
-                        let think_msg = Message {
-                            role: Role::Assistant, content: MessageContent::Text(String::new()),
-                            name: None, tool_calls: None, tool_call_id: None,
-                            reasoning_content: Some(content.clone()),
-                            created_at: now,
-                        };
-                        sm.add_message(&persist_sid, &think_msg).ok();
-                    }
-                    _ => {}
                 }
             }
-            events::emit_event(&app_handle_clone, &event);
         }
 
+        // If the loop ended normally (channel closed), check forge result.
         match forge_task.await {
-            Ok(Ok(())) => info!(session = %session_id_clone, "forge completed"),
-            Ok(Err(e)) => error!(session = %session_id_clone, %e, "forge failed"),
-            Err(e) => error!(session = %session_id_clone, ?e, "forge panicked"),
+            Ok(Ok(())) => info!(session = %persist_sid, "forge completed"),
+            Ok(Err(e)) => error!(session = %persist_sid, %e, "forge failed"),
+            Err(e) => error!(session = %persist_sid, ?e, "forge panicked"),
         }
 
-        // Persist final text response
+        // DB2: Persist final accumulated content after normal completion.
         let app_state = app_handle_clone.state::<AppState>();
         let sm_guard = app_state.session_manager.lock().await;
         if let Some(ref sm) = *sm_guard {
+            let now = chrono::Utc::now().timestamp();
+            // DB6: Persist any remaining accumulated thinking.
+            if !thinking_buffer.is_empty() {
+                sm.add_message(&persist_sid, &Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text(String::new()),
+                    name: None, tool_calls: None, tool_call_id: None,
+                    reasoning_content: Some(thinking_buffer),
+                    created_at: now,
+                }).ok();
+            }
             if !assistant_content.is_empty() {
                 sm.add_message(&persist_sid, &Message {
                     role: Role::Assistant,
                     content: MessageContent::Text(assistant_content),
                     name: None, tool_calls: None, tool_call_id: None,
-                    reasoning_content: None, created_at: chrono::Utc::now().timestamp(),
+                    reasoning_content: None, created_at: now,
                 }).ok();
             }
         }
     });
 
-    // Store the handle so `abort` can cancel it.
+    // Store the handle and cancellation token so `abort` can cancel it.
     {
         let mut guard = state.active_forge_handle.lock().await;
-        if let Some(old_handle) = guard.take() { old_handle.abort(); }
-        *guard = Some(handle);
+        if let Some(old) = guard.take() {
+            old.cancel.cancel();
+            old.handle.abort();
+        }
+        *guard = Some(ActiveForge { cancel, handle });
     }
 
     Ok(())
@@ -222,16 +319,24 @@ pub async fn send_message(
 
 /// Abort the currently running forge task.
 ///
-/// This sends an abort signal to the background Tokio task spawned by
-/// [`send_message`]. Any in-progress LLM call or tool execution will be
-/// cancelled. The frontend should treat this as an interrupted turn.
+/// This cancels the [`CancellationToken`] shared with the forge and event-loop
+/// tasks, causing both to stop. Accumulated assistant text and thinking content
+/// are persisted before the tasks exit. The frontend should treat this as an
+/// interrupted turn.
 #[tauri::command]
 pub async fn abort(state: tauri::State<'_, AppState>) -> Result<(), String> {
     info!("chat: abort requested");
 
     let mut guard = state.active_forge_handle.lock().await;
-    if let Some(handle) = guard.take() {
-        handle.abort();
+    if let Some(active) = guard.take() {
+        // DB3: Cancel the token — this stops both the forge (LLM call) and
+        // the event loop. The handle.abort() is a safety net.
+        active.cancel.cancel();
+        // Give tasks a moment to respond to cancellation.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if !active.handle.is_finished() {
+            active.handle.abort();
+        }
         info!("chat: forge task aborted");
     } else {
         info!("chat: no active forge task to abort");

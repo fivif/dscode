@@ -7,12 +7,21 @@ use tracing::info;
 
 use crate::app_state::AppState;
 
-/// List all sessions, most-recently-updated first.
+/// List sessions, most-recently-updated first.
 /// Messages are NOT loaded (use [`get_session`] for full details).
+///
+/// # Parameters
+/// - `limit`: maximum number of sessions to return (default 100, max 500).
+/// - `offset`: number of sessions to skip before returning results (default 0).
 #[tauri::command]
 pub async fn list_sessions(
     state: tauri::State<'_, AppState>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<Vec<Session>, String> {
+    let limit = limit.unwrap_or(100).min(500);
+    let offset = offset.unwrap_or(0);
+
     state.ensure_session_manager().await?;
 
     let sm_guard = state.session_manager.lock().await;
@@ -20,7 +29,17 @@ pub async fn list_sessions(
         .as_ref()
         .ok_or_else(|| "Session manager not initialized".to_string())?;
 
-    sm.list_sessions()
+    let mut sessions = sm.list_sessions()?;
+    // Apply pagination in-memory (the full list is already sorted by updated_at DESC).
+    let total = sessions.len();
+    if offset < total {
+        let end = (offset + limit).min(total);
+        sessions = sessions[offset..end].to_vec();
+    } else {
+        sessions.clear();
+    }
+
+    Ok(sessions)
 }
 
 /// Get a session by id, including all messages.

@@ -467,23 +467,11 @@ impl PrdGenerator {
     }
 
     fn infer_files(&self, answers: &[(String, String)], _goals: &[String]) -> Vec<FileAction> {
-        // Inspect the working directory for existing source files
+        // Recursively walk the working directory for existing source files
+        // (Rust, TOML configs, Markdown docs). Directories like target/,
+        // node_modules/, .git/ are excluded for performance.
         let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.working_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext == "rs" || ext == "toml" || ext == "md" {
-                        files.push(FileAction {
-                            path: path.display().to_string(),
-                            action: FileActionType::Modify,
-                            description: format!("Existing {} file", ext),
-                            estimated_lines: 0,
-                        });
-                    }
-                }
-            }
-        }
+        self.collect_files_recursive(&self.working_dir, &mut files, 0);
         // Also check answers for explicitly mentioned paths
         for (_, answer) in answers {
             for word in answer.split_whitespace() {
@@ -540,6 +528,53 @@ impl PrdGenerator {
             completed: false,
         });
         steps
+    }
+
+    /// Recursively collect source files from `dir`, skipping noise directories.
+    /// Limits recursion depth to `max_depth` (0-based; 0 = root only) to
+    /// avoid runaway traversal in large repositories.
+    fn collect_files_recursive(
+        &self,
+        dir: &std::path::Path,
+        files: &mut Vec<FileAction>,
+        depth: usize,
+    ) {
+        // Skip common build / dependency directories.
+        const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".direnv", "dist", "build"];
+        const MAX_DEPTH: usize = 10;
+
+        if depth > MAX_DEPTH {
+            return;
+        }
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if path.is_dir() {
+                if SKIP_DIRS.contains(&file_name) || file_name.starts_with('.') {
+                    continue;
+                }
+                self.collect_files_recursive(&path, files, depth + 1);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext == "rs" || ext == "toml" || ext == "md" {
+                    files.push(FileAction {
+                        path: path.display().to_string(),
+                        action: FileActionType::Modify,
+                        description: format!("Existing {} file", ext),
+                        estimated_lines: 0,
+                    });
+                }
+            }
+        }
     }
 
     fn infer_test_plan(&self, files: &[FileAction], _answers: &[(String, String)]) -> TestPlan {

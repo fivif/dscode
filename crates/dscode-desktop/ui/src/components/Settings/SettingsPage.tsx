@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { useConfigStore } from '@/stores/configStore';
 import { KNOWN_MODELS } from '@/lib/types';
 import * as tauri from '@/lib/tauri';
+import type { AppConfig } from '@/lib/types';
 
 interface Props {
   onBack: () => void;
@@ -27,6 +28,14 @@ export default function SettingsPage({ onBack }: Props) {
   const [fetchedModels, setFetchedModels] = useState<Record<string, string[]>>({});
   const [fetching, setFetching] = useState(false);
   const [fetchMsg, setFetchMsg] = useState<string | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+
+  const debouncedUpdate = useCallback((patch: Partial<AppConfig>) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      updateConfig(patch);
+    }, 300);
+  }, [updateConfig]);
 
   const handleFetchModels = async (provider: string) => {
     setFetching(true);
@@ -125,7 +134,7 @@ export default function SettingsPage({ onBack }: Props) {
                     type="number" className="w-28 bg-card border border-border rounded-lg px-3 py-2.5 text-sm text-gray-200 focus:outline-none focus:border-gray-500 mt-2"
                     min={256} max={128000}
                     value={config.max_tokens}
-                    onChange={(e) => updateConfig({ max_tokens: parseInt(e.target.value) || 8192 })}
+                    onChange={(e) => debouncedUpdate({ max_tokens: parseInt(e.target.value) || 8192 })}
                   />
                 )}
               </Row>
@@ -134,7 +143,7 @@ export default function SettingsPage({ onBack }: Props) {
               <Row label="温度">
                 <div className="flex items-center gap-3">
                   <input type="range" min={0} max={2} step={0.1} value={config.temperature}
-                    onChange={(e) => updateConfig({ temperature: parseFloat(e.target.value) })}
+                    onChange={(e) => debouncedUpdate({ temperature: parseFloat(e.target.value) })}
                     className="w-36 accent-gray-400" />
                   <span className="text-xs text-gray-500 font-mono w-6">{config.temperature.toFixed(1)}</span>
                 </div>
@@ -159,7 +168,7 @@ export default function SettingsPage({ onBack }: Props) {
                 <div className="flex items-center gap-3">
                   <input type="range" min={0.6} max={0.95} step={0.05}
                     value={config.context_compress_threshold}
-                    onChange={(e) => updateConfig({ context_compress_threshold: parseFloat(e.target.value) })}
+                    onChange={(e) => debouncedUpdate({ context_compress_threshold: parseFloat(e.target.value) })}
                     className="w-36 accent-gray-400" />
                   <span className="text-xs text-gray-500 font-mono w-10">{(config.context_compress_threshold * 100).toFixed(0)}%</span>
                 </div>

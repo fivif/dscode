@@ -40,6 +40,7 @@ anyhow = "1"
 # Streaming
 futures = "0.3"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 # Regex
 regex = "1"
 # Random

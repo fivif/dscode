@@ -53,10 +53,21 @@ impl StallDetector {
         }
 
         // Check for upward trend — if improving, don't stall.
+        // Use a relative threshold: if the latest score is 20% higher than
+        // the earliest score in the window, consider it an upward trend
+        // regardless of absolute value.
         let first = self.recent_scores.first().copied().unwrap_or(0.0);
         let last = self.recent_scores.last().copied().unwrap_or(0.0);
-        if last > first && last >= 50.0 {
-            // Trending upward and not abysmal — give it more time.
+        let upward_trend = if first > 0.0 {
+            // Relative: 20% improvement from first to last.
+            (last - first) / first >= 0.20
+        } else if last > 0.0 {
+            // First was zero, anything positive is an improvement.
+            true
+        } else {
+            false
+        };
+        if upward_trend {
             return false;
         }
 

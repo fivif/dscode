@@ -47,15 +47,39 @@ pub async fn decompose_task(
     let response = provider.chat(messages, vec![]).await?;
 
     // Parse the numbered list from the response.
-    let subtasks: Vec<Subtask> = response
-        .content
-        .lines()
+    // Only lines that start with a number followed by a dot or parenthesis
+    // (e.g., "1.", "2)", "10.") are treated as task descriptions.
+    // Lines before the first numbered item (preamble / LLM commentary)
+    // are skipped.
+    //
+    // Find the index of the first numbered line.
+    let lines: Vec<&str> = response.content.lines().collect();
+    let start_idx = lines.iter().position(|line| {
+        let trimmed = line.trim();
+        let chars: Vec<char> = trimmed.chars().take(3).collect();
+        !chars.is_empty()
+            && chars[0].is_numeric()
+            && chars.get(1).map_or(false, |c| *c == '.' || *c == ')')
+    });
+
+    let parse_from = start_idx.unwrap_or(0);
+
+    let subtasks: Vec<Subtask> = lines[parse_from..]
+        .iter()
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() {
                 return None;
             }
             // Match lines like "1. Do something" or "1) Do something"
+            // Only parse if the line really does start with a number+delineator
+            let chars: Vec<char> = line.chars().take(3).collect();
+            if chars.len() < 2
+                || !chars[0].is_numeric()
+                || !(chars[1] == '.' || chars[1] == ')')
+            {
+                return None; // skip preamble / commentary lines
+            }
             let description = line
                 .trim_start_matches(|c: char| c.is_numeric() || c == '.' || c == ')' || c == ' ')
                 .trim()

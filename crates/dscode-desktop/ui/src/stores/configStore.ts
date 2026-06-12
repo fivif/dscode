@@ -2,6 +2,9 @@ import { create } from 'zustand';
 import * as tauri from '@/lib/tauri';
 import type { AppConfig, ProviderConfig } from '@/lib/types';
 
+let _saveTimer: ReturnType<typeof setTimeout> | null = null;
+let _pendingConfig: AppConfig | null = null;
+
 function defaultAppConfig(): AppConfig {
   return {
     default_model: 'deepseek-v4-pro',
@@ -53,24 +56,38 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
         context_compress_threshold: (r as any).context?.compress_threshold || 0.8,
       };
       set({ config: mapped, loading: false });
-    } catch { set({ loading: false }); }
+    } catch (e: any) { set({ loading: false, error: e?.message || String(e) }); }
   },
 
   saveConfig: async (c) => {
-    await tauri.updateConfig({
-      default_model: c.default_model,
-      router_model: c.default_model,
-      providers: {
-        deepseek: { api_key: c.providers.deepseek.api_key, base_url: c.providers.deepseek.base_url, enabled: c.providers.deepseek.enabled },
-        openai: { api_key: c.providers.openai.api_key, base_url: c.providers.openai.base_url, enabled: c.providers.openai.enabled },
-        anthropic: { api_key: c.providers.anthropic.api_key, base_url: c.providers.anthropic.base_url, enabled: c.providers.anthropic.enabled },
-        ollama: { api_key: '', base_url: '', enabled: false },
-      },
-      session: { retention_days: c.retention_days },
-      safety: { allow_write_outside_project: false, blocked_commands: [], tool_timeout_secs: 120 },
-      generation: { reasoning_effort: c.reasoning_effort, max_tokens: c.max_tokens, temperature: c.temperature },
-      context: { window_tokens: c.context_window_tokens, compress_threshold: c.context_compress_threshold },
-    } as any);
+    _pendingConfig = c;
+    return new Promise<void>((resolve, reject) => {
+      if (_saveTimer) clearTimeout(_saveTimer);
+      _saveTimer = setTimeout(async () => {
+        _saveTimer = null;
+        const cfg = _pendingConfig!;
+        _pendingConfig = null;
+        try {
+          await tauri.updateConfig({
+            default_model: cfg.default_model,
+            router_model: cfg.default_model,
+            providers: {
+              deepseek: { api_key: cfg.providers.deepseek.api_key, base_url: cfg.providers.deepseek.base_url, enabled: cfg.providers.deepseek.enabled, model: cfg.providers.deepseek.model },
+              openai: { api_key: cfg.providers.openai.api_key, base_url: cfg.providers.openai.base_url, enabled: cfg.providers.openai.enabled, model: cfg.providers.openai.model },
+              anthropic: { api_key: cfg.providers.anthropic.api_key, base_url: cfg.providers.anthropic.base_url, enabled: cfg.providers.anthropic.enabled, model: cfg.providers.anthropic.model },
+              ollama: { api_key: '', base_url: '', enabled: false },
+            },
+            session: { retention_days: cfg.retention_days },
+            safety: { allow_write_outside_project: false, blocked_commands: [], tool_timeout_secs: 120 },
+            generation: { reasoning_effort: cfg.reasoning_effort, max_tokens: cfg.max_tokens, temperature: cfg.temperature },
+            context: { window_tokens: cfg.context_window_tokens, compress_threshold: cfg.context_compress_threshold },
+          } as any);
+          resolve();
+        } catch (e: any) {
+          reject(e);
+        }
+      }, 300);
+    });
   },
 
   updateConfig: async (p) => {

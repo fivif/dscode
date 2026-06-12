@@ -4,9 +4,41 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::agent::stream::{StreamEvent, ToolStatus};
 use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
+
+/// Commands or command patterns that are unconditionally blocked.
+/// Matches are checked via `command.contains()` after normalizing whitespace.
+const DANGEROUS_COMMANDS: &[&str] = &[
+    "rm -rf /",
+    "mkfs.",
+    "dd if=",
+    ":(){ :|:& };:",
+    "chmod -R 777 /",
+    "> /dev/sda",
+    "sudo rm",
+    "sudo mv",
+];
+
+/// Check whether a command string contains any blocked dangerous pattern.
+fn is_dangerous(command: &str) -> Option<&'static str> {
+    let normalized = command.trim();
+    // Also collapse multiple spaces for matching
+    let collapsed: String = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    for pattern in DANGEROUS_COMMANDS {
+        if collapsed.contains(pattern) {
+            return Some(pattern);
+        }
+    }
+    // Check for bare "> /dev/sd" pattern even with odd spacing
+    let compact: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.contains(">/dev/sd") || compact.contains(">/dev/hd") {
+        return Some("> /dev/sd*");
+    }
+    None
+}
 
 /// The `do_bash` tool: executes a shell command in the session's working
 /// directory, captures stdout/stderr, and streams output chunks back to the
@@ -81,24 +113,54 @@ impl Tool for DoBash {
             .as_str()
             .ok_or_else(|| ToolError::MissingParameter("command".into()))?;
 
+        // T1: Validate command against dangerous patterns
         if command.trim().is_empty() {
             return Ok(ToolResult::err("", "command must not be empty"));
+        }
+
+        if let Some(pattern) = is_dangerous(command) {
+            return Ok(ToolResult::err(
+                "",
+                format!(
+                    "Command blocked by safety policy: detected dangerous pattern '{}'. \
+                     If you believe this is a false positive, adjust the safety config.",
+                    pattern
+                ),
+            ));
         }
 
         let timeout_secs = args["timeout"]
             .as_u64()
             .unwrap_or(self.default_timeout_secs)
             .min(600);
+        // T4: Minimum timeout of 5 seconds to prevent zero-timeout immediate failures
+        let timeout_secs = timeout_secs.max(5);
 
         let description = args["description"]
             .as_str()
             .unwrap_or("executing command");
+
+        // T5: Verify working directory exists
+        if !ctx.working_dir.exists() {
+            return Err(ToolError::Internal(format!(
+                "Working directory does not exist: {}",
+                ctx.working_dir.display()
+            )));
+        }
+
+        if !ctx.working_dir.is_dir() {
+            return Err(ToolError::Internal(format!(
+                "Working directory is not a directory: {}",
+                ctx.working_dir.display()
+            )));
+        }
 
         // Emit ToolStart
         let _ = ctx.sender.send(StreamEvent::ToolStart {
             id: ctx.tool_call_id.clone(),
             name: self.name().into(),
             description: description.into(),
+            arguments: String::new(),
         });
 
         // Emit ToolProgress with a description
@@ -107,19 +169,26 @@ impl Tool for DoBash {
             chunk: format!("$ {}\n", command),
         });
 
-        // Spawn the command
-        let mut child = Command::new("bash")
-            .arg("-c")
+        // Build the command with process group support
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
             .arg(command)
             .current_dir(&ctx.working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                ToolError::Internal(format!("Failed to spawn command: {}", e))
-            })?;
+            .kill_on_drop(true);
+
+        // T3: Set process group so we can kill the entire process tree on timeout
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            ToolError::Internal(format!("Failed to spawn command: {}", e))
+        })?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -127,12 +196,16 @@ impl Tool for DoBash {
         let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel();
         let (tx_err, mut rx_err) = tokio::sync::mpsc::unbounded_channel();
 
+        // T2: Keep handles to reader tasks so we can await them before draining
+        let mut stdout_handle: Option<JoinHandle<()>> = None;
+        let mut stderr_handle: Option<JoinHandle<()>> = None;
+
         // Read stdout in a background task
         if let Some(stdout) = stdout {
             let tx = tx_out.clone();
             let sender = ctx.sender.clone();
             let call_id = ctx.tool_call_id.clone();
-            tokio::spawn(async move {
+            stdout_handle = Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
                     let chunk = format!("{}\n", line);
@@ -142,7 +215,7 @@ impl Tool for DoBash {
                     });
                     let _ = tx.send(chunk);
                 }
-            });
+            }));
         }
 
         // Read stderr in a background task
@@ -150,7 +223,7 @@ impl Tool for DoBash {
             let tx = tx_err.clone();
             let sender = ctx.sender.clone();
             let call_id = ctx.tool_call_id.clone();
-            tokio::spawn(async move {
+            stderr_handle = Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
                     let chunk = format!("[stderr] {}\n", line);
@@ -160,16 +233,25 @@ impl Tool for DoBash {
                     });
                     let _ = tx.send(chunk);
                 }
-            });
+            }));
         }
 
         // Wait for the command with timeout
         let exit_status = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait())
             .await;
 
-        // Drop senders so the reading tasks finish
+        // T2: Await reader tasks so all output is consumed before we drain channels.
+        // Drop the senders so channels close when tasks finish.
         drop(tx_out);
         drop(tx_err);
+
+        // Await reader tasks to completion — they will finish when their pipes close
+        if let Some(h) = stdout_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = stderr_handle {
+            let _ = h.await;
+        }
 
         match exit_status {
             Ok(Ok(status)) => {
@@ -215,8 +297,30 @@ impl Tool for DoBash {
                 Ok(ToolResult::err("", msg))
             }
             Err(_elapsed) => {
-                // Timeout — kill the child process
-                let _ = child.start_kill();
+                // T3: Timeout — kill the entire process group, not just the child
+                #[cfg(unix)]
+                {
+                    let pid = child.id().unwrap_or(0) as i32;
+                    if pid > 0 {
+                        // SIGKILL = 9 on all unix platforms
+                        const SIGKILL: i32 = 9;
+                        extern "C" {
+                            fn kill(pid: i32, sig: i32) -> i32;
+                        }
+                        // Send SIGKILL to the entire process group (negative pid = pgid)
+                        unsafe { kill(-pid, SIGKILL) };
+                    }
+                }
+
+                // Drain any remaining output
+                while let Ok(chunk) = rx_out.try_recv() {
+                    // discard
+                    let _ = chunk;
+                }
+                while let Ok(chunk) = rx_err.try_recv() {
+                    let _ = chunk;
+                }
+
                 let msg = format!("Command timed out after {}s", timeout_secs);
                 let _ = ctx.sender.send(StreamEvent::ToolEnd {
                     id: ctx.tool_call_id.clone(),

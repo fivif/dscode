@@ -155,7 +155,7 @@ impl Monitor {
                 entry.status = AgentStatus::Running;
                 entry.iterations = entry.iterations.max(*step);
             }
-            StreamEvent::ToolStart { id: _, name, description: _ } => {
+            StreamEvent::ToolStart { id: _, name, .. } => {
                 entry.status = AgentStatus::Running;
                 entry.current_tool = Some(name.clone());
             }
@@ -299,6 +299,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "do_bash".into(),
                 description: String::new(),
+                arguments: String::new(),
             },
         })
         .unwrap();

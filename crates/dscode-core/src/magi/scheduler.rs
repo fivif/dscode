@@ -33,8 +33,10 @@ pub enum MagiError {
     Parse(String),
 
     /// The spiral exhausted its round budget without Melchior stopping.
+    /// Wraps the max rounds reached and the completed rounds so callers
+    /// can access partial results.
     #[error("max rounds ({0}) reached without completion")]
-    MaxRounds(u32),
+    MaxRounds(u32, Vec<MagiRound>),
 }
 
 /// A single round of the MAGI spiral.
@@ -220,7 +222,7 @@ impl MagiScheduler {
             rounds = self.max_rounds,
             "MAGI: max rounds reached without completion"
         );
-        Err(MagiError::MaxRounds(self.max_rounds))
+        Err(MagiError::MaxRounds(self.max_rounds, rounds))
     }
 }
 
@@ -413,8 +415,11 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            MagiError::MaxRounds(2) => {}
-            e => panic!("expected MaxRounds(2), got {:?}", e),
+            MagiError::MaxRounds(max, completed_rounds) => {
+                assert_eq!(max, 2);
+                assert!(!completed_rounds.is_empty()); // rounds should be preserved
+            }
+            e => panic!("expected MaxRounds(2, rounds), got {:?}", e),
         }
     }
 }

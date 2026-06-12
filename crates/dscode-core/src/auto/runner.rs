@@ -181,6 +181,7 @@ impl AutoRunner {
         let mut all_rounds: Vec<Vec<MagiRound>> = Vec::new();
         let mut stall_detector = StallDetector::new(self.stall_rounds);
         let mut recompose_count = 0u32;
+        let mut consecutive_recompose_failures = 0u32;
 
         loop {
             // Find the next ready subtask
@@ -343,6 +344,9 @@ impl AutoRunner {
 
                 match decompose_task(&**self.runtime_provider, &remaining_prd).await {
                     Ok(new_subtasks) => {
+                        // Remove all non-Completed subtasks before appending new ones.
+                        // Only keep subtasks that are already Done.
+                        subtasks.retain(|s| s.status == SubtaskStatus::Done);
                         let next_id = subtasks.iter().map(|s| s.id).max().unwrap_or(0) + 1;
                         for (i, mut st) in new_subtasks.into_iter().enumerate() {
                             st.id = next_id + i;
@@ -350,6 +354,7 @@ impl AutoRunner {
                             subtasks.push(st);
                         }
                         stall_detector.reset();
+                        consecutive_recompose_failures = 0;
                         info!(
                             session = %session_id,
                             pending_count = subtasks.iter().filter(|s| s.status == SubtaskStatus::Pending).count(),
@@ -357,11 +362,23 @@ impl AutoRunner {
                         );
                     }
                     Err(e) => {
+                        consecutive_recompose_failures += 1;
                         warn!(
                             session = %session_id,
                             error = %e,
-                            "AutoRunner: re-decomposition failed, continuing with current plan"
+                            consecutive_failures = consecutive_recompose_failures,
+                            "AutoRunner: re-decomposition failed"
                         );
+                        if consecutive_recompose_failures >= 3 {
+                            warn!(
+                                session = %session_id,
+                                "AutoRunner: 3 consecutive re-decomposition failures, aborting"
+                            );
+                            return Err(AutoError::Parse(format!(
+                                "Re-decomposition failed {} times consecutively: {}",
+                                consecutive_recompose_failures, e
+                            )));
+                        }
                         stall_detector.reset();
                     }
                 }

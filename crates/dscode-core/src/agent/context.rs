@@ -77,38 +77,43 @@ pub fn build_context(
     }
 }
 
-/// Estimate token count from text. Simple heuristic: ~1 token per 3.5 bytes.
-/// Accurate enough for threshold decisions (±15%).
+/// Estimate token count from text. ~1 token per 2.5 characters.
+/// Uses char count rather than byte length for better CJK approximation
+/// (CJK characters are 1-3 bytes each but roughly 1-2 tokens).
 pub fn count_tokens(text: &str) -> u64 {
-    (text.len() as f64 / 3.5) as u64
+    (text.chars().count() as f64 / 2.5) as u64
 }
 
 /// Estimate tokens for a list of messages.
-pub fn count_message_tokens(messages: &[Message]) -> u64 {
+/// Now also includes reasoning_content and tool_call name+arguments.
+pub fn count_message_tokens(messages: &[&Message]) -> u64 {
     messages
         .iter()
-        .map(|m| match &m.content {
-            MessageContent::Text(s) => count_tokens(s),
-            MessageContent::Parts(_) => count_tokens(&serde_json::to_string(m).unwrap_or_default()),
+        .map(|m| {
+            let mut tokens = match &m.content {
+                MessageContent::Text(s) => count_tokens(s),
+                MessageContent::Parts(_) => count_tokens(&serde_json::to_string(m).unwrap_or_default()),
+            };
+            // C2: Include reasoning_content if present
+            if let Some(ref rc) = m.reasoning_content {
+                tokens += count_tokens(rc);
+            }
+            // C2: Include tool call names and arguments
+            if let Some(ref tc) = m.tool_calls {
+                for t in tc.iter() {
+                    tokens += count_tokens(&t.function.name);
+                    tokens += count_tokens(&t.function.arguments);
+                }
+            }
+            tokens
         })
         .sum()
 }
 
 /// Build a compression summary prompt for a chunk of messages.
-pub fn compression_prompt(old_messages: &[Message]) -> String {
-    let convo = old_messages
-        .iter()
-        .filter(|m| m.role != Role::System)
-        .map(|m| format!(
-            "[{}]: {}",
-            match m.role { Role::User => "User", Role::Assistant => "Agent", Role::Tool => "Tool", _ => "System" },
-            m.content.as_text().unwrap_or("")
-        ))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "Condense the following conversation excerpt into a structured summary. \
+/// Truncates old messages if the prompt would exceed `max_tokens` (half the window).
+pub fn compression_prompt(old_messages: &[Message], max_tokens: u64) -> String {
+    let template = "Condense the following conversation excerpt into a structured summary. \
          Preserve all critical information:\n\
          - Files edited and what changed\n\
          - Decisions made and reasoning\n\
@@ -116,9 +121,40 @@ pub fn compression_prompt(old_messages: &[Message]) -> String {
          - Errors encountered and fixes\n\
          - Tool calls and their brief results\n\
          Keep the summary under 500 words.\n\n\
-         === CONVERSATION ===\n{}\n=== END ===",
-        convo
-    )
+         === CONVERSATION ===\n";
+
+    let footer = "\n=== END ===";
+    let overhead = count_tokens(template) + count_tokens(footer);
+    let available = max_tokens.saturating_sub(overhead);
+
+    // Build conversation lines newest-first so we can truncate oldest
+    let mut lines: Vec<String> = old_messages
+        .iter()
+        .rev()
+        .filter(|m| m.role != Role::System)
+        .map(|m| format!(
+            "[{}]: {}",
+            match m.role { Role::User => "User", Role::Assistant => "Agent", Role::Tool => "Tool", _ => "System" },
+            m.content.as_text().unwrap_or("")
+        ))
+        .collect();
+
+    // Truncate oldest (end of reversed vec) until we fit under available tokens
+    let mut total = 0u64;
+    let mut keep = 0usize;
+    for line in lines.iter() {
+        let lt = count_tokens(line) + 1; // +1 for newline
+        if total + lt > available {
+            break;
+        }
+        total += lt;
+        keep += 1;
+    }
+    lines.truncate(keep);
+    lines.reverse(); // restore chronological order
+    let convo = lines.join("\n");
+
+    format!("{}{}{}", template, convo, footer)
 }
 
 #[cfg(test)]

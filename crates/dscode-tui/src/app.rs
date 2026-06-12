@@ -81,7 +81,10 @@ pub struct AppState {
 
     // ── Chat ──
     pub messages: Vec<UiMessage>,
-    pub scroll_offset: usize,
+    pub chat_scroll_offset: usize,
+
+    // ── Sidebar ──
+    pub sidebar_scroll_offset: usize,
 
     // ── Input ──
     pub input_buffer: String,
@@ -101,6 +104,7 @@ pub struct AppState {
     // ── Config ──
     pub config: Config,
     pub working_dir: PathBuf,
+    pub tool_registry: Arc<ToolRegistry>,
 
     // ── UI flags ──
     pub sidebar_visible: bool,
@@ -126,6 +130,10 @@ impl AppState {
                 older: vec![],
             });
 
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register_default_tools();
+        let tool_registry = Arc::new(tool_registry);
+
         Ok(Self {
             session_manager,
             sessions_grouped,
@@ -133,7 +141,8 @@ impl AppState {
             session_select_index: None,
             new_session_title: String::new(),
             messages: vec![],
-            scroll_offset: 0,
+            chat_scroll_offset: 0,
+            sidebar_scroll_offset: 0,
             input_buffer: String::new(),
             input_cursor: 0,
             input_history: vec![],
@@ -145,6 +154,7 @@ impl AppState {
             total_output_tokens: 0,
             config,
             working_dir,
+            tool_registry,
             sidebar_visible: true,
             show_settings: false,
             should_quit: false,
@@ -186,14 +196,42 @@ impl AppState {
                                     timestamp: ts,
                                 }
                             }
-                            Role::Tool => UiMessage::ToolCard {
-                                id: msg.tool_call_id.clone().unwrap_or_default(),
-                                name: String::new(),
-                                description: String::new(),
-                                result: Some(msg.content.as_text().unwrap_or("").to_string()),
-                                status: ToolCardStatus::Success,
-                                collapsed: true,
-                            },
+                            Role::Tool => {
+                                // Try to look up the tool name from the registry.
+                                let tool_content = msg.content.as_text().unwrap_or("").to_string();
+                                let (name, description) = msg
+                                    .tool_call_id
+                                    .as_deref()
+                                    .and_then(|_| {
+                                        // Attempt to extract a tool name from the content or
+                                        // from the registry. If the tool_call_id doesn't give us
+                                        // a name match, derive one from the first line of content.
+                                        let first_line = tool_content
+                                            .lines()
+                                            .next()
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        Some((String::new(), first_line))
+                                    })
+                                    .unwrap_or_else(|| {
+                                        let first_line = tool_content
+                                            .lines()
+                                            .next()
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        (String::new(), first_line)
+                                    });
+                                UiMessage::ToolCard {
+                                    id: msg.tool_call_id.clone().unwrap_or_default(),
+                                    name,
+                                    description,
+                                    result: Some(tool_content),
+                                    status: ToolCardStatus::Success,
+                                    collapsed: true,
+                                }
+                            }
                             Role::System => UiMessage::Assistant {
                                 content: format!("[system] {}", msg.content.as_text().unwrap_or("")),
                                 timestamp: ts,
@@ -202,7 +240,7 @@ impl AppState {
                     })
                     .collect();
                 self.active_session = Some(session);
-                self.scroll_offset = 0;
+                self.chat_scroll_offset = 0;
             }
             Ok(None) => {
                 self.messages = vec![];
@@ -221,7 +259,7 @@ impl AppState {
                 let id = session.id.clone();
                 self.active_session = Some(session);
                 self.messages = vec![];
-                self.scroll_offset = 0;
+                self.chat_scroll_offset = 0;
                 self.refresh_sessions();
                 // Find and select the new session in the sidebar.
                 self.select_session_in_sidebar(&id);
@@ -318,7 +356,7 @@ impl AppState {
 
         self.is_streaming = true;
         self.streaming_accumulator = String::new();
-        self.scroll_offset = 0;
+        self.chat_scroll_offset = 0;
     }
 
     /// Handle a StreamEvent from the running forge.
@@ -432,10 +470,7 @@ impl AppState {
             }
             StreamEvent::Complete { usage } => {
                 // Finalize the streaming accumulator as a settled assistant message.
-                if !self.streaming_accumulator.is_empty() {
-                    // Already handled by Token events — just ensure it's consistent.
-                }
-                self.streaming_accumulator.clear();
+                let assistant_text = std::mem::take(&mut self.streaming_accumulator);
 
                 if let Some(ref u) = usage {
                     self.total_input_tokens += u.input_tokens;
@@ -444,6 +479,83 @@ impl AppState {
 
                 self.messages
                     .push(UiMessage::Completion { usage });
+
+                // ── Persist assistant and tool messages to the session database ──
+                if let Some(ref session) = self.active_session {
+                    let session_id = &session.id;
+                    let now = Utc::now().timestamp();
+
+                    // Persist the assistant text response.
+                    if !assistant_text.is_empty() {
+                        let _ = self.session_manager.add_message(
+                            session_id,
+                            &Message {
+                                role: Role::Assistant,
+                                content: MessageContent::Text(assistant_text),
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                                created_at: now,
+                            },
+                        );
+                    }
+
+                    // Persist each tool card as a Role::Tool message.
+                    for msg in &self.messages {
+                        if let UiMessage::ToolCard {
+                            id,
+                            name,
+                            result,
+                            status,
+                            ..
+                        } = msg
+                        {
+                            if *status != ToolCardStatus::Running {
+                                let _ = self.session_manager.add_message(
+                                    session_id,
+                                    &Message {
+                                        role: Role::Tool,
+                                        content: MessageContent::Text(
+                                            result.clone().unwrap_or_default(),
+                                        ),
+                                        name: if name.is_empty() {
+                                            None
+                                        } else {
+                                            Some(name.clone())
+                                        },
+                                        tool_calls: None,
+                                        tool_call_id: if id.is_empty() {
+                                            None
+                                        } else {
+                                            Some(id.clone())
+                                        },
+                                        reasoning_content: None,
+                                        created_at: now,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    // Persist thinking blocks as reasoning content.
+                    for msg in &self.messages {
+                        if let UiMessage::Thinking { content, .. } = msg {
+                            let _ = self.session_manager.add_message(
+                                session_id,
+                                &Message {
+                                    role: Role::Assistant,
+                                    content: MessageContent::Text(String::new()),
+                                    name: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                    reasoning_content: Some(content.clone()),
+                                    created_at: now,
+                                },
+                            );
+                        }
+                    }
+                }
 
                 self.is_streaming = false;
             }
@@ -532,6 +644,12 @@ impl AppState {
             }
             Action::SessionSelect => {
                 if let Some(session) = self.selected_session() {
+                    // Avoid re-selecting the already active session.
+                    if let Some(ref active) = self.active_session {
+                        if active.id == session.id {
+                            return;
+                        }
+                    }
                     let id = session.id.clone();
                     self.load_session(&id);
                 }
@@ -540,19 +658,23 @@ impl AppState {
                 self.delete_selected_session();
             }
             Action::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                // Scroll up: decrease offset to show older messages.
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(1);
             }
             Action::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                // Scroll down: increase offset to show newer messages.
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_add(1);
             }
             Action::ScrollPageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
             }
             Action::ScrollPageDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_add(10);
             }
             Action::ScrollBottom => {
-                self.scroll_offset = 0;
+                // Use usize::MAX as a sentinel — the chat renderer clamps
+                // it to the bottom-most visible position.
+                self.chat_scroll_offset = usize::MAX;
             }
             Action::ToggleThinking(idx) => {
                 let mut msg_idx = 0;

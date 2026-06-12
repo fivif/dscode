@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use futures::stream::Stream;
 use reqwest::Client;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio_stream::StreamExt;
 
 pub struct OpenAiProvider {
@@ -31,7 +32,10 @@ impl OpenAiProvider {
             max_tokens: 8192,
             temperature: 0.0,
             reasoning_effort: Some("max".into()),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 
@@ -64,7 +68,10 @@ impl OpenAiProvider {
             max_tokens: conf.generation.max_tokens,
             temperature: conf.generation.temperature,
             reasoning_effort: Some(conf.generation.reasoning_effort.clone()),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .expect("Failed to build HTTP client"),
         }
     }
 }
@@ -76,6 +83,11 @@ impl LlmProvider for OpenAiProvider {
         messages: Vec<Message>,
         tools: Vec<ToolDef>,
     ) -> Result<ChatResponse, ProviderError> {
+        // P10: Check for empty API key before making request
+        if self.api_key.trim().is_empty() {
+            return Err(ProviderError::NoApiKey);
+        }
+
         let request_body = self.build_request_body(messages, tools, false);
         let resp = self
             .client
@@ -88,21 +100,32 @@ impl LlmProvider for OpenAiProvider {
 
         let status = resp.status();
         let raw_body = resp.text().await?;
-        let body: serde_json::Value = serde_json::from_str(&raw_body)
-            .map_err(|e| ProviderError::Parse(format!("JSON parse error: {}. Body: {}", e, &raw_body[..raw_body.len().min(200)])))?;
 
         if !status.is_success() {
-            let msg = body["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown error")
-                .to_string();
+            // P5: Try to parse error.message from JSON, fall back to raw text
+            let error_msg = serde_json::from_str::<serde_json::Value>(&raw_body)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
+                .unwrap_or(raw_body);
             return Err(ProviderError::Api {
                 status: status.as_u16(),
-                message: msg,
+                message: error_msg,
             });
         }
 
-        let choice = &body["choices"][0];
+        // Parse body after confirming success
+        // P4: Use chars().take(200) to avoid mid-UTF-8 slice panic
+        let body: serde_json::Value = serde_json::from_str(&raw_body)
+            .map_err(|e| {
+                let preview: String = raw_body.chars().take(200).collect();
+                ProviderError::Parse(format!("JSON parse error: {}. Body: {}", e, preview))
+            })?;
+
+        // P6: Use .get(0) for bounds safety
+        let choice = body["choices"]
+            .as_array()
+            .and_then(|arr| arr.get(0))
+            .ok_or_else(|| ProviderError::Parse("No choices in response".into()))?;
         let msg = &choice["message"];
 
         let content = msg["content"].as_str().unwrap_or("").to_string();
@@ -124,6 +147,11 @@ impl LlmProvider for OpenAiProvider {
         tools: Vec<ToolDef>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderError>> + Send>>, ProviderError>
     {
+        // P10: Check for empty API key before making request
+        if self.api_key.trim().is_empty() {
+            return Err(ProviderError::NoApiKey);
+        }
+
         let request_body = self.build_request_body(messages, tools, true);
         let resp = self
             .client
@@ -136,20 +164,47 @@ impl LlmProvider for OpenAiProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await?;
+            // P5: Try to parse error.message from JSON, fall back to raw text
+            let raw_body = resp.text().await?;
+            let error_msg = serde_json::from_str::<serde_json::Value>(&raw_body)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
+                .unwrap_or(raw_body);
             return Err(ProviderError::Api {
                 status: status.as_u16(),
-                message: body,
+                message: error_msg,
             });
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map(|result| -> Result<StreamChunk, ProviderError> {
-                let bytes = result?;
-                let text = String::from_utf8_lossy(&bytes);
-                parse_sse_chunk(&text)
-            });
+        // P1: Buffer TCP chunks into complete SSE events (delimited by \n\n)
+        let byte_stream = resp.bytes_stream();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, ProviderError>>(64);
+
+        tokio::spawn(async move {
+            let mut buffer = String::new();
+            futures::pin_mut!(byte_stream);
+            while let Some(result) = tokio_stream::StreamExt::next(&mut byte_stream).await {
+                match result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+                            if tx.send(Ok(event)).await.is_err() {
+                                return; // receiver dropped
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(ProviderError::Http(e))).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .map(|result| result.and_then(|text| parse_sse_chunk(&text)));
 
         Ok(Box::pin(stream))
     }
@@ -176,9 +231,15 @@ impl OpenAiProvider {
             body["tools"] = serde_json::to_value(&tools).unwrap();
         }
 
-        // DeepSeek-specific: reasoning_effort via extra_body or direct param
-        if let Some(ref effort) = self.reasoning_effort {
-            body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        // P8: DeepSeek-specific reasoning_effort — only include for DeepSeek
+        // to avoid 400 errors on OpenAI/Groq endpoints.
+        let is_deepseek = self.base_url.contains("deepseek");
+        if is_deepseek {
+            if let Some(ref effort) = self.reasoning_effort {
+                if !effort.is_empty() {
+                    body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+                }
+            }
         }
 
         body
@@ -249,7 +310,6 @@ fn parse_usage(body: &serde_json::Value) -> Option<crate::agent::stream::UsageIn
 }
 
 fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
-    // SSE format: "data: {...}\n\n"
     let mut result = StreamChunk {
         content: None,
         tool_calls: None,
@@ -258,13 +318,19 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
         usage: None,
     };
 
+    let mut has_valid_data = false;
+
     for line in text.lines() {
         let data = match line.strip_prefix("data: ") {
             Some(d) => d.trim(),
             None => continue,
         };
         if data == "[DONE]" {
-            result.finish_reason = Some("stop".into());
+            // P2: Only set finish_reason to "stop" if not already set from a prior delta
+            if result.finish_reason.is_none() {
+                result.finish_reason = Some("stop".into());
+            }
+            has_valid_data = true;
             continue;
         }
         if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
@@ -277,9 +343,14 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
                                 result.content.as_deref().unwrap_or(""),
                                 c
                             ));
+                            has_valid_data = true;
                         }
                         if let Some(rc) = delta["reasoning_content"].as_str() {
-                            result.reasoning_content = Some(rc.to_string());
+                            // P3: Accumulate reasoning_content across deltas with push_str / +=
+                            let mut accumulated = result.reasoning_content.unwrap_or_default();
+                            accumulated.push_str(rc);
+                            result.reasoning_content = Some(accumulated);
+                            has_valid_data = true;
                         }
                         // Accumulate tool calls from delta
                         if let Some(tc_deltas) = delta["tool_calls"].as_array() {
@@ -298,11 +369,13 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
                             }
                             if !parsed.is_empty() {
                                 result.tool_calls = Some(parsed);
+                                has_valid_data = true;
                             }
                         }
                     }
                     if let Some(fr) = choice["finish_reason"].as_str() {
                         result.finish_reason = Some(fr.to_string());
+                        has_valid_data = true;
                     }
                 }
             }
@@ -317,8 +390,14 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
                         .as_u64()
                         .unwrap_or(0),
                 });
+                has_valid_data = true;
             }
         }
+    }
+
+    // P9: Filter out empty chunks — return Err to signal "no meaningful data"
+    if !has_valid_data {
+        return Err(ProviderError::Parse("Empty SSE chunk".into()));
     }
 
     Ok(result)

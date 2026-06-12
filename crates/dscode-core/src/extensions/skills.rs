@@ -3,7 +3,7 @@
 //! Skills are loaded from `~/.dscode/skills/<name>/SKILL.md` files.
 //! Compatible with the cc-switch SKILL.md format (YAML frontmatter).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A loaded skill with metadata and instructions.
@@ -23,16 +23,65 @@ pub struct SkillLoader {
     skills: Vec<Skill>,
 }
 
+/// Maximum recursion depth for skill directory traversal (E6).
+const MAX_DEPTH: usize = 5;
+
 impl SkillLoader {
     pub fn new() -> Self { Self { skills: vec![] } }
 
     /// Load all SKILL.md files from a directory recursively.
     /// Directory structure: `<dir>/<skill-name>/SKILL.md`
     pub fn load_from_dir(&mut self, dir: &Path) -> Result<usize, String> {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create skills dir: {}", e))?;
+        let canon = std::fs::canonicalize(dir)
+            .map_err(|e| format!("Cannot resolve skills dir {:?}: {}", dir, e))?;
+        let mut visited: HashSet<u64> = HashSet::new();
+        self.load_from_dir_inner(&canon, 0, &mut visited)
+    }
+
+    /// Internal recursive loader with depth limit and symlink cycle detection (E6).
+    fn load_from_dir_inner(
+        &mut self,
+        dir: &Path,
+        depth: usize,
+        visited: &mut HashSet<u64>,
+    ) -> Result<usize, String> {
+        if depth > MAX_DEPTH {
+            tracing::warn!(
+                "Skill directory recursion depth {} exceeded at {:?}, stopping",
+                depth, dir
+            );
             return Ok(0);
         }
+
+        // Detect symlink cycles by tracking inode numbers
+        if let Ok(meta) = std::fs::metadata(dir) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let ino = meta.ino();
+                if !visited.insert(ino) {
+                    tracing::warn!("Symlink cycle detected at {:?}, skipping", dir);
+                    return Ok(0);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix, fall back to canonical path tracking
+                if let Ok(canon) = std::fs::canonicalize(dir) {
+                    use std::hash::{Hash, Hasher};
+                    let path_key = {
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        canon.hash(&mut h);
+                        h.finish()
+                    };
+                    if !visited.insert(path_key) {
+                        tracing::warn!("Symlink cycle detected at {:?}, skipping", dir);
+                        return Ok(0);
+                    }
+                }
+            }
+        }
+
         let mut count = 0;
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -46,7 +95,7 @@ impl SkillLoader {
                         }
                     } else {
                         // Recurse into subdirectories for nested skill trees
-                        count += self.load_from_dir(&path)?;
+                        count += self.load_from_dir_inner(&path, depth + 1, visited)?;
                     }
                 }
             }
@@ -109,9 +158,16 @@ impl SkillLoader {
 
     /// Get the skills directory path.
     pub fn default_skills_dir() -> PathBuf {
-        crate::config::settings::Config::data_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("skills")
+        match crate::config::settings::Config::data_dir() {
+            Ok(dir) => dir.join("skills"),
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot determine data directory ({}), falling back to current directory for skills",
+                    e
+                );
+                PathBuf::from(".").join("skills")
+            }
+        }
     }
 }
 
@@ -134,6 +190,20 @@ fn parse_yaml_frontmatter(content: &str) -> Result<(HashMap<String, String>, Str
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
+        // If we see a new key: value pattern (not indented), exit multi-line mode
+        // E5: key pattern: ^[a-zA-Z_][a-zA-Z0-9_]*: with optional value
+        let is_new_key = is_key_value_line(trimmed);
+
+        if in_multiline && is_new_key {
+            // Save the accumulated multi-line value and start a new key
+            if !current_key.is_empty() {
+                map.insert(current_key.clone(), current_value.trim().to_string());
+            }
+            in_multiline = false;
+            current_key.clear();
+            current_value.clear();
+        }
+
         if !in_multiline {
             if let Some(pos) = trimmed.find(':') {
                 // Save previous key if any
@@ -151,16 +221,11 @@ fn parse_yaml_frontmatter(content: &str) -> Result<(HashMap<String, String>, Str
                     current_key.clear();
                     current_value.clear();
                 }
-            } else if !current_key.is_empty() && in_multiline {
-                if !current_value.is_empty() { current_value.push('\n'); }
-                current_value.push_str(trimmed);
             }
         } else {
             // Multi-line value: continue accumulating
             if !current_value.is_empty() { current_value.push('\n'); }
             current_value.push_str(trimmed);
-            // Check if next line would be a new key
-            in_multiline = true; // stays true until we see a key: value
         }
     }
     if !current_key.is_empty() {
@@ -168,6 +233,29 @@ fn parse_yaml_frontmatter(content: &str) -> Result<(HashMap<String, String>, Str
     }
 
     Ok((map, body))
+}
+
+/// Check if a trimmed line looks like a YAML key: value pair (not a continuation).
+/// Matches: ^[a-zA-Z_][a-zA-Z0-9_]*:  (key name followed by colon and optional value).
+fn is_key_value_line(line: &str) -> bool {
+    // Must start at column 0 (not indented) and match key: pattern
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return false;
+    }
+    if let Some(pos) = line.find(':') {
+        let key = &line[..pos];
+        // Key must be non-empty and match identifier pattern
+        if key.is_empty() {
+            return false;
+        }
+        let first = key.chars().next().unwrap();
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return false;
+        }
+        key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    } else {
+        false
+    }
 }
 
 fn get_field(fm: &HashMap<String, String>, key: &str) -> Option<String> {

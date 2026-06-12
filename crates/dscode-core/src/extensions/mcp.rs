@@ -10,8 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::time::timeout;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 Types
@@ -145,8 +147,8 @@ impl McpClient {
         self
     }
 
-    /// Connect to the MCP server, spawning the subprocess and initializing
-    /// the JSON-RPC connection.
+    /// Connect to the MCP server, spawning the subprocess, performing the
+    /// initialize handshake, and sending the required initialized notification.
     pub async fn connect(&self) -> Result<McpConnection, McpError> {
         let mut cmd = Command::new(&self.command);
         cmd.args(&self.args);
@@ -170,13 +172,22 @@ impl McpClient {
 
         let stdin_writer = tokio::io::BufWriter::new(stdin);
 
-        Ok(McpConnection {
+        let mut conn = McpConnection {
             server_name: self.server_name.clone(),
             child,
             stdin: Some(stdin_writer),
             reader: BufReader::new(stdout),
             next_id: 1,
-        })
+        };
+
+        // Perform the initialize handshake automatically on connect
+        conn.initialize().await?;
+
+        // MCP spec requires sending notifications/initialized after initialize
+        // handshake completes (E1)
+        conn.send_notification("notifications/initialized", None).await?;
+
+        Ok(conn)
     }
 
     /// Connect and immediately list available tools.
@@ -236,12 +247,8 @@ impl McpConnection {
 
     /// List all tools provided by this MCP server.
     ///
-    /// First sends `initialize`, then `tools/list`, and returns the parsed
-    /// tool definitions.
+    /// Assumes the handshake has already been performed (connect() does this).
     pub async fn list_tools(&mut self) -> Result<Vec<McpToolDef>, McpError> {
-        // Handshake
-        let _init = self.initialize().await?;
-
         // Request tool list
         let response = self.send_request("tools/list", None).await?;
 
@@ -285,7 +292,27 @@ impl McpConnection {
     // Internal wire protocol
     // ------------------------------------------------------------------
 
+    /// Send a JSON-RPC 2.0 notification (no id field, no response expected).
+    async fn send_notification(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<(), McpError> {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        });
+
+        let json = serde_json::to_string(&notification)?;
+        self.write_message(&json).await
+    }
+
     /// Send a JSON-RPC request and wait for the response.
+    ///
+    /// Uses MCP stdio framing: writes a Content-Length header then the JSON
+    /// body, and reads the response using the same framing. Includes a timeout
+    /// to prevent hanging on unresponsive servers.
     async fn send_request(
         &mut self,
         method: &str,
@@ -301,33 +328,15 @@ impl McpConnection {
             params,
         };
 
-        let mut json = serde_json::to_string(&request)?;
-        json.push('\n');
+        let json = serde_json::to_string(&request)?;
+        self.write_message(&json).await?;
 
-        // Write to stdin
-        if let Some(ref mut stdin) = self.stdin {
-            stdin.write_all(json.as_bytes()).await?;
-            stdin.flush().await?;
-        } else {
-            return Err(McpError::Protocol("stdin is closed".into()));
-        }
+        // Read response with timeout (E2)
+        let response_text = timeout(Duration::from_secs(30), self.read_message()).await
+            .map_err(|_| McpError::Timeout)?
+            .map_err(|e| e)?;
 
-        // Read response from stdout
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
-            Ok(0) => {
-                // EOF — process likely exited
-                let status = self.child.wait().await;
-                return Err(McpError::ProcessExited(format!(
-                    "MCP server '{}' exited with {:?}",
-                    self.server_name, status
-                )));
-            }
-            Ok(_) => {}
-            Err(e) => return Err(McpError::SpawnError(e)),
-        }
-
-        let response: JsonRpcResponse = serde_json::from_str(line.trim())?;
+        let response: JsonRpcResponse = serde_json::from_str(&response_text)?;
 
         if let Some(err) = response.error {
             return Err(McpError::ServerError {
@@ -339,6 +348,62 @@ impl McpConnection {
         response
             .result
             .ok_or_else(|| McpError::Protocol("Response missing result".into()))
+    }
+
+    /// Write a JSON message using MCP stdio framing (Content-Length header).
+    async fn write_message(&mut self, json: &str) -> Result<(), McpError> {
+        let framed = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+
+        if let Some(ref mut stdin) = self.stdin {
+            stdin.write_all(framed.as_bytes()).await?;
+            stdin.flush().await?;
+            Ok(())
+        } else {
+            Err(McpError::Protocol("stdin is closed".into()))
+        }
+    }
+
+    /// Read a JSON message using MCP stdio framing.
+    ///
+    /// Reads a Content-Length header line, then reads exactly that many bytes
+    /// of JSON body (E3 — supports multi-line JSON responses).
+    async fn read_message(&mut self) -> Result<String, McpError> {
+        // Read the Content-Length header line
+        let mut header_line = String::new();
+        match self.reader.read_line(&mut header_line).await {
+            Ok(0) => {
+                let status = self.child.wait().await;
+                return Err(McpError::ProcessExited(format!(
+                    "MCP server '{}' exited with {:?}",
+                    self.server_name, status
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(McpError::SpawnError(e)),
+        }
+
+        let header = header_line.trim();
+        if !header.starts_with("Content-Length:") {
+            return Err(McpError::Protocol(format!(
+                "Expected Content-Length header, got: {}",
+                header
+            )));
+        }
+
+        let length_str = header["Content-Length:".len()..].trim();
+        let length: usize = length_str
+            .parse()
+            .map_err(|_| McpError::Protocol(format!("Invalid Content-Length: {}", length_str)))?;
+
+        // Read the empty line separator (\r\n)
+        let mut separator = String::new();
+        self.reader.read_line(&mut separator).await?;
+
+        // Read exactly `length` bytes of JSON body
+        let mut body = vec![0u8; length];
+        self.reader.read_exact(&mut body).await?;
+
+        String::from_utf8(body).map_err(|e| McpError::Protocol(format!("Invalid UTF-8: {}", e)))
     }
 }
 
