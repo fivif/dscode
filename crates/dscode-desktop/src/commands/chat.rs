@@ -220,7 +220,7 @@ pub async fn send_message(
                                             role: Role::Assistant,
                                             content: MessageContent::Text(String::new()),
                                             name: None,
-                                            tool_call_id: Some(id.clone()),
+                                            tool_call_id: None,
                                             tool_calls: Some(vec![ToolCall {
                                                 id: id.clone(),
                                                 call_type: "function".into(),
