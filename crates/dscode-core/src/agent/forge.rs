@@ -565,6 +565,13 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
         }
     }
 
+    // Strip tool_call_id on ALL Assistant messages (belongs only on Tool messages)
+    for m in &mut messages {
+        if m.role == Role::Assistant && m.tool_call_id.is_some() {
+            m.tool_call_id = None;
+        }
+    }
+
     // Final: remove any remaining Tool messages without matching tool_calls
     let valid_ids: std::collections::HashSet<String> = messages.iter()
         .filter_map(|m| m.tool_calls.as_ref())
@@ -588,9 +595,12 @@ fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
             tc.retain(|t| responded.contains(&t.id));
             if tc.is_empty() {
                 msg.tool_calls = None;
-                // Always clear tool_call_id when tool_calls are emptied
-                msg.tool_call_id = None;
             }
+        }
+        // Always strip tool_call_id from Assistant messages — it belongs
+        // only on Tool-role messages per OpenAI protocol.
+        if msg.role == Role::Assistant && msg.tool_call_id.is_some() {
+            msg.tool_call_id = None;
         }
     }
 

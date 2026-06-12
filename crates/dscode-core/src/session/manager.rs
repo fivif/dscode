@@ -513,26 +513,18 @@ impl SessionManager {
             .collect();
         for m in messages.iter_mut() {
             if let Some(ref mut tc) = m.tool_calls {
-                // SM8: Track which tool call IDs are being orphaned.
-                let orphaned_ids: std::collections::HashSet<String> = tc
-                    .iter()
-                    .filter(|t| !responded.contains(&t.id))
-                    .map(|t| t.id.clone())
-                    .collect();
                 tc.retain(|t| responded.contains(&t.id));
                 if tc.is_empty() {
                     m.tool_calls = None;
-                    // SM8: Only clear tool_call_id on Assistant messages when
-                    // ALL their tool_calls are orphaned AND tool_call_id matches
-                    // one of the orphaned IDs.
-                    if m.role == Role::Assistant {
-                        if let Some(ref tci) = m.tool_call_id {
-                            if orphaned_ids.contains(tci) {
-                                m.tool_call_id = None;
-                            }
-                        }
-                    }
                 }
+            }
+            // CRITICAL: tool_call_id on the Message envelope belongs ONLY to
+            // Role::Tool messages. Assistant messages carry tool call IDs inside
+            // the tool_calls[].id field. Setting tool_call_id on an Assistant
+            // message violates OpenAI protocol and causes DeepSeek 400 errors:
+            // "insufficient tool messages following tool_calls message"
+            if m.role == Role::Assistant && m.tool_call_id.is_some() {
+                m.tool_call_id = None;
             }
         }
         let valid_ids: std::collections::HashSet<String> = messages
