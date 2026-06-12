@@ -1,0 +1,48 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Node.js / Frontend
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Tauri
+crates/dscode-desktop/ui/dist/
+crates/dscode-desktop/gen/
+crates/dscode-desktop/icons/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+*.dylib
+*.so
+*.dll
+
+# Logs
+*.log
+
+# Database (local session data)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Cargo lock (workspace crate, not end-user app)
+# Cargo.lock is committed for deterministic builds in this project

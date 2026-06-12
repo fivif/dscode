@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body, #root { height:100%; width:100%; overflow:hidden; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 3px; }
+
+@layer components {
+  .sidebar-item { @apply px-3 py-1.5 mx-1 rounded cursor-pointer text-xs text-gray-400 hover:bg-gray-800/50 hover:text-gray-200 transition-colors truncate; }
+  .sidebar-item.active { @apply bg-card text-gray-200; }
+  .group-header { @apply px-3 py-1.5 text-xs text-gray-500 select-none bg-transparent border-none; }
+  .btn { @apply px-3 py-1.5 rounded text-sm font-medium transition-colors; }
+  .btn-primary { @apply bg-gray-600 text-white hover:bg-gray-500; }
+  .btn-ghost { @apply text-gray-400 hover:text-gray-200 hover:bg-gray-800; }
+  .card { @apply bg-card border border-border rounded-lg p-3 my-2; }
+  .input { @apply w-full bg-input border border-border rounded-lg px-4 py-3 text-sm text-gray-100 placeholder-gray-500 resize-none focus:outline-none focus:border-gray-500; }
+}

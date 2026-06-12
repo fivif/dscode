@@ -1,0 +1,38 @@
+[package]
+name = "dscode-tui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["ZAY"]
+description = "Claude Code-style terminal UI for DS Code"
+
+[[bin]]
+name = "dscode-tui"
+path = "src/main.rs"
+
+[dependencies]
+# ── DS Code core ──
+dscode-core = { path = "../dscode-core" }
+
+# ── TUI framework ──
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+# ── Async runtime ──
+tokio = { workspace = true }
+
+# ── CLI args ──
+argh = "0.1"
+
+# ── Error handling ──
+anyhow = { workspace = true }
+
+# ── Serialization ──
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# ── Time ──
+chrono = { workspace = true }
+
+# ── Streaming ──
+futures = { workspace = true }

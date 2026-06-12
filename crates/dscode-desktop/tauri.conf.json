@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
+  "productName": "DS Code",
+  "version": "0.1.0",
+  "identifier": "com.dscode.app",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:27463",
+    "beforeDevCommand": "cd /Users/zay/Desktop/DS_code/crates/dscode-desktop/ui && npm run dev",
+    "beforeBuildCommand": "cd /Users/zay/Desktop/DS_code/crates/dscode-desktop/ui && npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DS Code — Universal Code Agent",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

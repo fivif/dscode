@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dscode-core",
+    "crates/dscode-cli",
+    "crates/dscode-tui",
+    "crates/dscode-desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["ZAY"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Config
+toml = "0.8"
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# SQLite
+rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+# UUID
+uuid = { version = "1", features = ["v4"] }
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+# Async trait
+async-trait = "0.1"
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Error handling
+thiserror = "2"
+anyhow = "1"
+# Streaming
+futures = "0.3"
+tokio-stream = "0.1"
+# Regex
+regex = "1"
+# Random
+rand = "0.8"
+# Base64
+base64 = "0.22"
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
