@@ -508,7 +508,26 @@ pub async fn compress_context(
 /// Validate that messages sent to the provider have intact tool chains.
 /// Returns cloned+fixed messages, logging any issues found.
 fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
+    // Deduplicate consecutive identical messages before sending to provider
     clean_orphaned_tool_calls(&mut messages);
+    let mut i = 1;
+    while i < messages.len() {
+        let prev = &messages[i - 1];
+        let curr = &messages[i];
+        let same_role = prev.role == curr.role;
+        let same_tc = prev.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
+            == curr.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
+        let same_tci = prev.tool_call_id == curr.tool_call_id;
+        let same_content = match (&prev.content, &curr.content) {
+            (MessageContent::Text(a), MessageContent::Text(b)) => a == b,
+            _ => false,
+        };
+        if same_role && same_tc && same_tci && same_content {
+            messages.remove(i);
+        } else {
+            i += 1;
+        }
+    }
 
     // Second pass: ensure no assistant message with tool_calls lacks follow-up tool messages
     let responded: std::collections::HashSet<String> = messages
