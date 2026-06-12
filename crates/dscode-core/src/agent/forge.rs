@@ -522,7 +522,8 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
             (MessageContent::Text(a), MessageContent::Text(b)) => a == b,
             _ => false,
         };
-        if same_role && same_tc && same_tci && same_content {
+        let same_rc = prev.reasoning_content == curr.reasoning_content;
+        if same_role && same_tc && same_tci && same_content && same_rc {
             messages.remove(i);
         } else {
             i += 1;
