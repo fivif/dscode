@@ -334,7 +334,9 @@ impl Forge {
             clean_orphaned_tool_calls(&mut messages);
 
             // (a) Call the LLM provider with a snapshot of the cleaned messages.
-            let response = match self.provider.chat(messages.clone(), tools.clone()).await {
+            let snapshot = messages.clone();
+            let validated = validate_tool_chain_for_provider(snapshot);
+            let response = match self.provider.chat(validated, tools.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!(session = %session_id, iteration, %e, "provider error");
@@ -503,6 +505,57 @@ pub async fn compress_context(
 }
 
 /// Remove tool_calls from messages that have no matching tool response.
+/// Validate that messages sent to the provider have intact tool chains.
+/// Returns cloned+fixed messages, logging any issues found.
+fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
+    clean_orphaned_tool_calls(&mut messages);
+
+    // Second pass: ensure no assistant message with tool_calls lacks follow-up tool messages
+    let responded: std::collections::HashSet<String> = messages
+        .iter().filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.clone()).collect();
+
+    // Track tool_call_ids from assistant messages that have tool_calls
+    let mut expected_responses: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for m in &messages {
+        if let Some(ref tc) = m.tool_calls {
+            for t in tc.iter() {
+                expected_responses.insert(t.id.clone());
+            }
+        }
+    }
+
+    // Find orphaned: tool_calls without responses
+    let orphaned: std::collections::HashSet<_> = expected_responses
+        .difference(&responded).cloned().collect();
+
+    if !orphaned.is_empty() {
+        warn!("Forge: found {} orphaned tool_calls, removing from messages", orphaned.len());
+        for m in &mut messages {
+            if let Some(ref mut tc) = m.tool_calls {
+                tc.retain(|t| !orphaned.contains(&t.id));
+                if tc.is_empty() {
+                    m.tool_calls = None;
+                    m.tool_call_id = None;
+                }
+            }
+        }
+    }
+
+    // Final: remove any remaining Tool messages without matching tool_calls
+    let valid_ids: std::collections::HashSet<String> = messages.iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flat_map(|tc| tc.iter().map(|t| t.id.clone())).collect();
+
+    messages.retain(|m| {
+        if m.role != Role::Tool { return true; }
+        m.tool_call_id.as_ref().map_or(false, |id| valid_ids.contains(id))
+    });
+
+    messages
+}
+
 fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
     let responded: std::collections::HashSet<String> = messages
         .iter().filter(|m| m.role == Role::Tool)
@@ -513,7 +566,8 @@ fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
             tc.retain(|t| responded.contains(&t.id));
             if tc.is_empty() {
                 msg.tool_calls = None;
-                msg.tool_call_id = None; // clear orphaned tool_call_id
+                // Always clear tool_call_id when tool_calls are emptied
+                msg.tool_call_id = None;
             }
         }
     }
