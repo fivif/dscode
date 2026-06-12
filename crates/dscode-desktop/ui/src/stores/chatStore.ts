@@ -32,20 +32,42 @@ export const useChatStore = create<ChatStore>((set, get) => {
     async loadSessionMessages(id: string) {
       try {
         const session = await getSession(id);
-        const msgs = (session?.messages || []).map((m: any) => {
-          // Strip tool-prefix from old-format messages
-          if (m.content && m.tool_calls?.length > 0 && m.content.startsWith('🔧')) {
-            return { ...m, content: '' };
+        const raw = (session?.messages || []) as any[];
+        const merged: any[] = [];
+        let i = 0;
+        while (i < raw.length) {
+          const m = raw[i];
+          // user messages always standalone
+          if (m.role === 'user') { merged.push(m); i++; continue; }
+          // assistant with content (not tool_calls) is standalone
+          if (m.role === 'assistant' && m.content && !m.tool_calls?.length) {
+            merged.push(m); i++; continue;
           }
-          if (m.reasoning_content && (!m.content || m.content === '')) {
-            return { ...m, thinking_blocks: [{ step: m.role === 'assistant' ? 0 : 0, content: m.reasoning_content }] };
+          // Start of a turn: collect consecutive assistant/tool messages
+          const turnMsg = { ...m, role: 'assistant', content: '', thinking_blocks: [] as any[], tool_calls: [] as any[], created_at: m.created_at, id: m.id };
+          while (i < raw.length && raw[i].role !== 'user') {
+            const cm = raw[i];
+            if (cm.reasoning_content) {
+              turnMsg.thinking_blocks!.push({ step: turnMsg.thinking_blocks!.length, content: cm.reasoning_content });
+            }
+            if (cm.content && cm.content.trim()) {
+              turnMsg.content = turnMsg.content ? turnMsg.content + '\n' + cm.content : cm.content;
+            }
+            if (cm.tool_calls?.length > 0) {
+              for (const tc of cm.tool_calls) {
+                turnMsg.tool_calls!.push({ id: tc.id, name: tc.function?.name || 'tool', description: '', status: 'success', result: '' });
+              }
+            }
+            if (cm.role === 'tool' && cm.tool_call_id) {
+              for (const tc of turnMsg.tool_calls!) {
+                if (tc.id === cm.tool_call_id) { tc.result = cm.content || ''; break; }
+              }
+            }
+            i++;
           }
-          if (m.role === 'tool' && m.tool_call_id) {
-            return { ...m, role: 'assistant' as const, content: '', tool_calls: [{ id: m.tool_call_id, name: 'tool', description: '', status: 'success' as const, result: m.content || '' }] };
-          }
-          return m;
-        });
-        set({ messages: msgs });
+          merged.push(turnMsg);
+        }
+        set({ messages: merged });
       } catch { set({ messages: [] }); }
     },
     setMessages(messages) { set({ messages }); },
