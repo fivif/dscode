@@ -506,22 +506,15 @@ impl SessionManager {
 
     /// Strip orphaned tool_calls and their tool messages.
     fn validate_tool_chain(messages: &mut Vec<Message>) {
-        // Deduplicate consecutive identical messages (backend persistence bug)
+        // Deduplicate consecutive identical messages (backend persistence bug).
+        // Compare JSON representations to catch all subtle field differences.
         let mut i = 1;
         while i < messages.len() {
-            let prev = &messages[i - 1];
-            let curr = &messages[i];
-            let same_role = prev.role == curr.role;
-            let same_tc = prev.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
-                == curr.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
-            let same_tci = prev.tool_call_id == curr.tool_call_id;
-            let same_content = match (&prev.content, &curr.content) {
-                (MessageContent::Text(a), MessageContent::Text(b)) => a == b,
-                _ => false,
-            };
-            let same_rc = prev.reasoning_content == curr.reasoning_content;
-            if same_role && same_tc && same_tci && same_content && same_rc {
-                eprintln!("[SessionManager] Deduplicating consecutive message at index {}", i);
+            let prev_role = messages[i-1].role == messages[i].role;
+            let prev_json = serde_json::to_string(&messages[i-1]).unwrap_or_default();
+            let curr_json = serde_json::to_string(&messages[i]).unwrap_or_default();
+            if prev_role && prev_json == curr_json {
+                eprintln!("[SessionManager] Deduplicating msg at index {} ({} total before)", i, messages.len());
                 messages.remove(i);
             } else {
                 i += 1;
