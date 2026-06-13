@@ -506,15 +506,18 @@ impl SessionManager {
 
     /// Strip orphaned tool_calls and their tool messages.
     fn validate_tool_chain(messages: &mut Vec<Message>) {
-        // Deduplicate consecutive identical messages (backend persistence bug).
-        // Compare JSON representations to catch all subtle field differences.
+        // Remove consecutive duplicate messages (same role, same content, same tool metadata).
+        // Ignores created_at since duplicates are persisted within the same second.
         let mut i = 1;
         while i < messages.len() {
-            let prev_role = messages[i-1].role == messages[i].role;
-            let prev_json = serde_json::to_string(&messages[i-1]).unwrap_or_default();
-            let curr_json = serde_json::to_string(&messages[i]).unwrap_or_default();
-            if prev_role && prev_json == curr_json {
-                eprintln!("[SessionManager] Deduplicating msg at index {} ({} total before)", i, messages.len());
+            if messages[i-1].role == messages[i].role
+                && messages[i-1].content == messages[i].content
+                && messages[i-1].tool_calls == messages[i].tool_calls
+                && messages[i-1].tool_call_id == messages[i].tool_call_id
+                && messages[i-1].reasoning_content == messages[i].reasoning_content
+                && messages[i-1].name == messages[i].name
+            {
+                eprintln!("[SessionManager] Deduplicating msg at index {} ({} total)", i, messages.len());
                 messages.remove(i);
             } else {
                 i += 1;

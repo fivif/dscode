@@ -509,13 +509,16 @@ pub async fn compress_context(
 /// Returns cloned+fixed messages, logging any issues found.
 fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
     clean_orphaned_tool_calls(&mut messages);
-    // Deduplicate consecutive identical messages using JSON comparison
+    // Remove consecutive duplicates (ignoring created_at)
     let mut i = 1;
     while i < messages.len() {
-        let prev_role = messages[i-1].role == messages[i].role;
-        let prev_json = serde_json::to_string(&messages[i-1]).unwrap_or_default();
-        let curr_json = serde_json::to_string(&messages[i]).unwrap_or_default();
-        if prev_role && prev_json == curr_json {
+        if messages[i-1].role == messages[i].role
+            && messages[i-1].content == messages[i].content
+            && messages[i-1].tool_calls == messages[i].tool_calls
+            && messages[i-1].tool_call_id == messages[i].tool_call_id
+            && messages[i-1].reasoning_content == messages[i].reasoning_content
+            && messages[i-1].name == messages[i].name
+        {
             messages.remove(i);
         } else {
             i += 1;
