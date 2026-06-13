@@ -116,6 +116,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
       if (!stream) return;
       const { msgId } = stream;
 
+      // If current stream msg has tool_calls, new content starts a fresh msg
+      const st0 = get()._stream;
+      if (st0 && st0.toolCalls.length > 0 && (event.type === 'thinking' || event.type === 'token')) {
+        get()._flushAndNewStreamMsg('');
+      }
+
       switch (event.type) {
         case 'thinking': {
           set((s) => {
