@@ -29,10 +29,10 @@ export default function StreamingRenderer({ content }: Props) {
             <p className="my-3 leading-relaxed text-gray-200 whitespace-pre-wrap" style={{ lineHeight: 1.65 }}>{children}</p>
           ),
           ul: ({ children }) => (
-            <ul className="my-3 pl-6 list-disc space-y-1.5 text-gray-200" style={{ lineHeight: 1.6 }}>{children}</ul>
+            <ul className="my-3 pl-6 list-disc space-y-1.5 text-gray-200 marker:text-gray-500" style={{ lineHeight: 1.6 }}>{children}</ul>
           ),
           ol: ({ children }) => (
-            <ol className="my-3 pl-6 list-decimal space-y-1.5 text-gray-200" style={{ lineHeight: 1.6 }}>{children}</ol>
+            <ol className="my-3 pl-6 list-decimal space-y-1.5 text-gray-200 marker:text-gray-500" style={{ lineHeight: 1.6 }}>{children}</ol>
           ),
           li: ({ children }) => (
             <li className="text-gray-200 mb-1.5">{children}</li>
