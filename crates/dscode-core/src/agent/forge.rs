@@ -19,7 +19,6 @@ use tracing::{debug, error, info, warn};
 use super::context::{build_context, compression_prompt, count_message_tokens, count_tokens, ContextPacket};
 use super::stream::{StreamEvent, ToolStatus};
 use crate::extensions::skills::SkillLoader;
-use futures::StreamExt;
 use crate::providers::trait_def::{
     FunctionCall, LlmProvider, Message, MessageContent, ProviderError, Role, ToolCall, ToolDef,
 };
@@ -352,8 +351,9 @@ impl Forge {
                 info!(session = %session_id, "Forge: pre-call tool_calls = {:?}", last_tc);
             }
 
-            let mut stream = match self.provider.chat_stream(validated, tools.clone()).await {
-                Ok(s) => s,
+            // (a) Call the LLM provider — non-streaming for reliability.
+            let response = match self.provider.chat(validated, tools.clone()).await {
+                Ok(r) => r,
                 Err(e) => {
                     error!(session = %session_id, iteration, %e, "provider error");
                     let _ = event_tx.send(StreamEvent::Error {
@@ -363,94 +363,29 @@ impl Forge {
                 }
             };
 
-            // (b) Iterate the SSE stream, emitting Token/Thinking per-chunk
-            // and accumulating the full response for tool_calls processing.
-            let mut full_content = String::new();
-            let mut full_reasoning = String::new();
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut usage = None;
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        // Emit content delta — each chunk carries pure deltas.
-                        if let Some(ref text) = chunk.content {
-                            if !text.is_empty() {
-                                let _ = event_tx.send(StreamEvent::Token {
-                                    content: text.clone(),
-                                });
-                                full_content.push_str(text);
-                            }
-                        }
-
-                        // Emit reasoning delta
-                        if let Some(ref rc) = chunk.reasoning_content {
-                            if !rc.is_empty() {
-                                let _ = event_tx.send(StreamEvent::Thinking {
-                                    content: rc.clone(),
-                                    step: iteration,
-                                });
-                                full_reasoning.push_str(rc);
-                            }
-                        }
-
-                        // Accumulate tool call deltas by index
-                        if let Some(ref tc_deltas) = chunk.tool_calls {
-                            for delta in tc_deltas {
-                                let idx = delta.index as usize;
-                                while tool_calls.len() <= idx {
-                                    tool_calls.push(ToolCall {
-                                        id: String::new(),
-                                        call_type: "function".to_string(),
-                                        function: FunctionCall {
-                                            name: String::new(),
-                                            arguments: String::new(),
-                                        },
-                                    });
-                                }
-                                if let Some(ref id) = delta.id {
-                                    tool_calls[idx].id = id.clone();
-                                }
-                                if let Some(ref func) = delta.function {
-                                    if let Some(ref name) = func.name {
-                                        tool_calls[idx].function.name = name.clone();
-                                    }
-                                    if let Some(ref args) = func.arguments {
-                                        tool_calls[idx].function.arguments.push_str(args);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Capture usage from the final chunk
-                        if chunk.usage.is_some() {
-                            usage = chunk.usage;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(session = %session_id, iteration, %e, "stream chunk parse error");
-                    }
+            // (b) Emit thinking content (DeepSeek reasoning)
+            if let Some(ref reasoning) = response.reasoning_content {
+                if !reasoning.is_empty() {
+                    let _ = event_tx.send(StreamEvent::Thinking {
+                        content: reasoning.clone(),
+                        step: iteration,
+                    });
                 }
             }
 
-            // (c) Build the assistant message from accumulated stream data
-            let has_tool_calls = !tool_calls.is_empty();
+            // (c) Emit text content tokens
+            let has_tool_calls = !response.tool_calls.is_empty();
+            if !response.content.is_empty() {
+                let _ = event_tx.send(StreamEvent::Token { content: response.content.clone() });
+            }
 
             let assistant_msg = Message {
                 role: Role::Assistant,
-                content: MessageContent::Text(full_content.clone()),
+                content: MessageContent::Text(response.content.clone()),
                 name: None,
-                tool_calls: if has_tool_calls {
-                    Some(tool_calls.clone())
-                } else {
-                    None
-                },
+                tool_calls: if has_tool_calls { Some(response.tool_calls.clone()) } else { None },
                 tool_call_id: None,
-                reasoning_content: if full_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(full_reasoning)
-                },
+                reasoning_content: response.reasoning_content.clone(),
                 created_at: 0,
             };
 
@@ -459,7 +394,7 @@ impl Forge {
                 debug!(
                     session = %session_id,
                     iteration,
-                    tool_count = tool_calls.len(),
+                    tool_count = response.tool_calls.len(),
                     "Forge: executing tool calls"
                 );
 
@@ -467,7 +402,7 @@ impl Forge {
                 // and before tool results so the API sees Assistant→Tool ordering.
                 messages.push(assistant_msg);
 
-                for tc in &tool_calls {
+                for tc in &response.tool_calls {
                     execute_one_tool(
                         &self.tools,
                         tc,
@@ -484,13 +419,13 @@ impl Forge {
             }
 
             // (e) No tool calls — this is the final answer.
-            if !full_content.is_empty() {
+            if !response.content.is_empty() {
                 info!(
                     session = %session_id,
                     iteration,
                     "Forge: agent finished with final answer"
                 );
-                let _ = event_tx.send(StreamEvent::Complete { usage });
+                let _ = event_tx.send(StreamEvent::Complete { usage: response.usage });
                 return Ok(());
             }
 
