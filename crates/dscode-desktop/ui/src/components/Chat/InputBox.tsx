@@ -15,6 +15,7 @@ export default function InputBox() {
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
+  const [outputFormat, setOutputFormat] = useState<'markdown' | 'html'>('markdown');
   const messages = useChatStore((s) => s.messages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -212,6 +213,15 @@ export default function InputBox() {
                 </svg>
                 <span className="absolute text-[7px] text-gray-400 font-mono">{ctxUsed}</span>
               </div>
+
+              {/* HTML/Markdown toggle */}
+              <button
+                className={`text-xs px-1.5 py-0.5 rounded transition-colors ${outputFormat === 'html' ? 'text-blue-400 bg-blue-400/10' : 'text-gray-500 hover:text-gray-300'}`}
+                title={outputFormat === 'html' ? '切换到 Markdown 输出' : '切换到 HTML 输出'}
+                onClick={() => setOutputFormat(outputFormat === 'html' ? 'markdown' : 'html')}
+              >
+                {outputFormat === 'html' ? 'HTML' : 'MD'}
+              </button>
 
               {/* Wiki toggle */}
               <button
