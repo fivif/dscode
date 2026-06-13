@@ -508,7 +508,9 @@ impl SessionManager {
     fn validate_tool_chain(messages: &mut Vec<Message>) {
         // Remove consecutive duplicate messages (same role, same content, same tool metadata).
         // Ignores created_at since duplicates are persisted within the same second.
+        let before_count = messages.len();
         let mut i = 1;
+        let mut deduped = 0u32;
         while i < messages.len() {
             if messages[i-1].role == messages[i].role
                 && messages[i-1].content == messages[i].content
@@ -519,9 +521,13 @@ impl SessionManager {
             {
                 eprintln!("[SessionManager] Deduplicating msg at index {} ({} total)", i, messages.len());
                 messages.remove(i);
+                deduped += 1;
             } else {
                 i += 1;
             }
+        }
+        if deduped > 0 {
+            eprintln!("[SessionManager] Dedup summary: removed {} of {} messages", deduped, before_count);
         }
 
         let responded: std::collections::HashSet<String> = messages
