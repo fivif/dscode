@@ -255,22 +255,32 @@ impl OpenAiProvider {
 }
 
 fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
-    // Pre-pass: collect valid tool_call_ids from Tool messages
-    let valid_tool_ids: std::collections::HashSet<&str> = msgs.iter()
+    // Collect tool IDs from both directions:
+    // - assistant_tc_ids: IDs from Assistant tool_calls (for filtering orphaned Tool msgs)
+    // - tool_response_ids: IDs from Tool messages (for filtering orphaned tool_calls)
+    let assistant_tc_ids: std::collections::HashSet<&str> = msgs.iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flat_map(|tc| tc.iter().map(|t| t.id.as_str()))
+        .collect();
+    let tool_response_ids: std::collections::HashSet<&str> = msgs.iter()
         .filter(|m| m.role == Role::Tool)
         .filter_map(|m| m.tool_call_id.as_deref())
         .collect();
 
     msgs.iter()
         .filter(|m| {
-            // Defense-in-depth: skip ghost Assistant messages that have no
-            // content, no tool_calls, and no reasoning. These cause 400 errors:
-            // "messages with role 'assistant' must have content or tool_calls".
-            if m.role != Role::Assistant { return true; }
-            if !m.content.is_empty() { return true; }
-            if m.tool_calls.is_some() { return true; }
-            if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
-            false
+            // Skip Tool messages with no matching assistant tool_calls
+            if m.role == Role::Tool {
+                return m.tool_call_id.as_deref().map_or(false, |id| assistant_tc_ids.contains(id));
+            }
+            // Filter ghost Assistant messages
+            if m.role == Role::Assistant {
+                if !m.content.is_empty() { return true; }
+                if m.tool_calls.is_some() { return true; }
+                if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
+                return false;
+            }
+            true
         })
         .map(|m| {
             let mut value = serde_json::json!({
@@ -293,7 +303,7 @@ fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
             // Only include tool_calls that have matching tool responses
             if let Some(ref tool_calls) = m.tool_calls {
                 let valid_calls: Vec<_> = tool_calls.iter()
-                    .filter(|tc| valid_tool_ids.contains(tc.id.as_str()))
+                    .filter(|tc| tool_response_ids.contains(tc.id.as_str()))
                     .cloned()
                     .collect();
                 if !valid_calls.is_empty() {
