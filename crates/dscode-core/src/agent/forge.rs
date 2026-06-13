@@ -509,33 +509,82 @@ pub async fn compress_context(
 /// Returns cloned+fixed messages, logging any issues found.
 fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
     clean_orphaned_tool_calls(&mut messages);
-    // Remove consecutive duplicates — compare tool_calls by ID only (arguments may differ)
+    // Remove consecutive duplicates
     let mut i = 1;
-    let mut removed = 0u32;
-    let _before = messages.len();
     while i < messages.len() {
-        let prev = &messages[i-1];
-        let curr = &messages[i];
-        let same_role = prev.role == curr.role;
-        let same_content = prev.content == curr.content;
-        // Compare tool_calls by ID list — arguments can differ between copies
-        let same_tc_ids = prev.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
-            == curr.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
-        let same_tci = prev.tool_call_id == curr.tool_call_id;
-        let same_rc = prev.reasoning_content == curr.reasoning_content;
-        let same_name = prev.name == curr.name;
-        if same_role && same_content && same_tc_ids && same_tci && same_rc && same_name {
+        let same_tc_ids = messages[i-1].tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
+            == messages[i].tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
+        if messages[i-1].role == messages[i].role
+            && messages[i-1].content == messages[i].content
+            && same_tc_ids
+            && messages[i-1].tool_call_id == messages[i].tool_call_id
+            && messages[i-1].reasoning_content == messages[i].reasoning_content
+            && messages[i-1].name == messages[i].name
+        {
             messages.remove(i);
-            removed += 1;
         } else {
             i += 1;
         }
     }
-    if removed > 0 {
-        warn!("[Forge-dedup] removed {} of {} duplicates", removed, _before);
+
+    // Sequential tool chain fix: scan left-to-right, track which tool_call_ids
+    // have been declared by assistant(tc) messages. Only allow Tool messages
+    // whose tool_call_id was declared by a PREVIOUS assistant. Remove tool_calls
+    // from assistants that have no following tool messages.
+    let mut pending_tc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut responded_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // First pass: mark which IDs have responses
+    for m in &messages {
+        if m.role == Role::Tool {
+            if let Some(ref id) = m.tool_call_id {
+                responded_ids.insert(id.clone());
+            }
+        }
     }
 
-    messages
+    // Second pass: sequential validation
+    let mut result = Vec::new();
+    for mut m in messages {
+        if m.role == Role::Assistant {
+            // Track declared tool_call IDs from this assistant
+            if let Some(ref tc) = m.tool_calls {
+                for t in tc.iter() {
+                    pending_tc_ids.insert(t.id.clone());
+                }
+            }
+            // Only include tool_calls that will have responses
+            if let Some(ref mut tc) = m.tool_calls {
+                tc.retain(|t| responded_ids.contains(&t.id));
+                if tc.is_empty() {
+                    m.tool_calls = None;
+                }
+            }
+            result.push(m);
+        } else if m.role == Role::Tool {
+            // Only keep Tool messages whose ID was declared by a previous assistant
+            if let Some(ref id) = m.tool_call_id {
+                if pending_tc_ids.contains(id) {
+                    result.push(m);
+                }
+            }
+        } else {
+            // User/System — clear pending tool calls (new conversation turn)
+            pending_tc_ids.clear();
+            result.push(m);
+        }
+    }
+
+    // Remove ghost assistants
+    result.retain(|m| {
+        if m.role != Role::Assistant { return true; }
+        if !m.content.is_empty() { return true; }
+        if m.tool_calls.is_some() { return true; }
+        if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
+        false
+    });
+
+    result
 }
 
 fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {

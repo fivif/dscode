@@ -255,71 +255,34 @@ impl OpenAiProvider {
 }
 
 fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
-    // Collect tool IDs from both directions:
-    // - assistant_tc_ids: IDs from Assistant tool_calls (for filtering orphaned Tool msgs)
-    // - tool_response_ids: IDs from Tool messages (for filtering orphaned tool_calls)
-    let assistant_tc_ids: std::collections::HashSet<&str> = msgs.iter()
-        .filter_map(|m| m.tool_calls.as_ref())
-        .flat_map(|tc| tc.iter().map(|t| t.id.as_str()))
-        .collect();
-    let tool_response_ids: std::collections::HashSet<&str> = msgs.iter()
-        .filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.tool_call_id.as_deref())
-        .collect();
-
+    // Tool chain validation is done in validate_tool_chain_for_provider.
+    // Here we just serialize cleanly: tool_call_id ONLY on Tool messages.
     msgs.iter()
-        .filter(|m| {
-            // Skip Tool messages with no matching assistant tool_calls
-            if m.role == Role::Tool {
-                return m.tool_call_id.as_deref().map_or(false, |id| assistant_tc_ids.contains(id));
-            }
-            // Filter ghost Assistant messages
-            if m.role == Role::Assistant {
-                if !m.content.is_empty() { return true; }
-                if m.tool_calls.is_some() { return true; }
-                if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
-                return false;
-            }
-            true
-        })
         .map(|m| {
-            let mut value = serde_json::json!({
-                "role": m.role,
-            });
+            let mut value = serde_json::json!({ "role": m.role });
 
             match &m.content {
-                MessageContent::Text(text) => {
-                    value["content"] = serde_json::Value::String(text.clone());
-                }
-                MessageContent::Parts(parts) => {
-                    value["content"] = serde_json::to_value(parts).unwrap();
-                }
+                MessageContent::Text(text) => value["content"] = serde_json::Value::String(text.clone()),
+                MessageContent::Parts(parts) => value["content"] = serde_json::to_value(parts).unwrap(),
             }
 
             if let Some(ref name) = m.name {
                 value["name"] = serde_json::Value::String(name.clone());
             }
-
-            // Only include tool_calls that have matching tool responses
             if let Some(ref tool_calls) = m.tool_calls {
-                let valid_calls: Vec<_> = tool_calls.iter()
-                    .filter(|tc| tool_response_ids.contains(tc.id.as_str()))
-                    .cloned()
-                    .collect();
-                if !valid_calls.is_empty() {
-                    value["tool_calls"] = serde_json::to_value(valid_calls).unwrap();
+                if !tool_calls.is_empty() {
+                    value["tool_calls"] = serde_json::to_value(tool_calls).unwrap();
                 }
             }
-
-            // tool_call_id belongs ONLY on Role::Tool messages
-            if m.role == Role::Tool {
-                if let Some(ref tc_id) = m.tool_call_id {
+            if let Some(ref tc_id) = m.tool_call_id {
+                if m.role == Role::Tool {
                     value["tool_call_id"] = serde_json::Value::String(tc_id.clone());
                 }
             }
-
             if let Some(ref reasoning) = m.reasoning_content {
-                value["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+                if !reasoning.is_empty() {
+                    value["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+                }
             }
 
             value
