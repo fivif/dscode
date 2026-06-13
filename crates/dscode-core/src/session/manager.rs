@@ -521,6 +521,7 @@ impl SessionManager {
             };
             let same_rc = prev.reasoning_content == curr.reasoning_content;
             if same_role && same_tc && same_tci && same_content && same_rc {
+                eprintln!("[SessionManager] Deduplicating consecutive message at index {}", i);
                 messages.remove(i);
             } else {
                 i += 1;
