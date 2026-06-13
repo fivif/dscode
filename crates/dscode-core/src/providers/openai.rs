@@ -255,6 +255,12 @@ impl OpenAiProvider {
 }
 
 fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
+    // Pre-pass: collect valid tool_call_ids from Tool messages
+    let valid_tool_ids: std::collections::HashSet<&str> = msgs.iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+
     msgs.iter()
         .map(|m| {
             let mut value = serde_json::json!({
@@ -273,16 +279,25 @@ fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
             if let Some(ref name) = m.name {
                 value["name"] = serde_json::Value::String(name.clone());
             }
+
+            // Only include tool_calls that have matching tool responses
             if let Some(ref tool_calls) = m.tool_calls {
-                value["tool_calls"] = serde_json::to_value(tool_calls).unwrap();
+                let valid_calls: Vec<_> = tool_calls.iter()
+                    .filter(|tc| valid_tool_ids.contains(tc.id.as_str()))
+                    .cloned()
+                    .collect();
+                if !valid_calls.is_empty() {
+                    value["tool_calls"] = serde_json::to_value(valid_calls).unwrap();
+                }
             }
-            // tool_call_id belongs ONLY on Role::Tool messages per OpenAI protocol.
-            // Assistant messages carry tool call IDs exclusively in tool_calls[].id.
+
+            // tool_call_id belongs ONLY on Role::Tool messages
             if m.role == Role::Tool {
                 if let Some(ref tc_id) = m.tool_call_id {
                     value["tool_call_id"] = serde_json::Value::String(tc_id.clone());
                 }
             }
+
             if let Some(ref reasoning) = m.reasoning_content {
                 value["reasoning_content"] = serde_json::Value::String(reasoning.clone());
             }
