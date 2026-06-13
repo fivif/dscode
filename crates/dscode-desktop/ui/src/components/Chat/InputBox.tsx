@@ -4,9 +4,17 @@ import { useConfigStore } from '@/stores/configStore';
 import { useSessionStore } from '@/stores/sessionStore';
 import { KNOWN_MODELS, type ModelDef } from '@/lib/types';
 
+const SLASH_COMMANDS = [
+  { cmd: '/plan', desc: '五阶段需求评审 — 深度访谈生成 PRD', icon: 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z' },
+  { cmd: '/auto', desc: '三脑自动螺旋 — 全自动完成任务', icon: 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15' },
+  { cmd: '/teams', desc: '多智能体协作 — 子 Agent 分发执行', icon: 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z' },
+];
+
 export default function InputBox() {
   const [input, setInput] = useState('');
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showSlashMenu, setShowSlashMenu] = useState(false);
+  const [slashFilter, setSlashFilter] = useState('');
   const messages = useChatStore((s) => s.messages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -50,10 +58,48 @@ export default function InputBox() {
     setInput('');
   }, [input, activeSessionId, isStreaming, sendMessage]);
 
+  // Slash command detection
+  const filteredCommands = useMemo(() => {
+    if (!slashFilter) return SLASH_COMMANDS;
+    return SLASH_COMMANDS.filter((c) => c.cmd.includes(slashFilter.toLowerCase()));
+  }, [slashFilter]);
+
+  const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setInput(val);
+    // Show slash menu when "/" is typed at start or after space
+    const lastSlash = val.lastIndexOf('/');
+    if (lastSlash >= 0 && (lastSlash === 0 || val[lastSlash - 1] === ' ' || val[lastSlash - 1] === '\n')) {
+      const afterSlash = val.slice(lastSlash);
+      if (!afterSlash.includes(' ')) {
+        setSlashFilter(afterSlash);
+        setShowSlashMenu(true);
+        return;
+      }
+    }
+    setShowSlashMenu(false);
+  }, []);
+
+  const selectSlashCommand = useCallback((cmd: string) => {
+    const lastSlash = input.lastIndexOf('/');
+    const before = input.slice(0, lastSlash);
+    setInput(before + cmd + ' ');
+    setShowSlashMenu(false);
+    inputRef.current?.focus();
+  }, [input]);
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (showSlashMenu) {
+        if (e.key === 'Escape') { setShowSlashMenu(false); e.preventDefault(); return; }
+        if (e.key === 'Enter' && filteredCommands.length > 0) {
+          e.preventDefault();
+          selectSlashCommand(filteredCommands[0].cmd);
+          return;
+        }
+      }
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
-    }, [handleSend]);
+    }, [handleSend, showSlashMenu, filteredCommands, selectSlashCommand]);
 
   const handleSelectModel = useCallback((model: ModelDef) => {
     updateConfig({ default_model: model.id, active_provider: model.provider });
@@ -79,10 +125,31 @@ export default function InputBox() {
             placeholder="输入消息... (Enter 发送，Shift+Enter 换行)"
             rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={handleInputChange}
             onKeyDown={handleKeyDown}
             disabled={isStreaming}
           />
+
+          {/* Slash command menu */}
+          {showSlashMenu && filteredCommands.length > 0 && (
+            <div className="px-3 pb-1">
+              <div className="border-t border-border pt-1 flex flex-col gap-0.5">
+                {filteredCommands.map((c) => (
+                  <button
+                    key={c.cmd}
+                    className="flex items-center gap-2 px-2 py-1.5 rounded text-xs text-gray-300 hover:bg-gray-700 transition-colors text-left"
+                    onClick={() => selectSlashCommand(c.cmd)}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-gray-500 shrink-0">
+                      <path d={c.icon} />
+                    </svg>
+                    <span className="font-mono text-gray-200">{c.cmd}</span>
+                    <span className="text-gray-500">{c.desc}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Bottom bar inside input box */}
           <div className="flex items-center justify-between px-3 pb-2.5">
