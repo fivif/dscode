@@ -262,6 +262,16 @@ fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
         .collect();
 
     msgs.iter()
+        .filter(|m| {
+            // Defense-in-depth: skip ghost Assistant messages that have no
+            // content, no tool_calls, and no reasoning. These cause 400 errors:
+            // "messages with role 'assistant' must have content or tool_calls".
+            if m.role != Role::Assistant { return true; }
+            if !m.content.is_empty() { return true; }
+            if m.tool_calls.is_some() { return true; }
+            if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
+            false
+        })
         .map(|m| {
             let mut value = serde_json::json!({
                 "role": m.role,

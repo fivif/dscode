@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
-use super::context::{build_context, compression_prompt, count_message_tokens, count_tokens, ContextPacket};
+use super::context::{build_context, compression_prompt, count_message_tokens, ContextPacket};
 use super::stream::{StreamEvent, ToolStatus};
 use crate::extensions::skills::SkillLoader;
 use crate::providers::trait_def::{
-    FunctionCall, LlmProvider, Message, MessageContent, ProviderError, Role, ToolCall, ToolDef,
+    LlmProvider, Message, MessageContent, ProviderError, Role, ToolCall,
 };
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::{ToolContext, ToolError};
@@ -339,7 +339,6 @@ impl Forge {
             let validated = validate_tool_chain_for_provider(snapshot);
 
             // HARD tool chain validation: dump last assistant(tc) + tool messages before call
-            let validated_len = validated.len();
             let last_tc: Vec<String> = validated.iter().enumerate()
                 .filter(|(_, m)| m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()))
                 .map(|(i, m)| {
@@ -458,9 +457,6 @@ impl Forge {
         });
         Err(ForgeError::MaxIterations(self.max_iterations))
     }
-
-    /// Mark compression as done for this session.
-    fn mark_compressed(&self) { self.compressed.store(true, Ordering::Relaxed); }
 }
 
 /// Compress older messages using LLM summarization.
@@ -529,56 +525,6 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
         }
     }
 
-    // Second pass: ensure no assistant message with tool_calls lacks follow-up tool messages
-    let responded: std::collections::HashSet<String> = messages
-        .iter().filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.tool_call_id.clone()).collect();
-
-    // Track tool_call_ids from assistant messages that have tool_calls
-    let mut expected_responses: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for m in &messages {
-        if let Some(ref tc) = m.tool_calls {
-            for t in tc.iter() {
-                expected_responses.insert(t.id.clone());
-            }
-        }
-    }
-
-    // Find orphaned: tool_calls without responses
-    let orphaned: std::collections::HashSet<_> = expected_responses
-        .difference(&responded).cloned().collect();
-
-    if !orphaned.is_empty() {
-        warn!("Forge: found {} orphaned tool_calls, removing from messages", orphaned.len());
-        for m in &mut messages {
-            if let Some(ref mut tc) = m.tool_calls {
-                tc.retain(|t| !orphaned.contains(&t.id));
-                if tc.is_empty() {
-                    m.tool_calls = None;
-                    m.tool_call_id = None;
-                }
-            }
-        }
-    }
-
-    // Strip tool_call_id on ALL Assistant messages (belongs only on Tool messages)
-    for m in &mut messages {
-        if m.role == Role::Assistant && m.tool_call_id.is_some() {
-            m.tool_call_id = None;
-        }
-    }
-
-    // Final: remove any remaining Tool messages without matching tool_calls
-    let valid_ids: std::collections::HashSet<String> = messages.iter()
-        .filter_map(|m| m.tool_calls.as_ref())
-        .flat_map(|tc| tc.iter().map(|t| t.id.clone())).collect();
-
-    messages.retain(|m| {
-        if m.role != Role::Tool { return true; }
-        m.tool_call_id.as_ref().map_or(false, |id| valid_ids.contains(id))
-    });
-
     messages
 }
 
@@ -608,6 +554,18 @@ fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
     messages.retain(|m| {
         if m.role != Role::Tool { return true; }
         m.tool_call_id.as_ref().map_or(false, |id| valid_ids.contains(id))
+    });
+
+    // Remove ghost Assistant messages: after cleaning orphaned tool_calls,
+    // an assistant may have empty content, no tool_calls, and no reasoning.
+    // These cause 400 errors: "messages with role 'assistant' must have
+    // content or tool_calls".
+    messages.retain(|m| {
+        if m.role != Role::Assistant { return true; }
+        if !m.content.is_empty() { return true; }
+        if m.tool_calls.is_some() { return true; }
+        if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
+        false
     });
 }
 
