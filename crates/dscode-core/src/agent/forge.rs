@@ -338,6 +338,21 @@ impl Forge {
             // using chat_stream() for SSE streaming instead of blocking chat().
             let snapshot = messages.clone();
             let validated = validate_tool_chain_for_provider(snapshot);
+
+            // Quick tool chain sanity check before provider call
+            if iteration == 1 {
+                let mut tc_count = 0u32;
+                let mut tool_count = 0u32;
+                let mut last_tc_idx = None;
+                for (i, m) in validated.iter().enumerate() {
+                    if let Some(ref tc) = m.tool_calls { if !tc.is_empty() { tc_count += 1; last_tc_idx = Some(i); } }
+                    if m.role == Role::Tool { tool_count += 1; }
+                }
+                if tc_count > 0 {
+                    info!(session = %session_id, tc_count, tool_count, last_tc_idx, msg_count = validated.len(), "Forge: pre-call tool chain summary");
+                }
+            }
+
             let mut stream = match self.provider.chat_stream(validated, tools.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
