@@ -509,39 +509,30 @@ pub async fn compress_context(
 /// Returns cloned+fixed messages, logging any issues found.
 fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
     clean_orphaned_tool_calls(&mut messages);
-    // Remove consecutive duplicates — compare essential fields
-    let _before = messages.len();
-    let mut removed = 0u32;
+    // Remove consecutive duplicates — compare tool_calls by ID only (arguments may differ)
     let mut i = 1;
+    let mut removed = 0u32;
+    let _before = messages.len();
     while i < messages.len() {
         let prev = &messages[i-1];
         let curr = &messages[i];
         let same_role = prev.role == curr.role;
         let same_content = prev.content == curr.content;
-        let same_tc = prev.tool_calls == curr.tool_calls;
+        // Compare tool_calls by ID list — arguments can differ between copies
+        let same_tc_ids = prev.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
+            == curr.tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
         let same_tci = prev.tool_call_id == curr.tool_call_id;
         let same_rc = prev.reasoning_content == curr.reasoning_content;
         let same_name = prev.name == curr.name;
-        let all_same = same_role && same_content && same_tc && same_tci && same_rc && same_name;
-        if !all_same && same_role && prev.tool_calls.is_some() && curr.tool_calls.is_some() {
-            let diffs: Vec<&str> = vec![];
-            if !same_content { /* compare manually */ }
-            if !same_tc { warn!("[Forge-dedup] SKIP: DIFFERENT tool_calls at {}: prev={:?} curr={:?}", i, prev.tool_calls, curr.tool_calls); }
-            else if !same_name { warn!("[Forge-dedup] SKIP: DIFFERENT name"); }
-            else if !same_rc { warn!("[Forge-dedup] SKIP: DIFFERENT reasoning_content"); }
-            else if !same_tci { warn!("[Forge-dedup] SKIP: DIFFERENT tool_call_id"); }
-            else if !same_content { warn!("[Forge-dedup] SKIP: DIFFERENT content"); }
-        }
-        if all_same {
+        if same_role && same_content && same_tc_ids && same_tci && same_rc && same_name {
             messages.remove(i);
             removed += 1;
-            warn!("[Forge-dedup] REMOVED duplicate at index {}", i);
         } else {
             i += 1;
         }
     }
-    if removed > 0 || _before > 0 {
-        warn!("[Forge-dedup] END: removed {} of {} messages", removed, _before);
+    if removed > 0 {
+        warn!("[Forge-dedup] removed {} of {} duplicates", removed, _before);
     }
 
     messages

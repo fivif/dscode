@@ -512,12 +512,15 @@ impl SessionManager {
         let mut i = 1;
         let mut deduped = 0u32;
         while i < messages.len() {
-            if messages[i-1].role == messages[i].role
-                && messages[i-1].content == messages[i].content
-                && messages[i-1].tool_calls == messages[i].tool_calls
-                && messages[i-1].tool_call_id == messages[i].tool_call_id
-                && messages[i-1].reasoning_content == messages[i].reasoning_content
-                && messages[i-1].name == messages[i].name
+            let same_role = messages[i-1].role == messages[i].role;
+            let same_content = messages[i-1].content == messages[i].content;
+            // Compare tool_calls by ID only — arguments can differ between copies
+            let same_tc_ids = messages[i-1].tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
+                == messages[i].tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
+            let same_tci = messages[i-1].tool_call_id == messages[i].tool_call_id;
+            let same_rc = messages[i-1].reasoning_content == messages[i].reasoning_content;
+            let same_name = messages[i-1].name == messages[i].name;
+            if same_role && same_content && same_tc_ids && same_tci && same_rc && same_name
             {
                 eprintln!("[SessionManager] Deduplicating msg at index {} ({} total)", i, messages.len());
                 messages.remove(i);
