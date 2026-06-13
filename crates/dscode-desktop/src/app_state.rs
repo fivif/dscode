@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use dscode_core::config::settings::Config;
 use dscode_core::session::manager::SessionManager;
 use dscode_core::tools::registry::ToolRegistry;
+use dscode_core::tools::background::TaskManager;
 use dscode_core::wiki::Engine;
 
 /// Handle to an in-progress forge task with cancellation support.
@@ -43,6 +44,9 @@ pub struct AppState {
     /// Each session gets its own Mutex<()> — the guard is held for the
     /// duration of send_message to serialize requests for that session.
     pub per_session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+
+    /// Background task manager for non-blocking command execution.
+    pub task_manager: TaskManager,
 }
 
 impl AppState {
@@ -51,8 +55,13 @@ impl AppState {
     pub fn new() -> Self {
         let config = Config::load().unwrap_or_default();
 
+        let task_manager = TaskManager::new();
+        let handle = task_manager.handle();
+
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register_default_tools();
+        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone()));
+        tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle));
 
         Self {
             config: Mutex::new(config),
@@ -61,6 +70,7 @@ impl AppState {
             active_forge_handle: Mutex::new(None),
             wiki_engine: Mutex::new(None),
             per_session_locks: Mutex::new(HashMap::new()),
+            task_manager,
         }
     }
 

@@ -130,8 +130,12 @@ impl AppState {
                 older: vec![],
             });
 
+        let task_manager = dscode_core::tools::background::TaskManager::new();
+        let handle = task_manager.handle();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register_default_tools();
+        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone()));
+        tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle));
         let tool_registry = Arc::new(tool_registry);
 
         Ok(Self {
