@@ -509,20 +509,35 @@ pub async fn compress_context(
 /// Returns cloned+fixed messages, logging any issues found.
 fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
     clean_orphaned_tool_calls(&mut messages);
-    // Remove consecutive duplicates (ignoring created_at)
+    // Remove consecutive duplicates — compare essential fields
+    let _before = messages.len();
+    let mut removed = 0u32;
     let mut i = 1;
     while i < messages.len() {
-        if messages[i-1].role == messages[i].role
-            && messages[i-1].content == messages[i].content
-            && messages[i-1].tool_calls == messages[i].tool_calls
-            && messages[i-1].tool_call_id == messages[i].tool_call_id
-            && messages[i-1].reasoning_content == messages[i].reasoning_content
-            && messages[i-1].name == messages[i].name
-        {
+        let prev = &messages[i-1];
+        let curr = &messages[i];
+        let same_role = prev.role == curr.role;
+        let same_content = prev.content == curr.content;
+        let same_tc = prev.tool_calls == curr.tool_calls;
+        let same_tci = prev.tool_call_id == curr.tool_call_id;
+        let same_rc = prev.reasoning_content == curr.reasoning_content;
+        let same_name = prev.name == curr.name;
+        let all_same = same_role && same_content && same_tc && same_tci && same_rc && same_name;
+        if all_same {
             messages.remove(i);
+            removed += 1;
         } else {
+            // Log WHY dedup missed
+            if prev.role == Role::Assistant && curr.role == Role::Assistant
+                && prev.tool_calls.is_some() && curr.tool_calls.is_some()
+                && !same_content {
+                eprintln!("[Forge-dedup] SKIP: same role+tc but DIFFERENT content");
+            }
             i += 1;
         }
+    }
+    if removed > 0 {
+        eprintln!("[Forge-dedup] removed {} of {} messages", removed, _before);
     }
 
     messages
