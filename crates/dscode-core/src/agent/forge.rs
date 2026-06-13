@@ -339,18 +339,17 @@ impl Forge {
             let snapshot = messages.clone();
             let validated = validate_tool_chain_for_provider(snapshot);
 
-            // Quick tool chain sanity check before provider call
-            if iteration == 1 {
-                let mut tc_count = 0u32;
-                let mut tool_count = 0u32;
-                let mut last_tc_idx = None;
-                for (i, m) in validated.iter().enumerate() {
-                    if let Some(ref tc) = m.tool_calls { if !tc.is_empty() { tc_count += 1; last_tc_idx = Some(i); } }
-                    if m.role == Role::Tool { tool_count += 1; }
-                }
-                if tc_count > 0 {
-                    info!(session = %session_id, tc_count, tool_count, last_tc_idx, msg_count = validated.len(), "Forge: pre-call tool chain summary");
-                }
+            // HARD tool chain validation: dump last assistant(tc) + tool messages before call
+            let validated_len = validated.len();
+            let last_tc: Vec<String> = validated.iter().enumerate()
+                .filter(|(_, m)| m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()))
+                .map(|(i, m)| {
+                    let ids: Vec<_> = m.tool_calls.as_ref().unwrap().iter().map(|t| &t.id).collect();
+                    let has_tci = m.tool_call_id.is_some();
+                    format!("[{}] Assistant tc={:?} tci={}", i, ids, has_tci)
+                }).collect();
+            if !last_tc.is_empty() {
+                info!(session = %session_id, "Forge: pre-call tool_calls = {:?}", last_tc);
             }
 
             let mut stream = match self.provider.chat_stream(validated, tools.clone()).await {
