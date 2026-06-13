@@ -2,7 +2,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::time::Duration;
+
 use dscode_desktop::app_state::AppState;
+use tauri::Manager;
 
 fn main() {
     tracing_subscriber::fmt::init();
@@ -11,6 +14,24 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+                    let state = handle.state::<AppState>();
+                    let guard = state.session_manager.lock().await;
+                    if let Some(ref mgr) = *guard {
+                        if let Err(e) = mgr.purge_now() {
+                            tracing::warn!("Session auto-cleanup failed: {}", e);
+                        } else {
+                            tracing::info!("Session auto-cleanup completed");
+                        }
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             dscode_desktop::commands::chat::send_message,
             dscode_desktop::commands::chat::abort,

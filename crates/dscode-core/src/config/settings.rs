@@ -242,6 +242,9 @@ pub struct GenerationConfig {
     /// Temperature
     #[serde(default)]
     pub temperature: f64,
+    /// HTTP proxy URL (e.g. "http://127.0.0.1:10808")
+    #[serde(default = "default_proxy_url")]
+    pub proxy_url: String,
 }
 
 impl Default for GenerationConfig {
@@ -250,12 +253,14 @@ impl Default for GenerationConfig {
             reasoning_effort: default_reasoning(),
             max_tokens: default_max_tokens(),
             temperature: 0.0,
+            proxy_url: default_proxy_url(),
         }
     }
 }
 
 fn default_reasoning() -> String { "max".into() }
 fn default_max_tokens() -> u32 { 8192 }
+fn default_proxy_url() -> String { "http://127.0.0.1:10808".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {

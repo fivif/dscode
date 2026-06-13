@@ -25,6 +25,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
+        let client = build_client("");
         Self {
             api_key,
             base_url,
@@ -32,10 +33,7 @@ impl OpenAiProvider {
             max_tokens: 8192,
             temperature: 0.0,
             reasoning_effort: Some("max".into()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(300))
-                .build()
-                .expect("Failed to build HTTP client"),
+            client,
         }
     }
 
@@ -61,6 +59,8 @@ impl OpenAiProvider {
             None => model.to_string(),
         };
 
+        let client = build_client(&conf.generation.proxy_url);
+
         Self {
             api_key: provider_conf.api_key,
             base_url,
@@ -68,12 +68,20 @@ impl OpenAiProvider {
             max_tokens: conf.generation.max_tokens,
             temperature: conf.generation.temperature,
             reasoning_effort: Some(conf.generation.reasoning_effort.clone()),
-            client: Client::builder()
-                .timeout(Duration::from_secs(300))
-                .build()
-                .expect("Failed to build HTTP client"),
+            client,
         }
     }
+}
+
+/// Build a reqwest Client with optional proxy support.
+fn build_client(proxy_url: &str) -> Client {
+    let mut builder = Client::builder().timeout(Duration::from_secs(300));
+    if !proxy_url.is_empty() {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .expect("Failed to build proxy");
+        builder = builder.proxy(proxy);
+    }
+    builder.build().expect("Failed to build HTTP client")
 }
 
 #[async_trait]
