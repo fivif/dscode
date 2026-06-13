@@ -45,8 +45,8 @@ export default function ChatArea() {
         return (
           <div key={msg.id} className="mb-4">
             {thinking.length > 0 && <ThinkingBlockView blocks={thinking} />}
-            {toolCalls.length > 0 && toolCalls.map((tc: any) => <ToolCallCard key={tc.id} tool={tc} />)}
             {msg.content && <MessageBubble message={msg} />}
+            {toolCalls.map((tc: any) => <ToolCallCard key={tc.id} tool={tc} />)}
           </div>
         );
       })}

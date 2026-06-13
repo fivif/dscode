@@ -86,6 +86,31 @@ export const useChatStore = create<ChatStore>((set, get) => {
       }, 600000);
     },
 
+    /** Flush current streaming text into a completed message, start fresh stream msg */
+    _flushAndNewStreamMsg(logText: string) {
+      set((s) => {
+        const st = s._stream;
+        if (!st) return s;
+        // Mark current streaming msg as complete (no stream_state)
+        const newId = genId();
+        const completedMsg = {
+          id: st.msgId, session_id: st.sessionId, role: 'assistant' as const,
+          content: logText || st.text, thinking_blocks: st.thinking, tool_calls: st.toolCalls,
+          created_at: Math.floor(Date.now() / 1000), stream_state: undefined,
+        };
+        // Create new empty streaming message
+        const newStreamMsg: Message = {
+          id: newId, session_id: st.sessionId, role: 'assistant', content: '',
+          created_at: Math.floor(Date.now() / 1000), thinking_blocks: [], tool_calls: [],
+          stream_state: { text: '', thinking: [], tool_calls: [] },
+        };
+        return {
+          _stream: { ...st, msgId: newId, text: '', thinking: [], toolCalls: [] },
+          messages: s.messages.map((m) => m.id === st.msgId ? completedMsg : m).concat(newStreamMsg),
+        };
+      });
+    },
+
     handleStreamEvent(event) {
       const stream = get()._stream;
       if (!stream) return;
@@ -122,6 +147,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
 
         case 'tool_start': {
+          // Flush accumulated text into a completed message, start fresh for tool card
+          const stream = get()._stream;
+          if (stream && stream.text.trim()) {
+            get()._flushAndNewStreamMsg(stream.text);
+          }
           const tc: ToolCallRecord = { id: event.id, name: event.name, description: event.description, status: 'running', result: '' };
           set((s) => {
             const st = s._stream;
