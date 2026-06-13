@@ -8,6 +8,7 @@ export default function ChatArea() {
   const messages = useChatStore((s) => s.messages);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamError = useChatStore((s) => s.streamError);
+  const outputFormat = useChatStore((s) => s.outputFormat);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRaf = useRef<number>(0);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -45,7 +46,7 @@ export default function ChatArea() {
         return (
           <div key={msg.id} className="mb-4">
             {thinking.length > 0 && <ThinkingBlockView blocks={thinking} />}
-            {msg.content && <MessageBubble message={msg} />}
+            {msg.content && <MessageBubble message={msg} isHtml={outputFormat === 'html'} />}
             {toolCalls.map((tc: any) => <ToolCallCard key={tc.id} tool={tc} />)}
           </div>
         );

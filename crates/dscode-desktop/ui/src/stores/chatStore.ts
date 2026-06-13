@@ -9,6 +9,7 @@ export interface ChatStore {
   messages: Message[]; activeSessionId: string | null;
   isStreaming: boolean; streamError: string | null;
   _stream: ActiveStream | null;
+  outputFormat: 'markdown' | 'html'; setOutputFormat: (f: 'markdown' | 'html') => void;
   setActiveSession: (id: string | null) => void;
   loadSessionMessages: (id: string) => Promise<void>;
   setMessages: (m: Message[]) => void; clearMessages: () => void;
@@ -24,6 +25,8 @@ let _streamTimeoutId: ReturnType<typeof setTimeout> | null = null;
 export const useChatStore = create<ChatStore>((set, get) => {
   return {
     messages: [], activeSessionId: null, isStreaming: false, streamError: null, _stream: null,
+    outputFormat: 'markdown',
+    setOutputFormat(f) { set({ outputFormat: f }); },
 
     setActiveSession(id) {
       if (_streamTimeoutId) { clearTimeout(_streamTimeoutId); _streamTimeoutId = null; }

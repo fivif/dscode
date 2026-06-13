@@ -1,10 +1,17 @@
 import StreamingRenderer from './StreamingRenderer';
 import type { Message } from '@/lib/types';
 
-interface Props { message: Message; }
+interface Props { message: Message; isHtml?: boolean; }
 
-export default function MessageBubble({ message }: Props) {
+export default function MessageBubble({ message, isHtml }: Props) {
   const isUser = message.role === 'user';
+
+  const renderContent = (content: string) => {
+    if (isHtml) {
+      return <div className="text-sm leading-relaxed" dangerouslySetInnerHTML={{ __html: content }} />;
+    }
+    return <StreamingRenderer content={content} />;
+  };
 
   // Assistant: no bubble, clean flat text with subtle left line
   if (!isUser) {
@@ -14,7 +21,7 @@ export default function MessageBubble({ message }: Props) {
         <div className="max-w-[90%] border-l-2 border-gray-800 pl-3 py-0.5">
           <div className="text-gray-200 text-sm leading-relaxed">
             {message.content ? (
-              <StreamingRenderer content={message.content} />
+              renderContent(message.content)
             ) : (
               <span className="text-gray-500 italic text-xs leading-relaxed whitespace-pre-wrap">{(message as any).reasoning_content}</span>
             )}
@@ -29,7 +36,7 @@ export default function MessageBubble({ message }: Props) {
     <div className="flex justify-start mb-3">
       <div className="max-w-[85%] bg-card border border-border/50 rounded-xl px-4 py-2.5">
         <div className="text-gray-100 text-sm leading-relaxed">
-          <StreamingRenderer content={message.content} />
+          {renderContent(message.content)}
         </div>
       </div>
     </div>

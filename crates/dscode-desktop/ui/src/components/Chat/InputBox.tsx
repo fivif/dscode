@@ -10,12 +10,15 @@ const SLASH_COMMANDS = [
   { cmd: '/teams', desc: '多智能体协作 — 子 Agent 分发执行', icon: 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z' },
 ];
 
-export default function InputBox() {
+interface Props { onOpenWiki?: () => void; }
+
+export default function InputBox({ onOpenWiki }: Props) {
   const [input, setInput] = useState('');
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashFilter, setSlashFilter] = useState('');
-  const [outputFormat, setOutputFormat] = useState<'markdown' | 'html'>('markdown');
+  const outputFormat = useChatStore((s) => s.outputFormat);
+  const setOutputFormat = useChatStore((s) => s.setOutputFormat);
   const messages = useChatStore((s) => s.messages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -227,6 +230,7 @@ export default function InputBox() {
               <button
                 className="text-gray-400 hover:text-gray-200 transition-colors"
                 title="知识图谱"
+                onClick={onOpenWiki}
               >
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="10" />
