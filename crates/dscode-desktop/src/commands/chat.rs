@@ -126,6 +126,10 @@ pub async fn send_message(
     let event_loop_cancel = cancel.clone();
     let forge_cancel = cancel.clone();
 
+    // Clone conversation history for background wiki ingestion after forge completes.
+    let ingest_messages = history.clone();
+    let ingest_sid = session_id.clone();
+
     let handle = tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
@@ -302,6 +306,12 @@ pub async fn send_message(
                 }).ok();
             }
         }
+        drop(sm_guard);
+
+        // After forge completes, spawn background wiki ingestion.
+        tokio::spawn(async move {
+            dscode_core::wiki::ingestor::auto_ingest(ingest_sid, ingest_messages);
+        });
     });
 
     // Store the handle and cancellation token so `abort` can cancel it.
@@ -398,5 +408,46 @@ pub async fn delete_skill(name: String) -> Result<(), String> {
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete: {}", e))?;
     }
+    Ok(())
+}
+
+/// Manually trigger wiki knowledge ingestion from a session's messages.
+///
+/// Reads the latest messages from the given session, extracts key facts,
+/// decisions, file edits, and errors, and persists them as knowledge nodes
+/// in the wiki engine. Runs in a background task — non-blocking.
+#[tauri::command]
+pub async fn wiki_ingest(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    info!(%session_id, "wiki_ingest: manual trigger");
+
+    state.ensure_session_manager().await?;
+
+    let messages = {
+        let sm_guard = state.session_manager.lock().await;
+        let sm = sm_guard
+            .as_ref()
+            .ok_or_else(|| "Session manager not initialized".to_string())?;
+
+        let session = sm
+            .get_session(&session_id)?
+            .ok_or_else(|| format!("Session '{}' not found", session_id))?;
+        session.messages
+    };
+
+    if messages.is_empty() {
+        return Err("No messages in session to ingest".to_string());
+    }
+
+    info!(
+        session = %session_id,
+        msg_count = messages.len(),
+        "wiki_ingest: spawning background task"
+    );
+
+    dscode_core::wiki::ingestor::auto_ingest(session_id, messages);
+
     Ok(())
 }

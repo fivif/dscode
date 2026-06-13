@@ -267,7 +267,7 @@ mod tests {
                     content: "STOP: true\nREASON: Done\nQUALITY: 95\nFOCUS: None".into(),
                     tool_calls: vec![],
                     usage: None,
-                    reasoning_content: None, created_at: 0, })
+                    reasoning_content: None, })
             } else {
                 Ok(guard.remove(0))
             }
@@ -338,19 +338,19 @@ mod tests {
                 content: "Casper review: looks good, proceed.".into(),
                 tool_calls: vec![],
                 usage: None,
-                reasoning_content: None, created_at: 0, },
+                reasoning_content: None, },
             // 2. Balthasar
             ChatResponse {
                 content: "Balthasar executed: implemented main.rs".into(),
                 tool_calls: vec![],
                 usage: None,
-                reasoning_content: None, created_at: 0, },
+                reasoning_content: None, },
             // 3. Melchior (runtime provider)
             ChatResponse {
                 content: "STOP: true\nREASON: All requirements met\nQUALITY: 95\nFOCUS: None".into(),
                 tool_calls: vec![],
                 usage: None,
-                reasoning_content: None, created_at: 0, },
+                reasoning_content: None, },
         ];
 
         let primary = Box::new(StubProvider::new(responses));
@@ -358,7 +358,7 @@ mod tests {
             content: "STOP: true\nREASON: All requirements met\nQUALITY: 95\nFOCUS: None".into(),
             tool_calls: vec![],
             usage: None,
-            reasoning_content: None, created_at: 0, }]));
+            reasoning_content: None, }]));
 
         let mut tools = ToolRegistry::new();
         tools.register(EchoTool);
@@ -392,7 +392,7 @@ mod tests {
                 content: "CONTINUE".into(),
                 tool_calls: vec![],
                 usage: None,
-                reasoning_content: None, created_at: 0, })
+                reasoning_content: None, })
             .collect();
 
         let primary = Box::new(StubProvider::new(responses.clone()));

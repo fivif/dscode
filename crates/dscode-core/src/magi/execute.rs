@@ -356,7 +356,7 @@ mod tests {
             content: "I implemented the feature.".into(),
             tool_calls: vec![],
             usage: None,
-            reasoning_content: None, created_at: 0, }]);
+            reasoning_content: None, }]);
 
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
@@ -393,13 +393,13 @@ mod tests {
                     },
                 }],
                 usage: None,
-                reasoning_content: None, created_at: 0, },
+                reasoning_content: None, },
             // Second response: final answer
             ChatResponse {
                 content: "Done with the echo test.".into(),
                 tool_calls: vec![],
                 usage: None,
-                reasoning_content: None, created_at: 0, },
+                reasoning_content: None, },
         ]);
 
         let mut registry = ToolRegistry::new();
@@ -437,7 +437,7 @@ mod tests {
                     },
                 }],
                 usage: None,
-                reasoning_content: None, created_at: 0, })
+                reasoning_content: None, })
             .collect();
 
         let provider = StubProvider::new(responses);

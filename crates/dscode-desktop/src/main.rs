@@ -50,6 +50,7 @@ fn main() {
             dscode_desktop::commands::config::fetch_models,
             dscode_desktop::commands::wiki::wiki_search,
             dscode_desktop::commands::wiki::wiki_graph,
+            dscode_desktop::commands::chat::wiki_ingest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DS Code Desktop");

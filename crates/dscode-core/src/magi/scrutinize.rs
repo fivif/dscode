@@ -192,7 +192,7 @@ mod tests {
             content: "All looks clear. Focus on the auth module.".into(),
             tool_calls: vec![],
             usage: None,
-            reasoning_content: None, created_at: 0, });
+            reasoning_content: None, });
 
         let result = scrutinize(
             &provider,
@@ -215,7 +215,7 @@ mod tests {
             content: "Round 1 left off with incomplete tests. Focus on testing.".into(),
             tool_calls: vec![],
             usage: None,
-            reasoning_content: None, created_at: 0, });
+            reasoning_content: None, });
 
         let previous = vec![MagiRound {
             round_number: 1,

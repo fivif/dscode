@@ -282,7 +282,7 @@ mod tests {
             content: "STOP: true\nREASON: Perfect\nQUALITY: 98\nFOCUS: None".into(),
             tool_calls: vec![],
             usage: None,
-            reasoning_content: None, created_at: 0, });
+            reasoning_content: None, });
 
         let result = promote(
             &provider,
@@ -304,7 +304,7 @@ mod tests {
             content: "STOP: false\nREASON: Barely started\nQUALITY: 15\nFOCUS: Start coding".into(),
             tool_calls: vec![],
             usage: None,
-            reasoning_content: None, created_at: 0, });
+            reasoning_content: None, });
 
         let result = promote(
             &provider,

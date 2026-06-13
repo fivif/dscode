@@ -198,6 +198,138 @@ pub fn export_quartz_pages(engine: &super::engine::Engine) -> Result<String, Str
     to_quartz_json(&graph)
 }
 
+// ── Quartz markdown export ──────────────────────────────────────────────────
+
+/// Export the wiki graph as Quartz-compatible markdown files.
+///
+/// Each [`KnowledgeNode`] becomes a single `.md` file with YAML frontmatter
+/// (`title`, `date`, `tags`).  Bidirectional [[wikilinks]] connect nodes that
+/// share an edge in the graph.  An `index.md` groups all nodes by type.
+///
+/// Files are written to `~/.dscode/wiki/quartz/`.
+pub fn to_quartz_markdown(engine: &super::engine::Engine) -> Result<String, String> {
+    use crate::config::settings::Config;
+    use std::fs;
+
+    let quartz_dir = Config::wiki_dir()
+        .map_err(|e| format!("wiki_dir: {}", e))?
+        .join("quartz");
+
+    fs::create_dir_all(&quartz_dir)
+        .map_err(|e| format!("Failed to create quartz dir {:?}: {}", quartz_dir, e))?;
+
+    // Gather all global nodes and build the graph for edge data.
+    let nodes = engine.list_global()?;
+    let graph = Graph::from_nodes(nodes.clone());
+
+    // Build adjacency: node_id -> Vec<target_node_id>
+    let mut links: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for edge in &graph.edges {
+        links
+            .entry(edge.source.clone())
+            .or_default()
+            .push(edge.target.clone());
+        // Make it bidirectional for [[wikilinks]].
+        links
+            .entry(edge.target.clone())
+            .or_default()
+            .push(edge.source.clone());
+    }
+
+    // Deduplicate link lists.
+    for targets in links.values_mut() {
+        targets.sort();
+        targets.dedup();
+    }
+
+    // ── Write each node as a .md file ──
+    let mut file_count = 0;
+    for node in &nodes {
+        let slug = slugify(&node.title);
+        let outgoing = links.get(&node.id).cloned().unwrap_or_default();
+
+        // Build wikilinks: [[Title]]
+        let wikilinks: Vec<String> = outgoing
+            .iter()
+            .filter_map(|target_id| {
+                // Find the target node's title from the id.
+                nodes.iter().find(|n| n.id == *target_id).map(|n| {
+                    format!("[[{}]]", n.title)
+                })
+            })
+            .collect();
+
+        let date_str = chrono::DateTime::from_timestamp(node.created_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let content = format!(
+            "---\ntitle: \"{}\"\ndate: {}\ntype: {}\ntags: [{}]\n---\n\n{}\n\n{}",
+            node.title,
+            date_str,
+            node.node_type.as_str(),
+            node.tags.join(", "),
+            node.content,
+            if wikilinks.is_empty() {
+                String::new()
+            } else {
+                format!("\n## Linked\n\n{}", wikilinks.join("\n"))
+            },
+        );
+
+        let file_path = quartz_dir.join(format!("{}.md", slug));
+        fs::write(&file_path, &content)
+            .map_err(|e| format!("Failed to write {:?}: {}", file_path, e))?;
+        file_count += 1;
+    }
+
+    // ── Write index.md grouped by node type ──
+    let mut index = String::from("# Wiki Knowledge Graph\n\n");
+    let type_order = [
+        ("Pattern", "## Patterns"),
+        ("Rule", "## Rules"),
+        ("Decision", "## Decisions"),
+        ("Fact", "## Facts"),
+        ("Concept", "## Concepts"),
+    ];
+
+    // Group nodes by type.
+    let mut by_type: std::collections::HashMap<String, Vec<&super::engine::KnowledgeNode>> =
+        std::collections::HashMap::new();
+    for node in &nodes {
+        by_type
+            .entry(node.node_type.as_str().to_string())
+            .or_default()
+            .push(node);
+    }
+
+    for (type_key, heading) in &type_order {
+        if let Some(group) = by_type.get(*type_key) {
+            index.push_str(&format!("\n{} ({})\n\n", heading, group.len()));
+            for node in group {
+                index.push_str(&format!(
+                    "- [[{}]] — {}\n",
+                    node.title,
+                    if node.content.len() > 80 {
+                        format!("{}...", &node.content[..80])
+                    } else {
+                        node.content.clone()
+                    }
+                ));
+            }
+        }
+    }
+
+    fs::write(quartz_dir.join("index.md"), &index)
+        .map_err(|e| format!("Failed to write index.md: {}", e))?;
+
+    Ok(format!(
+        "Exported {} nodes with wikilinks to {:?}",
+        file_count, quartz_dir
+    ))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Map node type to a hex colour for sigma.js rendering.

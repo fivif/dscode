@@ -6,6 +6,7 @@
 //! heuristic (regex + keyword) extractor to identify potential knowledge nodes,
 //! and writes them into the wiki engine.
 
+use regex::Regex;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -260,6 +261,199 @@ fn extract_entities(text: &str, min_content_length: usize) -> Vec<ExtractedEntit
     entities
 }
 
+// ── Public auto-ingest entry point ───────────────────────────────────────────
+
+/// Automatically ingest knowledge from a full conversation message set.
+///
+/// Runs in a background `tokio::spawn` task — non-blocking for the caller.
+/// Creates an [`Engine`] internally, extracts key facts, file edits, decisions,
+/// and errors from every message, and persists them as [`KnowledgeNode`]s into
+/// the global and session wiki layers.
+pub fn auto_ingest(session_id: String, messages: Vec<Message>) {
+    tokio::spawn(async move {
+        let engine = match Engine::new() {
+            Ok(eng) => eng,
+            Err(e) => {
+                warn!(session = %session_id, error = %e, "auto_ingest: engine creation failed");
+                return;
+            }
+        };
+
+        match auto_ingest_impl(&engine, &session_id, &messages) {
+            Ok(count) => {
+                info!(
+                    session = %session_id,
+                    nodes_created = count,
+                    "auto_ingest: knowledge nodes created"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session = %session_id,
+                    error = %e,
+                    "auto_ingest: processing failed"
+                );
+            }
+        }
+    });
+}
+
+/// Core auto-ingest logic — extracts entities from all messages and persists them.
+fn auto_ingest_impl(
+    engine: &Engine,
+    session_id: &str,
+    messages: &[Message],
+) -> Result<usize, String> {
+    // Collect text from all non-empty messages.
+    let texts: Vec<String> = messages
+        .iter()
+        .filter_map(|m| m.content.as_text().map(|t| t.to_string()))
+        .collect();
+
+    if texts.is_empty() {
+        return Ok(0);
+    }
+
+    // Use enhanced heuristics: file paths, errors, decisions, edits.
+    let entities = extract_entities_enhanced(&texts);
+    if entities.is_empty() {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for entity in &entities {
+        let node = KnowledgeNode::new(
+            entity.title.clone(),
+            entity.content.clone(),
+            entity.node_type.clone(),
+            entity.tags.clone(),
+        )
+        .with_session(session_id.to_string());
+
+        // Insert into global layer first, then session.
+        engine.insert_global(&node)?;
+        Engine::insert_session(session_id, &node)?;
+        count += 1;
+    }
+
+    info!(
+        session = %session_id,
+        entities_found = entities.len(),
+        "auto_ingest: created {} knowledge nodes",
+        count
+    );
+
+    Ok(count)
+}
+
+// ── Enhanced entity extraction (regex-based heuristics) ──────────────────────
+
+/// Extract entities from a list of message texts using enhanced heuristics.
+fn extract_entities_enhanced(texts: &[String]) -> Vec<ExtractedEntity> {
+    let mut entities: Vec<ExtractedEntity> = Vec::new();
+    let mut seen_fingerprints: HashSet<String> = HashSet::new();
+
+    // Compile regex patterns (lazily).
+    let file_path_re = Regex::new(
+        r#"(?:[\w\-./\\]+\.(?:rs|py|tsx?|jsx?|go|java|toml|ya?ml|json|md|css|html|sql))"#,
+    )
+    .unwrap();
+    let error_re = Regex::new(
+        r"(?i)\b(error|panic|crash|fail(?:ed|ure)?|cannot|unable|timeout|refused|denied|not found|invalid)\b",
+    )
+    .unwrap();
+    let decision_re = Regex::new(
+        r"(?i)\b(fix:|feat:|refactor:|chore:|decided|chose|we should|we will|let's|i'll)\b",
+    )
+    .unwrap();
+
+    for text in texts {
+        // ── Extract file-path entities ──
+        for caps in file_path_re.captures_iter(text) {
+            let path = caps.get(0).unwrap().as_str().to_string();
+            let fp = path.chars().take(50).collect::<String>();
+            if seen_fingerprints.contains(&fp) || path.len() < 4 {
+                continue;
+            }
+            seen_fingerprints.insert(fp);
+
+            entities.push(ExtractedEntity {
+                title: path.clone(),
+                content: format!("File referenced in conversation: {}", path),
+                node_type: NodeType::Fact,
+                tags: extract_tags(text),
+            });
+        }
+
+        // ── Extract error entities ──
+        for caps in error_re.captures_iter(text) {
+            let err_word = caps.get(1).unwrap().as_str().to_string();
+            // Capture the surrounding context (~100 chars around the match).
+            let match_start = caps.get(0).unwrap().start();
+            let ctx_start = match_start.saturating_sub(60);
+            let ctx_end = (match_start + 100).min(text.len());
+            let context = text[ctx_start..ctx_end].trim().to_string();
+
+            let fingerprint = context.chars().take(50).collect::<String>();
+            if seen_fingerprints.contains(&fingerprint) || context.len() < 15 {
+                continue;
+            }
+            seen_fingerprints.insert(fingerprint);
+
+            let title = format!("Error: {}", err_word);
+            entities.push(ExtractedEntity {
+                title,
+                content: context,
+                node_type: NodeType::Fact,
+                tags: {
+                    let mut tags = extract_tags(text);
+                    tags.push("error".to_string());
+                    tags
+                },
+            });
+        }
+
+        // ── Extract decision entities ──
+        for caps in decision_re.captures_iter(text) {
+            let marker = caps.get(1).unwrap().as_str().to_string();
+            // Capture the sentence around the decision marker.
+            let match_start = caps.get(0).unwrap().start();
+            let ctx_start = match_start.saturating_sub(40);
+            let ctx_end = (match_start + 160).min(text.len());
+            let context = text[ctx_start..ctx_end].trim().to_string();
+
+            let fingerprint = context.chars().take(50).collect::<String>();
+            if seen_fingerprints.contains(&fingerprint) || context.len() < 15 {
+                continue;
+            }
+            seen_fingerprints.insert(fingerprint);
+
+            let title = format!("Decision: {}", marker);
+            entities.push(ExtractedEntity {
+                title,
+                content: context,
+                node_type: NodeType::Decision,
+                tags: extract_tags(text),
+            });
+        }
+    }
+
+    // Also run the standard sentence-based extraction for pattern/rule/concept.
+    let combined = texts.join("\n");
+    let standard_entities = extract_entities(&combined, 30);
+    for se in standard_entities {
+        let fingerprint = se.content.chars().take(50).collect::<String>();
+        if !seen_fingerprints.contains(&fingerprint) {
+            seen_fingerprints.insert(fingerprint);
+            entities.push(se);
+        }
+    }
+
+    // Limit to at most 20 entities to avoid flooding.
+    entities.truncate(20);
+    entities
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -341,5 +535,46 @@ mod tests {
         let entities = extract_entities(text, 15);
         // Should deduplicate identical sentences.
         assert_eq!(entities.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_enhanced_file_paths() {
+        let texts = vec![
+            "I edited the file src/main.rs to add the new feature.".to_string(),
+            "The config lives in crates/dscode-core/src/config/settings.toml.".to_string(),
+        ];
+        let entities = extract_entities_enhanced(&texts);
+        // Should find file path entities.
+        assert!(entities.iter().any(|e| e.content.contains("src/main.rs")));
+        assert!(entities.iter().any(|e| e.content.contains("settings.toml")));
+    }
+
+    #[test]
+    fn test_extract_enhanced_errors() {
+        let texts = vec![
+            "Build failed with error: cannot find module 'serde'".to_string(),
+        ];
+        let entities = extract_entities_enhanced(&texts);
+        // Should find error entities.
+        assert!(entities.iter().any(|e| e.title.contains("Error:")));
+        assert!(entities.iter().any(|e| e.tags.contains(&"error".to_string())));
+    }
+
+    #[test]
+    fn test_extract_enhanced_decisions() {
+        let texts = vec![
+            "fix: resolve race condition in the wiki ingestor".to_string(),
+            "We decided to use regex for entity extraction.".to_string(),
+        ];
+        let entities = extract_entities_enhanced(&texts);
+        // Should find decision entities (title starts with "Decision:").
+        assert!(entities.iter().any(|e| e.node_type == NodeType::Decision));
+    }
+
+    #[test]
+    fn test_extract_enhanced_empty() {
+        let texts: Vec<String> = vec![];
+        let entities = extract_entities_enhanced(&texts);
+        assert!(entities.is_empty());
     }
 }

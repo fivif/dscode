@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
-import { wikiSearch, wikiGraph } from '@/lib/tauri';
+import { wikiSearch, wikiGraph, wikiIngest } from '@/lib/tauri';
 import type { WikiNode, WikiGraph } from '@/lib/types';
+import { useChatStore } from '@/stores/chatStore';
 
 interface Props { onBack: () => void; }
 
@@ -10,9 +11,18 @@ export default function WikiPage({ onBack }: Props) {
   const [graph, setGraph] = useState<WikiGraph | null>(null);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<'search' | 'graph'>('search');
+  const [ingesting, setIngesting] = useState(false);
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
+
+  const refreshGraph = async () => {
+    try {
+      const g = await wikiGraph();
+      setGraph(g);
+    } catch {}
+  };
 
   useEffect(() => {
-    wikiGraph().then(setGraph).catch(() => {});
+    refreshGraph();
   }, []);
 
   const handleSearch = async () => {
@@ -23,6 +33,17 @@ export default function WikiPage({ onBack }: Props) {
       setNodes(results);
     } catch {}
     setLoading(false);
+  };
+
+  const handleIngest = async () => {
+    if (!activeSessionId) return;
+    setIngesting(true);
+    try {
+      await wikiIngest(activeSessionId);
+      // Refresh graph after ingestion.
+      await refreshGraph();
+    } catch {}
+    setIngesting(false);
   };
 
   return (
@@ -55,6 +76,12 @@ export default function WikiPage({ onBack }: Props) {
                 className="px-4 py-2 bg-gray-700 text-sm text-gray-200 rounded-lg hover:bg-gray-600"
                 onClick={handleSearch} disabled={loading}
               >{loading ? '...' : '搜索'}</button>
+              <button
+                className="px-4 py-2 bg-blue-700 text-sm text-gray-200 rounded-lg hover:bg-blue-600 disabled:opacity-50"
+                onClick={handleIngest}
+                disabled={ingesting || !activeSessionId}
+                title={activeSessionId ? '从当前会话提取知识' : '无活跃会话'}
+              >{ingesting ? '摄入中...' : '自动摄入'}</button>
             </div>
             {nodes.length === 0 && (
               <p className="text-gray-500 text-sm text-center py-8">
@@ -84,7 +111,21 @@ export default function WikiPage({ onBack }: Props) {
 
         {tab === 'graph' && (
           <div>
-            <p className="text-gray-500 text-sm mb-4">知识图谱概览</p>
+            <div className="flex items-center justify-between mb-4">
+              <p className="text-gray-500 text-sm">知识图谱概览</p>
+              <div className="flex gap-2">
+                <button
+                  className="px-3 py-1.5 bg-blue-700 text-xs text-gray-200 rounded-lg hover:bg-blue-600 disabled:opacity-50"
+                  onClick={handleIngest}
+                  disabled={ingesting || !activeSessionId}
+                  title={activeSessionId ? '从当前会话提取知识' : '无活跃会话'}
+                >{ingesting ? '摄入中...' : '自动摄入'}</button>
+                <button
+                  className="px-3 py-1.5 bg-gray-700 text-xs text-gray-200 rounded-lg hover:bg-gray-600"
+                  onClick={refreshGraph}
+                >刷新</button>
+              </div>
+            </div>
             {graph ? (
               <div className="space-y-4">
                 <div className="bg-card border border-border rounded-lg p-4">

@@ -54,6 +54,10 @@ export async function wikiGraph(): Promise<WikiGraph> {
   return invoke('wiki_graph');
 }
 
+export async function wikiIngest(sessionId: string): Promise<void> {
+  return invoke('wiki_ingest', { sessionId });
+}
+
 export async function fetchModels(providerKey: string): Promise<string[]> {
   return invoke('fetch_models', { providerKey });
 }
