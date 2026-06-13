@@ -523,21 +523,25 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
         let same_rc = prev.reasoning_content == curr.reasoning_content;
         let same_name = prev.name == curr.name;
         let all_same = same_role && same_content && same_tc && same_tci && same_rc && same_name;
+        if !all_same && same_role && prev.tool_calls.is_some() && curr.tool_calls.is_some() {
+            let diffs: Vec<&str> = vec![];
+            if !same_content { /* compare manually */ }
+            if !same_tc { warn!("[Forge-dedup] SKIP: DIFFERENT tool_calls at {}: prev={:?} curr={:?}", i, prev.tool_calls, curr.tool_calls); }
+            else if !same_name { warn!("[Forge-dedup] SKIP: DIFFERENT name"); }
+            else if !same_rc { warn!("[Forge-dedup] SKIP: DIFFERENT reasoning_content"); }
+            else if !same_tci { warn!("[Forge-dedup] SKIP: DIFFERENT tool_call_id"); }
+            else if !same_content { warn!("[Forge-dedup] SKIP: DIFFERENT content"); }
+        }
         if all_same {
             messages.remove(i);
             removed += 1;
+            warn!("[Forge-dedup] REMOVED duplicate at index {}", i);
         } else {
-            // Log WHY dedup missed
-            if prev.role == Role::Assistant && curr.role == Role::Assistant
-                && prev.tool_calls.is_some() && curr.tool_calls.is_some()
-                && !same_content {
-                eprintln!("[Forge-dedup] SKIP: same role+tc but DIFFERENT content");
-            }
             i += 1;
         }
     }
-    if removed > 0 {
-        eprintln!("[Forge-dedup] removed {} of {} messages", removed, _before);
+    if removed > 0 || _before > 0 {
+        warn!("[Forge-dedup] END: removed {} of {} messages", removed, _before);
     }
 
     messages
