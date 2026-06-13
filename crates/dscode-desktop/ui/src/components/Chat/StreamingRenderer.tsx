@@ -8,33 +8,63 @@ export default function StreamingRenderer({ content }: Props) {
   if (!content?.trim()) return <span className="text-gray-500 italic text-xs">...</span>;
 
   return (
-    <div className="text-sm text-gray-200 space-y-1">
+    <div className="markdown-body text-sm text-gray-200">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw]}
         components={{
-          h1: ({ children }) => <h1 className="text-lg font-bold text-gray-100 mt-3 mb-2 pb-1 border-b border-border">{children}</h1>,
-          h2: ({ children }) => <h2 className="text-base font-semibold text-gray-100 mt-2.5 mb-1.5">{children}</h2>,
-          h3: ({ children }) => <h3 className="text-sm font-semibold text-gray-200 mt-2 mb-1">{children}</h3>,
-          p: ({ children }) => <p className="my-2 leading-relaxed text-gray-200">{children}</p>,
-          ul: ({ children }) => <ul className="my-2 pl-5 list-disc space-y-1 text-gray-200">{children}</ul>,
-          ol: ({ children }) => <ol className="my-2 pl-5 list-decimal space-y-1 text-gray-200">{children}</ol>,
-          li: ({ children }) => <li className="text-gray-200">{children}</li>,
-          strong: ({ children }) => <strong className="font-semibold text-gray-100">{children}</strong>,
-          em: ({ children }) => <em className="italic text-gray-300">{children}</em>,
-          hr: () => <hr className="my-3 border-border" />,
+          h1: ({ children }) => (
+            <h1 className="text-2xl font-bold text-gray-100 mt-0 mb-3 pb-2 border-b border-border leading-tight">{children}</h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="text-xl font-bold text-gray-100 mt-6 mb-3 pb-1.5 border-b border-border leading-tight">{children}</h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="text-lg font-semibold text-gray-100 mt-5 mb-2 leading-snug">{children}</h3>
+          ),
+          h4: ({ children }) => (
+            <h4 className="text-base font-semibold text-gray-200 mt-4 mb-1.5">{children}</h4>
+          ),
+          p: ({ children }) => (
+            <p className="my-3 leading-relaxed text-gray-200 whitespace-pre-wrap" style={{ lineHeight: 1.65 }}>{children}</p>
+          ),
+          ul: ({ children }) => (
+            <ul className="my-3 pl-6 list-disc space-y-1.5 text-gray-200" style={{ lineHeight: 1.6 }}>{children}</ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="my-3 pl-6 list-decimal space-y-1.5 text-gray-200" style={{ lineHeight: 1.6 }}>{children}</ol>
+          ),
+          li: ({ children }) => (
+            <li className="text-gray-200 mb-1.5">{children}</li>
+          ),
+          strong: ({ children }) => (
+            <strong className="font-bold text-gray-100">{children}</strong>
+          ),
+          em: ({ children }) => (
+            <em className="italic text-gray-300">{children}</em>
+          ),
+          hr: () => (
+            <hr className="my-5 border-0 border-t border-border" />
+          ),
 
           code({ node, className, children, ...props }: any) {
             const inline = !className || !className.includes('language-');
             if (inline) {
-              return <code className="bg-gray-800 text-gray-200 px-1.5 py-0.5 rounded text-[13px] font-mono" {...props}>{children}</code>;
+              return (
+                <code className="bg-gray-800/70 text-gray-200 px-1.5 py-0.5 rounded-md text-[13px] font-mono mx-0.5"
+                  style={{ wordBreak: 'keep-all', whiteSpace: 'pre-wrap' }} {...props}>
+                  {children}
+                </code>
+              );
             }
-            const lang = className?.replace('language-', '') || '';
+            const lang = className?.replace('language-', '') || 'text';
             return (
-              <div className="my-2 rounded-md overflow-hidden border border-border">
-                {lang && <div className="bg-gray-800 text-gray-500 text-[10px] px-3 py-1 font-mono tracking-wide">{lang}</div>}
-                <pre className="bg-gray-900/80 p-3 overflow-x-auto">
-                  <code className="text-[13px] leading-relaxed font-mono text-gray-200">{children}</code>
+              <div className="my-3 rounded-lg overflow-hidden border border-border shadow-sm">
+                <div className="flex items-center justify-between bg-gray-800 text-gray-400 text-[11px] px-4 py-1.5 font-mono tracking-wide">
+                  <span>{lang}</span>
+                </div>
+                <pre className="bg-[#1a1b26] p-4 overflow-x-auto m-0">
+                  <code className="text-[13px] leading-relaxed font-mono text-gray-200" style={{ lineHeight: 1.55 }}>{children}</code>
                 </pre>
               </div>
             );
@@ -43,19 +73,29 @@ export default function StreamingRenderer({ content }: Props) {
           pre: ({ children }) => <>{children}</>,
 
           a: ({ href, children }) => (
-            <a href={href} className="text-blue-400 hover:text-blue-300 underline" target="_blank" rel="noopener noreferrer">{children}</a>
+            <a href={href} className="text-blue-400 hover:text-blue-300 underline decoration-blue-400/30 hover:decoration-blue-300 underline-offset-2" target="_blank" rel="noopener noreferrer">{children}</a>
           ),
 
           table: ({ children }) => (
-            <div className="overflow-x-auto my-2 rounded-md border border-border">
-              <table className="w-full text-xs">{children}</table>
+            <div className="overflow-x-auto my-4 rounded-lg border border-border">
+              <table className="w-full text-xs border-collapse">{children}</table>
             </div>
           ),
-          th: ({ children }) => <th className="border border-border px-3 py-2 bg-gray-800 text-left font-medium text-gray-200">{children}</th>,
-          td: ({ children }) => <td className="border border-border px-3 py-2 text-gray-300">{children}</td>,
+          th: ({ children }) => (
+            <th className="border border-gray-700 px-4 py-2.5 bg-gray-800 text-left font-semibold text-gray-100">{children}</th>
+          ),
+          td: ({ children }) => (
+            <td className="border border-gray-700 px-4 py-2.5 text-gray-300 whitespace-pre-wrap" style={{ lineHeight: 1.5 }}>{children}</td>
+          ),
 
           blockquote: ({ children }) => (
-            <blockquote className="border-l-3 border-gray-600 pl-4 my-2 text-gray-400 italic">{children}</blockquote>
+            <blockquote className="border-l-[3px] border-blue-500/60 bg-gray-800/30 my-4 py-3 px-4 rounded-r-lg text-gray-300 italic" style={{ lineHeight: 1.6 }}>
+              {children}
+            </blockquote>
+          ),
+
+          img: ({ src, alt }) => (
+            <img src={src} alt={alt} className="max-w-full rounded-lg my-3 border border-border" />
           ),
         }}
       >
