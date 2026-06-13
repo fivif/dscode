@@ -258,9 +258,9 @@ impl Forge {
                 "Forge: calling provider"
             );
 
-            // F1+F2: Stall detection — sliding window of tool-call sets.
-            // Check every 20 iterations starting at 60, including beyond 180.
-            if iteration >= 60 && (iteration <= 180 || iteration % 20 == 0) {
+            // Stall detection — sliding window of tool-call sets.
+            // Check every iteration starting at 60.
+            if iteration >= 60 {
                 // Only scan messages added during this execute() call (F5).
                 let run_messages = &messages[initial_msg_count..];
                 let current_set: std::collections::BTreeSet<String> = run_messages
@@ -280,10 +280,10 @@ impl Forge {
                     for s in recent_tool_sets.iter() {
                         *counts.entry(s).or_insert(0) += 1;
                     }
-                    if counts.values().any(|&c| c >= 3) {
+                    if counts.values().any(|&c| c >= 5) {
                         let repeated: Vec<String> = current_set.iter().cloned().collect();
                         let _ = event_tx.send(StreamEvent::Error {
-                            content: format!("检测到循环调用，已停止。重复的工具: {}", repeated.join(", ")),
+                            content: format!("Detected tool loop after {} iterations: {}", iteration, repeated.join(", ")),
                         });
                         return Ok(());
                     }
