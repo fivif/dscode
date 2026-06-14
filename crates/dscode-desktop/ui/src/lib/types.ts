@@ -100,12 +100,20 @@ export interface WikiNode {
   id: string;
   title: string;
   content: string;
+  node_type: string;
+  tags: string[];
   links: string[];
+}
+
+export interface WikiSearchResult {
+  node: WikiNode;
+  score: number;
+  layer: 'session' | 'global';
 }
 
 export interface WikiGraph {
   nodes: Array<{ id: string; title: string; content: string; node_type: string; tags: string[]; session_id?: string; links?: string[] }>;
-  edges: Array<{ source: string; target: string; weight?: number }>;
+  edges: Array<{ source: string; target: string; weight?: number; weight_type?: string }>;
 }
 
 // ── Model definitions ──

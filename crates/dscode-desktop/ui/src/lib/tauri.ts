@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { StreamEvent, Session, AppConfig, WikiNode, WikiGraph } from './types';
+import type { StreamEvent, Session, AppConfig, WikiNode, WikiSearchResult, WikiGraph } from './types';
 
 // ── Chat ──
 export async function sendMessage(sessionId: string, message: string): Promise<void> {
@@ -46,7 +46,7 @@ export async function updateConfig(config: AppConfig): Promise<void> {
 }
 
 // ── Wiki ──
-export async function wikiSearch(query: string): Promise<WikiNode[]> {
+export async function wikiSearch(query: string): Promise<WikiSearchResult[]> {
   return invoke('wiki_search', { query });
 }
 
