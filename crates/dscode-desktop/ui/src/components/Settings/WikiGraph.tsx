@@ -219,10 +219,10 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       setSelected(d._data);
     });
 
-    // ── Drag (pause simulation while dragging for smooth control) ──
+    // ── Drag ──
     const drag = d3.drag<any, any>()
       .on('start', (ev, d: any) => {
-        simulation.stop();  // Freeze layout during drag
+        if (!ev.active) simulation.alphaTarget(0.3).restart();
         d.fx = d.x;
         d.fy = d.y;
       })
@@ -230,8 +230,10 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
         d.fx = ev.x;
         d.fy = ev.y;
       })
-      .on('end', () => {
-        simulation.alpha(0.02).restart();  // Minimal reheat after drag
+      .on('end', (ev, d: any) => {
+        if (!ev.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
       });
     node.call(drag);
 
