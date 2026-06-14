@@ -219,32 +219,19 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       setSelected(d._data);
     });
 
-    // ── Drag (direct update for smoothness, no simulation during drag) ──
-    const drag = d3.drag<any, any>()
-      .on('start', (ev, d: any) => {
-        simulation.stop();
+    // ── Drag (standard D3 pattern with fx/fy pinning) ──
+    node.call(d3.drag<any, any>()
+      .on('start', function(ev, d: any) {
+        if (!ev.active) simulation.alphaTarget(0.1).restart();
         d.fx = d.x; d.fy = d.y;
       })
-      .on('drag', (ev, d: any) => {
+      .on('drag', function(ev, d: any) {
         d.fx = ev.x; d.fy = ev.y;
-        d.x = ev.x; d.y = ev.y;
-        // Direct DOM update — skip simulation for smooth 60fps drag
-        d3.selectAll('circle').filter((n: any) => n.id === d.id)
-          .attr('cx', ev.x).attr('cy', ev.y);
-        d3.selectAll('text').filter((n: any) => n.id === d.id)
-          .attr('x', ev.x).attr('y', ev.y);
-        // Update connected edges
-        link.filter((l: any) => l.source.id === d.id || l.target.id === d.id)
-          .attr('x1', (l: any) => l.source.id === d.id ? ev.x : l.source.x)
-          .attr('y1', (l: any) => l.source.id === d.id ? ev.y : l.source.y)
-          .attr('x2', (l: any) => l.target.id === d.id ? ev.x : l.target.x)
-          .attr('y2', (l: any) => l.target.id === d.id ? ev.y : l.target.y);
       })
-      .on('end', () => {
-        simulation.alpha(0.05).restart();
-      });
-    node.call(drag);
-
+      .on('end', function(ev, d: any) {
+        if (!ev.active) simulation.alphaTarget(0);
+        d.fx = null; d.fy = null;
+      }) as any);
     // ── Zoom behaviour (AFTER elements exist so handler can reference them) ──
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.08, 8])
