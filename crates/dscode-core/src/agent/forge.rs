@@ -182,31 +182,28 @@ impl Forge {
         // F4: Reset compression flag for each new execution so re-use works.
         self.compressed.store(false, Ordering::Relaxed);
 
-        // --- Detect slash commands ---
+        // --- Detect slash commands and inject mode prompts ---
         let mode_prompt = if user_message.starts_with("/plan") {
             "\n\n## MODE: /plan — 5-Phase PRD Deep Interview\n\
-            You are conducting a structured product requirements discovery. Follow these phases:\n\
-            1. SCOPE — Understand the project boundaries and goals\n\
-            2. REQUIREMENTS — Ask detailed questions about features and constraints\n\
-            3. DESIGN — Propose architecture and component design\n\
-            4. RISKS — Identify technical risks, dependencies, and mitigations\n\
-            5. QUALITY — Define success criteria, testing strategy, and acceptance\n\
-            Ask one question at a time. Be thorough but concise. Output the final PRD as a markdown document."
+            Conduct a structured product requirements discovery. Follow these phases:\n\
+            1. SCOPE — Understand project boundaries and goals\n\
+            2. REQUIREMENTS — Deep-dive into features, constraints, dependencies\n\
+            3. DESIGN — Architecture, component design, data models\n\
+            4. RISKS — Technical risks, mitigations, trade-offs\n\
+            5. QUALITY — Success criteria, testing strategy, acceptance\n\
+            Ask probing questions. Challenge assumptions. Output a comprehensive PRD."
         } else if user_message.starts_with("/auto") {
-            "\n\n## MODE: /auto — 3-Brain Auto Spiral\n\
-            You operate in a continuous improvement spiral: SCRUTINIZE → EXECUTE → PROMOTE.\n\
-            - SCRUTINIZE: Examine the task, identify gaps and improvements\n\
-            - EXECUTE: Take action — write code, run tests, fix issues\n\
-            - PROMOTE: Elevate the work — refactor, optimize, document\n\
-            Keep cycling until the task is complete. Do not stop mid-spiral."
+            "\n\n## MODE: /auto — Continuous Improvement Spiral\n\
+            Operate in an endless spiral: ASSESS → EXECUTE → PROMOTE.\n\
+            - ASSESS: Examine current state, identify gaps, prioritize improvements\n\
+            - EXECUTE: Take concrete actions — write/fix code, run tests, make changes\n\
+            - PROMOTE: Refine, optimize, document, and prepare for next spiral\n\
+            DO NOT STOP until the task is genuinely complete. Each spiral must produce tangible progress."
         } else if user_message.starts_with("/teams") {
-            "\n\n## MODE: /teams — Multi-Agent Dispatch\n\
-            Break down the task into independent subtasks. For each subtask:\n\
-            - Assign a virtual sub-agent with a clear role and goal\n\
-            - Execute subtasks in parallel where possible\n\
-            - Aggregate results when all sub-agents complete\n\
-            - Monitor progress and handle failures\n\
-            Think like a team lead orchestrating multiple workers."
+            // /teams: extract task description, decompose, execute subtasks in this loop
+            let task_desc = user_message.strip_prefix("/teams").unwrap_or(user_message).trim();
+            let task = if task_desc.is_empty() { "Analyze and improve the current project" } else { task_desc };
+            return self.run_teams_task(task, session_id, history, event_tx).await;
         } else {
             ""
         };
@@ -491,6 +488,87 @@ impl Forge {
             ),
         });
         Err(ForgeError::MaxIterations(self.max_iterations))
+    }
+
+    /// Execute in /teams mode: decompose → execute subtasks → aggregate.
+    async fn run_teams_task(
+        &self,
+        task: &str,
+        session_id: &str,
+        history: Vec<Message>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<(), ForgeError> {
+        let _ = event_tx.send(StreamEvent::Token {
+            content: format!("## /teams mode activated\n\nTask: {}\n\nDecomposing...\n\n", task),
+        });
+
+        // Phase 1: Ask LLM to decompose into subtasks
+        let decompose_prompt = format!(
+            "You are a project manager. Break down this task into 3-5 independent subtasks.\n\
+             For each subtask, give a 1-line description.\n\
+             Format: `- [ ] description`\n\nTASK: {}",
+            task
+        );
+        let _ = event_tx.send(StreamEvent::Token { content: "_Asking LLM to decompose..._\n\n".into() });
+
+        // Run decomposition as a simple forge call
+        let decompose_result = self.provider.chat(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(decompose_prompt),
+                name: None, tool_calls: None, tool_call_id: None,
+                reasoning_content: None, created_at: 0,
+            }],
+            vec![],
+        ).await;
+
+        let subtasks = match decompose_result {
+            Ok(r) => {
+                let lines: Vec<String> = r.content.lines()
+                    .filter(|l| l.trim().starts_with("- [ ]") || l.trim().starts_with("- "))
+                    .map(|l| l.trim().trim_start_matches("- [ ]").trim_start_matches("- ").trim().to_string())
+                    .collect();
+                if lines.is_empty() { vec![task.to_string()] } else { lines }
+            }
+            Err(_) => vec![task.to_string()],
+        };
+
+        let _ = event_tx.send(StreamEvent::Token {
+            content: format!("Decomposed into {} subtasks:\n\n", subtasks.len()),
+        });
+        for (i, st) in subtasks.iter().enumerate() {
+            let _ = event_tx.send(StreamEvent::Token {
+                content: format!("{}. {}\n", i + 1, st),
+            });
+        }
+
+        // Phase 2: Execute each subtask sequentially
+        for (i, subtask) in subtasks.iter().enumerate() {
+            let _ = event_tx.send(StreamEvent::Token {
+                content: format!("\n---\n### Subtask {}/{}: {}\n\n", i + 1, subtasks.len(), subtask),
+            });
+
+            // Run subtask as a direct LLM call (no recursive forge)
+            let sub_result = self.provider.chat(
+                vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text(format!("Complete this subtask using available tools:\n\n{}", subtask)),
+                    name: None, tool_calls: None, tool_call_id: None, reasoning_content: None, created_at: 0,
+                }],
+                self.tools.to_openai_tools(),
+            ).await;
+            match sub_result {
+                Ok(r) => {
+                    let _ = event_tx.send(StreamEvent::Token { content: format!("\n{}\n\n✅ Subtask {}/{} complete.\n", r.content, i+1, subtasks.len()) });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(StreamEvent::Token { content: format!("\n❌ Subtask {}/{} failed: {}\n", i+1, subtasks.len(), e) });
+                }
+            }
+        }
+
+        let _ = event_tx.send(StreamEvent::Complete { usage: None });
+        Ok(())
     }
 }
 
