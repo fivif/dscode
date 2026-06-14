@@ -19,9 +19,8 @@ use tracing::{debug, error, info, warn};
 use super::context::{build_context, compression_prompt, count_message_tokens, ContextPacket};
 use super::stream::{StreamEvent, ToolStatus};
 use crate::extensions::skills::SkillLoader;
-use futures::StreamExt;
 use crate::providers::trait_def::{
-    FunctionCall, LlmProvider, Message, MessageContent, ProviderError, Role, ToolCall,
+    LlmProvider, Message, MessageContent, ProviderError, Role, ToolCall,
 };
 use crate::tools::registry::ToolRegistry;
 use crate::tools::trait_def::{ToolContext, ToolError};
@@ -361,27 +360,12 @@ impl Forge {
             // fix persists across iterations (new messages appended to original).
             clean_orphaned_tool_calls(&mut messages);
 
-            // (a) Call the LLM provider with a snapshot of the cleaned messages,
-            // using chat_stream() for SSE streaming instead of blocking chat().
+            // (a) Call the LLM provider — reliable non-streaming
             let snapshot = messages.clone();
             let validated = validate_tool_chain_for_provider(snapshot);
 
-            // HARD tool chain validation: dump last assistant(tc) + tool messages before call
-            let last_tc: Vec<String> = validated.iter().enumerate()
-                .filter(|(_, m)| m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty()))
-                .map(|(i, m)| {
-                    let ids: Vec<_> = m.tool_calls.as_ref().unwrap().iter().map(|t| &t.id).collect();
-                    let has_tci = m.tool_call_id.is_some();
-                    format!("[{}] Assistant tc={:?} tci={}", i, ids, has_tci)
-                }).collect();
-            if !last_tc.is_empty() {
-                info!(session = %session_id, "Forge: pre-call tool_calls = {:?}", last_tc);
-            }
-
-            // (a) Call the LLM provider via SSE streaming
-            use futures::StreamExt;
-            let mut stream = match self.provider.chat_stream(validated, tools.clone()).await {
-                Ok(s) => s,
+            let response = match self.provider.chat(validated, tools.clone()).await {
+                Ok(r) => r,
                 Err(e) => {
                     error!(session = %session_id, iteration, %e, "provider error");
                     let _ = event_tx.send(StreamEvent::Error { content: format!("Provider error: {}", e) });
@@ -389,34 +373,25 @@ impl Forge {
                 }
             };
 
-            let mut full_content = String::new();
-            let mut full_reasoning = String::new();
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut usage = None;
-
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(c) => {
-                        if let Some(ref text) = c.content { if !text.is_empty() { full_content.push_str(text); let _ = event_tx.send(StreamEvent::Token { content: text.clone() }); } }
-                        if let Some(ref rc) = c.reasoning_content { if !rc.is_empty() { full_reasoning.push_str(rc); let _ = event_tx.send(StreamEvent::Thinking { content: rc.clone(), step: iteration }); } }
-                        if let Some(ref tcd) = c.tool_calls {
-                            for d in tcd { let idx = d.index as usize; while tool_calls.len() <= idx { tool_calls.push(ToolCall { id: String::new(), call_type: "function".into(), function: FunctionCall { name: String::new(), arguments: String::new() } }); } if let Some(ref id) = d.id { tool_calls[idx].id = id.clone(); } if let Some(ref func) = d.function { if let Some(ref n) = func.name { tool_calls[idx].function.name = n.clone(); } if let Some(ref a) = func.arguments { tool_calls[idx].function.arguments.push_str(a); } } }
-                        }
-                        if c.usage.is_some() { usage = c.usage; }
-                    }
-                    Err(e) => { warn!(session=%session_id, iteration, %e, "stream chunk error"); }
+            // Emit thinking
+            if let Some(ref reasoning) = response.reasoning_content {
+                if !reasoning.is_empty() {
+                    let _ = event_tx.send(StreamEvent::Thinking { content: reasoning.clone(), step: iteration });
                 }
             }
+            // Emit text as one chunk (reliable, no hang)
+            if !response.content.is_empty() {
+                let _ = event_tx.send(StreamEvent::Token { content: response.content.clone() });
+            }
 
-            let has_tool_calls = !tool_calls.is_empty();
-
+            let has_tool_calls = !response.tool_calls.is_empty();
             let assistant_msg = Message {
                 role: Role::Assistant,
-                content: MessageContent::Text(full_content.clone()),
+                content: MessageContent::Text(response.content.clone()),
                 name: None,
-                tool_calls: if has_tool_calls { Some(tool_calls.clone()) } else { None },
+                tool_calls: if has_tool_calls { Some(response.tool_calls.clone()) } else { None },
                 tool_call_id: None,
-                reasoning_content: if full_reasoning.is_empty() { None } else { Some(full_reasoning) },
+                reasoning_content: response.reasoning_content.clone(),
                 created_at: 0,
             };
 
@@ -425,7 +400,7 @@ impl Forge {
                 debug!(
                     session = %session_id,
                     iteration,
-                    tool_count = tool_calls.len(),
+                    tool_count = response.tool_calls.len(),
                     "Forge: executing tool calls"
                 );
 
@@ -433,7 +408,7 @@ impl Forge {
                 // and before tool results so the API sees Assistant→Tool ordering.
                 messages.push(assistant_msg);
 
-                for tc in &tool_calls {
+                for tc in &response.tool_calls {
                     execute_one_tool(
                         &self.tools,
                         tc,
@@ -450,13 +425,13 @@ impl Forge {
             }
 
             // (e) No tool calls — this is the final answer.
-            if !full_content.is_empty() {
+            if !response.content.is_empty() {
                 info!(
                     session = %session_id,
                     iteration,
                     "Forge: agent finished with final answer"
                 );
-                let _ = event_tx.send(StreamEvent::Complete { usage });
+                let _ = event_tx.send(StreamEvent::Complete { usage: response.usage });
                 return Ok(());
             }
 
