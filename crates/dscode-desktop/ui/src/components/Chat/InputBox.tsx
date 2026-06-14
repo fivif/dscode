@@ -21,6 +21,7 @@ export default function InputBox({ onOpenWiki }: Props) {
   const setOutputFormat = useChatStore((s) => s.setOutputFormat);
   const messages = useChatStore((s) => s.messages);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const savedInputRef = useRef('');
 
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const isStreaming = useChatStore((s) => s.isStreaming);
@@ -58,6 +59,7 @@ export default function InputBox({ onOpenWiki }: Props) {
 
   const handleSend = useCallback(() => {
     if (!input.trim() || !activeSessionId || isStreaming) return;
+    savedInputRef.current = input;
     sendMessage(input);
     setInput('');
   }, [input, activeSessionId, isStreaming, sendMessage]);
@@ -102,8 +104,14 @@ export default function InputBox({ onOpenWiki }: Props) {
           return;
         }
       }
+      if (e.key === 'Escape' && isStreaming) {
+        e.preventDefault();
+        if (savedInputRef.current) { setInput(savedInputRef.current); savedInputRef.current = ''; }
+        abortStream();
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
-    }, [handleSend, showSlashMenu, filteredCommands, selectSlashCommand]);
+    }, [handleSend, isStreaming, abortStream, showSlashMenu, filteredCommands, selectSlashCommand]);
 
   const handleSelectModel = useCallback((model: ModelDef) => {
     updateConfig({ default_model: model.id, active_provider: model.provider });
