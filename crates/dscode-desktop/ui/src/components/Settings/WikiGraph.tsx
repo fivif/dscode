@@ -2,131 +2,175 @@ import { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
 import type { WikiGraph } from '@/lib/types';
 
-const MAX_NODES = 80;
 const NODE_COLORS: Record<string, string> = {
   concept: '#a78bfa', fact: '#34d399', pattern: '#fbbf24',
   decision: '#60a5fa', rule: '#f472b6',
 };
 
 export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [stats, setStats] = useState({ nodes: 0, edges: 0 });
-  const gRef = useRef<any>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const hoverRef = useRef<any>(null);
+  const simRef = useRef<d3.Simulation<any, any> | null>(null);
+  const [selected, setSelected] = useState<any>(null);
 
   useEffect(() => {
     if (!graph?.nodes?.length) return;
-    const el = containerRef.current;
-    if (!el) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const container = canvas.parentElement;
+    if (!container) return;
 
-    const W = el.clientWidth || 700;
+    const W = container.clientWidth || 700;
     const H = 420;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    const ctx = canvas.getContext('2d')!;
+    ctx.scale(dpr, dpr);
 
-    // Compute degree and cap nodes
+    // Compute degree for sizing
     const deg = new Map<string, number>();
     for (const e of graph.edges || []) {
       deg.set(e.source, (deg.get(e.source) || 0) + 1);
       deg.set(e.target, (deg.get(e.target) || 0) + 1);
     }
 
-    let rawNodes = (graph.nodes || []).map((n: any) => ({
-      id: n.id || n.title, title: n.title || n.id || '?',
+    const nodes: any[] = (graph.nodes || []).map((n: any) => ({
+      id: n.id || n.title, title: n.title || '?',
       _deg: deg.get(n.id || n.title) || 0,
       _type: n.node_type || 'fact',
+      _data: n,
     }));
 
-    // Sort by degree, take top N
-    rawNodes.sort((a, b) => b._deg - a._deg);
-    const capped = rawNodes.slice(0, MAX_NODES);
-
-    const nodeMap = new Map(capped.map(n => [n.id, n]));
+    const nodeMap = new Map(nodes.map(n => [n.id, n]));
     const edges = (graph.edges || [])
-      .filter(e => nodeMap.has(e.source) && nodeMap.has(e.target))
-      .map(e => ({ source: e.source, target: e.target }));
+      .filter((e: any) => nodeMap.has(e.source) && nodeMap.has(e.target))
+      .map((e: any) => ({ source: e.source, target: e.target }));
 
-    setStats({ nodes: capped.length, edges: edges.length });
+    const rScale = (d: number) => Math.max(3, Math.min(20, 4 + d * 1.5));
 
-    // Clear
-    el.innerHTML = '';
-
-    const svg = d3.select(el).append('svg')
-      .attr('width', W).attr('height', H)
-      .style('background', '#0a0a0f');
-
-    const g = svg.append('g');
-
-    const zoom = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.15, 4])
-      .on('zoom', (ev) => { g.attr('transform', ev.transform.toString()); });
-    svg.call(zoom);
-
-    const rScale = (d: number) => Math.max(3, Math.min(16, 4 + d * 1.5));
-
-    const sim = d3.forceSimulation(capped as any)
-      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(60))
-      .force('charge', d3.forceManyBody().strength(-120))
+    // D3 force simulation for physics only — Canvas for rendering
+    const sim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50))
+      .force('charge', d3.forceManyBody().strength(-150))
       .force('center', d3.forceCenter(W / 2, H / 2))
       .force('collide', d3.forceCollide((d: any) => rScale(d._deg) + 5))
-      .alphaDecay(0.03)
-      .alpha(0.5);
+      .alphaDecay(0.02)
+      .alpha(0.4);
 
-    // Edges
-    const link = g.append('g').selectAll('line').data(edges).join('line')
-      .attr('stroke', '#2a2d35').attr('stroke-width', 0.6);
+    // Throttled render — only draw every 3 ticks
+    let tickCount = 0;
+    let throttleCount = 0;
+    let stopped = false;
 
-    // Nodes
-    const node = g.append('g').selectAll('circle').data(capped).join('circle')
-      .attr('r', (d: any) => rScale(d._deg))
-      .attr('fill', (d: any) => NODE_COLORS[d._type] || '#6b7280')
-      .attr('stroke', '#1f2937').attr('stroke-width', 1)
-      .style('cursor', 'pointer');
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#0a0a0f';
+      ctx.fillRect(0, 0, W, H);
 
-    // Labels (hidden when >40 nodes)
-    const hideLabels = capped.length > 40;
-    const label = g.append('g').selectAll('text').data(capped).join('text')
-      .text((d: any) => (d.title || '').length > 12 ? d.title.slice(0, 10) + '…' : (d.title || ''))
-      .attr('dy', (d: any) => rScale(d._deg) + 10)
-      .attr('text-anchor', 'middle')
-      .attr('font-size', 8).attr('font-family', 'system-ui, sans-serif')
-      .attr('fill', '#6b7280')
-      .style('pointer-events', 'none')
-      .style('display', hideLabels ? 'none' : null);
+      // Edges
+      ctx.strokeStyle = '#2a2d35';
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      for (const e of edges) {
+        const s = nodeMap.get(e.source), t = nodeMap.get(e.target);
+        if (!s || s.x == null || t.x == null) continue;
+        ctx.moveTo(s.x, s.y);
+        ctx.lineTo(t.x, t.y);
+      }
+      ctx.stroke();
 
-    // Hover highlight
-    node.on('mouseenter', function (_: any, d: any) {
-      const r = rScale(d._deg);
-      d3.select(this).transition().duration(100)
-        .attr('r', r + 3).attr('stroke', '#fff').attr('stroke-width', 2);
-      label.filter((n: any) => n.id === d.id)
-        .attr('fill', '#e5e7eb').attr('font-size', 10).style('display', null);
+      // Nodes
+      for (const n of nodes) {
+        if (n.x == null) continue;
+        const r = rScale(n._deg);
+        const color = NODE_COLORS[n._type] || '#6b7280';
+        const isHover = hoverRef.current === n;
+        const rr = isHover ? r + 4 : r;
+
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, rr, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = isHover ? '#fff' : '#1f2937';
+        ctx.lineWidth = isHover ? 2 : 1;
+        ctx.stroke();
+      }
+
+      // Labels (only on hover or when stopped with fewer nodes)
+      if (stopped || hoverRef.current) {
+        for (const n of nodes) {
+          if (n.x == null) continue;
+          const isHover = hoverRef.current === n;
+          if (!isHover && !stopped) continue;
+          if (!isHover && nodes.length > 60) continue;
+          const r = rScale(n._deg);
+          const label = n.title.length > 14 ? n.title.slice(0, 12) + '…' : n.title;
+          ctx.font = `${isHover ? 11 : 8}px system-ui, sans-serif`;
+          ctx.fillStyle = isHover ? '#e5e7eb' : '#6b7280';
+          ctx.textAlign = 'center';
+          ctx.fillText(label, n.x, n.y + r + 10);
+        }
+      }
+    }
+
+    sim.on('tick', () => {
+      throttleCount++;
+      if (throttleCount % 3 !== 0) return; // Draw every 3rd tick
+      tickCount = throttleCount;
+      draw();
+      if (tickCount > 150) { sim.stop(); stopped = true; draw(); }
     });
-    node.on('mouseleave', function (_: any, d: any) {
-      d3.select(this).transition().duration(100)
-        .attr('r', rScale(d._deg)).attr('stroke', '#1f2937').attr('stroke-width', 1);
-      label.filter((n: any) => n.id === d.id)
-        .attr('fill', '#6b7280').attr('font-size', 8);
-      if (hideLabels) label.style('display', 'none');
-    });
+    sim.on('end', () => { stopped = true; draw(); });
 
-    // Drag
+    simRef.current = sim;
+
+    // Mouse interaction on canvas
+    canvas.onmousemove = (e) => {
+      const r = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      let found: any = null;
+      for (const n of nodes) {
+        if (n.x == null) continue;
+        const rr = rScale(n._deg) + 6;
+        if ((n.x - mx) ** 2 + (n.y - my) ** 2 < rr * rr) { found = n; break; }
+      }
+      hoverRef.current = found;
+      canvas.style.cursor = found ? 'pointer' : 'default';
+      draw();
+    };
+
+    canvas.onclick = (e) => {
+      if (!hoverRef.current) return;
+      setSelected(hoverRef.current._data);
+    };
+
+    // Drag via d3
     const drag = d3.drag<any, any>()
+      .subject(() => hoverRef.current || undefined)
       .on('start', (ev, d) => { if (!ev.active) sim.alphaTarget(0.05).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag', (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
       .on('end', (ev, d) => { if (!ev.active) sim.alphaTarget(0); d.fx = null; d.fy = null; });
-    (node as any).call(drag);
+    d3.select(canvas).call(drag as any);
 
-    // Tick — update positions, stop after layout settles
-    let tickCount = 0;
-    sim.on('tick', () => {
-      link.attr('x1', (d: any) => d.source.x).attr('y1', (d: any) => d.source.y)
-        .attr('x2', (d: any) => d.target.x).attr('y2', (d: any) => d.target.y);
-      node.attr('cx', (d: any) => d.x).attr('cy', (d: any) => d.y);
-      label.attr('x', (d: any) => d.x).attr('y', (d: any) => d.y);
-      tickCount++;
-      if (tickCount > 180) sim.stop();
-    });
+    // Zoom with mouse wheel
+    let scale = 1, tx = 0, ty = 0;
+    canvas.onwheel = (e) => {
+      e.preventDefault();
+      const r = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      const factor = e.deltaY < 0 ? 1.15 : 0.85;
+      scale *= factor;
+      scale = Math.max(0.2, Math.min(5, scale));
+      tx = mx - (mx - tx) * factor;
+      ty = my - (my - ty) * factor;
+      ctx.setTransform(dpr * scale, 0, 0, dpr * scale, tx * dpr, ty * dpr);
+      draw();
+    };
 
-    gRef.current = { svg, sim, zoom };
-
+    draw();
     return () => { sim.stop(); };
   }, [graph]);
 
@@ -136,25 +180,31 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
 
   return (
     <div>
-      <div ref={containerRef} className="rounded-lg border border-border overflow-hidden" style={{ height: 420 }} />
-      <div className="flex items-center gap-2 mt-2">
-        <button className="text-[10px] px-2 py-0.5 rounded bg-gray-700 text-gray-400 hover:text-gray-200"
-          onClick={() => { const g = gRef.current; if (g) g.svg.transition().duration(300).call(g.zoom.scaleBy, 1.4); }}>＋</button>
-        <button className="text-[10px] px-2 py-0.5 rounded bg-gray-700 text-gray-400 hover:text-gray-200"
-          onClick={() => { const g = gRef.current; if (g) g.svg.transition().duration(300).call(g.zoom.scaleBy, 0.7); }}>−</button>
-        <button className="text-[10px] px-2 py-0.5 rounded bg-gray-700 text-gray-400 hover:text-gray-200"
-          onClick={() => { const g = gRef.current; if (g) g.svg.transition().duration(400).call(g.zoom.transform, d3.zoomIdentity); }}>⊡</button>
-        <span className="text-[10px] text-gray-600 ml-auto">
-          {stats.nodes}/{graph.nodes.length} 节点 · {stats.edges} 边
-        </span>
+      <div className="rounded-lg border border-border overflow-hidden bg-[#0a0a0f]" style={{ height: 420 }}>
+        <canvas ref={canvasRef} style={{ width: '100%', height: 420 }} />
       </div>
-      <div className="flex items-center gap-3 mt-2 flex-wrap">
+      <div className="flex items-center gap-2 mt-2">
+        <span className="text-[10px] text-gray-600">{graph.nodes.length} 节点 · {graph.edges?.length || 0} 边</span>
+        <span className="text-[10px] text-gray-500 ml-auto">滚轮缩放 · 拖拽移动</span>
+      </div>
+      <div className="flex items-center gap-3 mt-1 flex-wrap">
         {Object.entries(NODE_COLORS).map(([type, color]) => (
           <span key={type} className="flex items-center gap-1 text-[10px] text-gray-500">
             <span className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />{type}
           </span>
         ))}
       </div>
+      {selected && (
+        <div className="mt-3 p-3 bg-card border border-border rounded-lg">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: (NODE_COLORS[selected.node_type] || '#6b7280') + '30', color: NODE_COLORS[selected.node_type] || '#6b7280' }}>
+              {selected.node_type || 'fact'}
+            </span>
+            <h3 className="text-sm font-medium text-gray-200">{selected.title}</h3>
+          </div>
+          <p className="text-xs text-gray-400 leading-relaxed">{selected.content}</p>
+        </div>
+      )}
     </div>
   );
 }
