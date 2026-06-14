@@ -124,23 +124,8 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       .attr('height', ch)
       .attr('fill', BG);
 
-    // ── Zoom behaviour ──
+    // ── Group (appended first, elements inside it later) ──
     const g = svg.append('g');
-    const zoom = d3.zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.08, 8])
-      .on('zoom', (ev) => {
-        g.attr('transform', ev.transform);
-        const k = ev.transform.k;
-        // Labels: hide when zoomed out, scale with zoom
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (label.style as any)('display', k > 0.6 ? null : 'none');
-        label.attr('font-size', (d: any) =>
-          Math.max(6, Math.min(12, rScale(d._deg || 1) * k * 0.8)),
-        );
-        // Edge opacity fades when zoomed out
-        link.attr('stroke-opacity', Math.min(0.25, 0.06 + k * 0.10));
-      });
-    svg.call(zoom);
 
     // ── Simulation ──
     const simulation = d3.forceSimulation(nodes)
@@ -240,6 +225,20 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
         d.fy = null;
       });
     node.call(drag);
+
+    // ── Zoom behaviour (AFTER elements exist so handler can reference them) ──
+    const zoom = d3.zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.08, 8])
+      .on('zoom', (ev) => {
+        g.attr('transform', ev.transform);
+        const k = ev.transform.k;
+        (label.style as any)('display', k > 0.6 ? null : 'none');
+        label.attr('font-size', (d: any) =>
+          Math.max(6, Math.min(12, rScale(d._deg || 1) * k * 0.8)),
+        );
+        link.attr('stroke-opacity', Math.min(0.25, 0.06 + k * 0.10));
+      });
+    svg.call(zoom);
 
     // ── Tick (stop after 200) ──
     let tickCount = 0;
