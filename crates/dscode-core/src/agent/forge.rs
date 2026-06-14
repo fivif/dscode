@@ -182,10 +182,40 @@ impl Forge {
         // F4: Reset compression flag for each new execution so re-use works.
         self.compressed.store(false, Ordering::Relaxed);
 
+        // --- Detect slash commands ---
+        let mode_prompt = if user_message.starts_with("/plan") {
+            "\n\n## MODE: /plan — 5-Phase PRD Deep Interview\n\
+            You are conducting a structured product requirements discovery. Follow these phases:\n\
+            1. SCOPE — Understand the project boundaries and goals\n\
+            2. REQUIREMENTS — Ask detailed questions about features and constraints\n\
+            3. DESIGN — Propose architecture and component design\n\
+            4. RISKS — Identify technical risks, dependencies, and mitigations\n\
+            5. QUALITY — Define success criteria, testing strategy, and acceptance\n\
+            Ask one question at a time. Be thorough but concise. Output the final PRD as a markdown document."
+        } else if user_message.starts_with("/auto") {
+            "\n\n## MODE: /auto — 3-Brain Auto Spiral\n\
+            You operate in a continuous improvement spiral: SCRUTINIZE → EXECUTE → PROMOTE.\n\
+            - SCRUTINIZE: Examine the task, identify gaps and improvements\n\
+            - EXECUTE: Take action — write code, run tests, fix issues\n\
+            - PROMOTE: Elevate the work — refactor, optimize, document\n\
+            Keep cycling until the task is complete. Do not stop mid-spiral."
+        } else if user_message.starts_with("/teams") {
+            "\n\n## MODE: /teams — Multi-Agent Dispatch\n\
+            Break down the task into independent subtasks. For each subtask:\n\
+            - Assign a virtual sub-agent with a clear role and goal\n\
+            - Execute subtasks in parallel where possible\n\
+            - Aggregate results when all sub-agents complete\n\
+            - Monitor progress and handle failures\n\
+            Think like a team lead orchestrating multiple workers."
+        } else {
+            ""
+        };
+
         // --- Build the enriched system prompt ---
         let enriched_system = format!(
-            "{}\n\nCurrent working directory: {}",
+            "{}{}\n\nCurrent working directory: {}",
             self.system_prompt,
+            mode_prompt,
             self.working_dir.display()
         );
 
