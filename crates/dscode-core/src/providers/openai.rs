@@ -75,7 +75,9 @@ impl OpenAiProvider {
 
 /// Build a reqwest Client with optional proxy support.
 fn build_client(proxy_url: &str) -> Client {
-    let mut builder = Client::builder().timeout(Duration::from_secs(300));
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(180));
     if !proxy_url.is_empty() {
         let proxy = reqwest::Proxy::all(proxy_url)
             .expect("Failed to build proxy");
@@ -184,18 +186,18 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        // P1: Use byte buffer to avoid splitting multi-byte UTF-8 characters
+        // P1: Use byte buffer with per-chunk read timeout to prevent hangs
         let byte_stream = resp.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
 
         tokio::spawn(async move {
             let mut buf: Vec<u8> = Vec::new();
             futures::pin_mut!(byte_stream);
-            while let Some(result) = tokio_stream::StreamExt::next(&mut byte_stream).await {
+            loop {
+                let result = tokio::time::timeout(Duration::from_secs(90), byte_stream.next()).await;
                 match result {
-                    Ok(bytes) => {
+                    Ok(Some(Ok(bytes))) => {
                         buf.extend_from_slice(&bytes);
-                        // Find complete lines (by \n byte) and process them
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes = buf.drain(..=pos).collect::<Vec<_>>();
                             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len()-1]);
@@ -204,10 +206,14 @@ impl LlmProvider for OpenAiProvider {
                             }
                         }
                     }
-                    Err(_) => { return; }
+                    Ok(Some(Err(_))) => { return; }
+                    Ok(None) => { break; }
+                    Err(_timeout) => {
+                        tracing::warn!("chat_stream chunk read timeout, closing stream");
+                        return;
+                    }
                 }
             }
-            // Process remaining buffer as a line
             if !buf.is_empty() {
                 let line = String::from_utf8_lossy(&buf);
                 if line.starts_with("data: ") {
