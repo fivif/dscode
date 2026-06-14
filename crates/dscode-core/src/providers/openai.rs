@@ -184,9 +184,9 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        // P1: Buffer TCP chunks into complete SSE events (delimited by \n\n)
+        // P1: Use chunk-based streaming to get bytes as they arrive
         let byte_stream = resp.bytes_stream();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, ProviderError>>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
 
         tokio::spawn(async move {
             let mut buffer = String::new();
@@ -194,25 +194,27 @@ impl LlmProvider for OpenAiProvider {
             while let Some(result) = tokio_stream::StreamExt::next(&mut byte_stream).await {
                 match result {
                     Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buffer.find("\n\n") {
-                            let event = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
-                            if tx.send(Ok(event)).await.is_err() {
-                                return; // receiver dropped
+                        let text = String::from_utf8_lossy(&bytes).to_string();
+                        buffer.push_str(&text);
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].to_string();
+                            buffer = buffer[pos + 1..].to_string();
+                            if line.starts_with("data: ") && !line.is_empty() {
+                                if tx.send(line).await.is_err() { return; }
                             }
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(ProviderError::Http(e))).await;
-                        return;
-                    }
+                    Err(_) => { return; }
                 }
+            }
+            // Send remaining buffer
+            if buffer.starts_with("data: ") && !buffer.is_empty() {
+                let _ = tx.send(buffer).await;
             }
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-            .map(|result| result.and_then(|text| parse_sse_chunk(&text)));
+            .map(|line| parse_sse_chunk(&line));
 
         Ok(Box::pin(stream))
     }
