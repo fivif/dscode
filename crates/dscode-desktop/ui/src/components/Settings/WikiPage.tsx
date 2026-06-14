@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { wikiSearch, wikiGraph, wikiIngest } from '@/lib/tauri';
 import type { WikiNode, WikiGraph } from '@/lib/types';
+import WikiGraphView from './WikiGraph';
 import { useChatStore } from '@/stores/chatStore';
 
 interface Props { onBack: () => void; }
@@ -112,32 +113,17 @@ export default function WikiPage({ onBack }: Props) {
         {tab === 'graph' && (
           <div>
             <div className="flex items-center justify-between mb-4">
-              <p className="text-gray-500 text-sm">知识图谱概览</p>
+              <p className="text-gray-500 text-sm">知识引力图谱</p>
               <div className="flex gap-2">
-                <button
-                  className="px-3 py-1.5 bg-blue-700 text-xs text-gray-200 rounded-lg hover:bg-blue-600 disabled:opacity-50"
-                  onClick={handleIngest}
-                  disabled={ingesting || !activeSessionId}
+                <button className="px-3 py-1.5 bg-blue-700 text-xs text-gray-200 rounded-lg hover:bg-blue-600 disabled:opacity-50"
+                  onClick={handleIngest} disabled={ingesting || !activeSessionId}
                   title={activeSessionId ? '从当前会话提取知识' : '无活跃会话'}
                 >{ingesting ? '摄入中...' : '自动摄入'}</button>
-                <button
-                  className="px-3 py-1.5 bg-gray-700 text-xs text-gray-200 rounded-lg hover:bg-gray-600"
-                  onClick={refreshGraph}
-                >刷新</button>
+                <button className="px-3 py-1.5 bg-gray-700 text-xs text-gray-200 rounded-lg hover:bg-gray-600"
+                  onClick={refreshGraph}>刷新</button>
               </div>
             </div>
-            {graph ? (
-              <div className="space-y-4">
-                <div className="bg-card border border-border rounded-lg p-4">
-                  <p className="text-xs text-gray-400">节点: {graph.nodes?.length || 0}  ·  边: {graph.edges?.length || 0}</p>
-                </div>
-                <pre className="bg-gray-900 rounded-lg p-4 text-xs text-gray-400 overflow-x-auto max-h-96">
-                  {JSON.stringify(graph, null, 2)}
-                </pre>
-              </div>
-            ) : (
-              <p className="text-gray-500 text-sm text-center py-8">加载中...</p>
-            )}
+            {graph ? <WikiGraphView graph={graph} /> : <p className="text-gray-500 text-sm text-center py-8">加载中...</p>}
           </div>
         )}
       </div>
