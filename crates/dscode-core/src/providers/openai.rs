@@ -184,32 +184,35 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        // P1: Use chunk-based streaming to get bytes as they arrive
+        // P1: Use byte buffer to avoid splitting multi-byte UTF-8 characters
         let byte_stream = resp.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
 
         tokio::spawn(async move {
-            let mut buffer = String::new();
+            let mut buf: Vec<u8> = Vec::new();
             futures::pin_mut!(byte_stream);
             while let Some(result) = tokio_stream::StreamExt::next(&mut byte_stream).await {
                 match result {
                     Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes).to_string();
-                        buffer.push_str(&text);
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].to_string();
-                            buffer = buffer[pos + 1..].to_string();
-                            if line.starts_with("data: ") && !line.is_empty() {
-                                if tx.send(line).await.is_err() { return; }
+                        buf.extend_from_slice(&bytes);
+                        // Find complete lines (by \n byte) and process them
+                        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                            let line_bytes = buf.drain(..=pos).collect::<Vec<_>>();
+                            let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len()-1]);
+                            if line.starts_with("data: ") {
+                                if tx.send(line.to_string()).await.is_err() { return; }
                             }
                         }
                     }
                     Err(_) => { return; }
                 }
             }
-            // Send remaining buffer
-            if buffer.starts_with("data: ") && !buffer.is_empty() {
-                let _ = tx.send(buffer).await;
+            // Process remaining buffer as a line
+            if !buf.is_empty() {
+                let line = String::from_utf8_lossy(&buf);
+                if line.starts_with("data: ") {
+                    let _ = tx.send(line.to_string()).await;
+                }
             }
         });
 
