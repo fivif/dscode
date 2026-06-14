@@ -18,8 +18,8 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
     nodes: (graph.nodes || []).map((n: any) => ({
       id: n.id || n.title,
       name: n.title || n.id || '?',
+      node_type: n.node_type || 'fact',
       val: 2,
-      color: NODE_COLORS[n.node_type] || '#6b7280',
       _data: n,
     })),
     links: (graph.edges || [])
@@ -37,27 +37,21 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
 
   return (
     <div>
-      <div className="rounded-lg border border-border overflow-hidden bg-[#0a0a0f]" style={{ height: 420 }}>
+      <div className="rounded-lg border border-border overflow-hidden bg-[#0a0a0f]" style={{ width: '100%', height: 420 }}>
         <ForceGraph2D
           ref={fgRef}
           graphData={data}
-          width={800}
+          width={window.innerWidth * 0.7}
           height={420}
-          nodeLabel={(n: any) => n.name}
-          nodeColor={(n: any) => n.color}
-          nodeRelSize={5}
+          nodeLabel="name"
+          nodeAutoColorBy="node_type"
+          nodeRelSize={6}
           linkColor={() => '#374151'}
-          linkWidth={0.5}
-          linkDirectionalArrowLength={0}
+          linkWidth={0.6}
           backgroundColor="#0a0a0f"
           onNodeClick={handleClick}
-          cooldownTicks={100}
-          d3AlphaDecay={0.02}
-          d3VelocityDecay={0.3}
-          enableNodeDrag={true}
-          enableZoomInteraction={true}
-          minZoom={0.3}
-          maxZoom={3}
+          cooldownTicks={50}
+          enableNodeDrag={false}
         />
       </div>
 
