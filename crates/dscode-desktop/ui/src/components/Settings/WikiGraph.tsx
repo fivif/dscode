@@ -129,12 +129,12 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
 
     // ── Simulation ──
     const simulation = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50).strength(0.5))
-      .force('charge', d3.forceManyBody().strength(-50))
+      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50).strength(0.3))
+      .force('charge', d3.forceManyBody().strength(-60))
       .force('center', d3.forceCenter(cw / 2, ch / 2))
-      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 8).strength(0.8))
-      .alphaDecay(0.015)
-      .alpha(0.5);
+      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 8).strength(1))
+      .alphaDecay(0.05)
+      .alpha(0.4);
 
     // ── Edges ──
     const link = g.append('g')
@@ -218,10 +218,8 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
         d.fx = ev.x;
         d.fy = ev.y;
       })
-      .on('end', (ev, d: any) => {
-        d.fx = null;
-        d.fy = null;
-        simulation.alpha(0.1).restart();  // Gentle reheat
+      .on('end', () => {
+        simulation.alpha(0.02).restart();  // Minimal reheat after drag
       });
     node.call(drag);
 
@@ -239,10 +237,8 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       });
     svg.call(zoom);
 
-    // ── Tick (stop after 200) ──
-    let tickCount = 0;
+    // ── Tick ──
     simulation.on('tick', () => {
-      tickCount++;
       link
         .attr('x1', (d: any) => d.source.x)
         .attr('y1', (d: any) => d.source.y)
@@ -254,9 +250,6 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       label
         .attr('x', (d: any) => d.x)
         .attr('y', (d: any) => d.y);
-      if (tickCount > 200) {
-        simulation.stop();
-      }
     });
 
     // ── Fit once layout settles ──
