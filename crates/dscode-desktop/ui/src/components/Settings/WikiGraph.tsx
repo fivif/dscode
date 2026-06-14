@@ -93,19 +93,31 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
     if (cw < 50) return;
     const ch = GRAPH_HEIGHT;
 
-    // ── Prepare data ──
+    // ── Prepare data (dedup by title, keep only nodes with edges) ──
     const deg = computeDegrees(graph.edges || []);
-    const nodes: any[] = graph.nodes.map((n) => ({
-      id: n.id,
-      title: n.title || n.id,
-      _deg: deg.get(n.id) || 0,
-      _type: n.node_type || 'fact',
-      _data: n,
-      x: cw / 2 + (Math.random() - 0.5) * 8,
-      y: ch / 2 + (Math.random() - 0.5) * 8,
-    }));
+    const seen = new Set<string>();
+    const nodes: any[] = [];
+    for (const n of graph.nodes) {
+      const key = n.title || n.id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const d = deg.get(n.id) || 0;
+      // Only include nodes with at least 1 edge (connected) or top 10 by degree
+      nodes.push({
+        id: n.id,
+        title: n.title || n.id,
+        _deg: d,
+        _type: n.node_type || 'fact',
+        _data: n,
+        x: cw / 2 + (Math.random() - 0.5) * cw * 0.3,
+        y: ch / 2 + (Math.random() - 0.5) * ch * 0.3,
+      });
+    }
+    // Sort by degree, keep top 100
+    nodes.sort((a, b) => b._deg - a._deg);
+    const displayNodes = nodes.slice(0, Math.min(100, nodes.length));
 
-    const nodeMap = new Map<string, any>(nodes.map((n) => [n.id, n]));
+    const nodeMap = new Map<string, any>(displayNodes.map((n) => [n.id, n]));
     const edges = (graph.edges || [])
       .filter((e) => nodeMap.has(e.source) && nodeMap.has(e.target))
       .map((e) => ({ source: e.source, target: e.target }));
@@ -128,7 +140,7 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
     const g = svg.append('g');
 
     // ── Simulation ──
-    const simulation = d3.forceSimulation(nodes)
+    const simulation = d3.forceSimulation(displayNodes)
       .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50).strength(0.3))
       .force('charge', d3.forceManyBody().strength(-60))
       .force('center', d3.forceCenter(cw / 2, ch / 2))
@@ -148,7 +160,7 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
     // ── Nodes ──
     const node = g.append('g')
       .selectAll('circle')
-      .data(nodes)
+      .data(displayNodes)
       .join('circle')
       .attr('r', (d: any) => rScale(d._deg || 1))
       .attr('fill', (d: any) => NODE_COLORS[d._type] || '#6b7280')
@@ -162,7 +174,7 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
     // ── Labels ──
     const label = g.append('g')
       .selectAll('text')
-      .data(nodes)
+      .data(displayNodes)
       .join('text')
       .text((d: any) => {
         const t = d.title || '';
@@ -257,7 +269,7 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       requestAnimationFrame(fitToBounds);
     });
 
-    stateRef.current = { svg, zoom, simulation, nodes, width: cw, height: ch };
+    stateRef.current = { svg, zoom, simulation, nodes: displayNodes, width: cw, height: ch };
 
     return () => {
       simulation.stop();
