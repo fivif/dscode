@@ -104,8 +104,8 @@ export interface WikiNode {
 }
 
 export interface WikiGraph {
-  nodes: Array<{ id: string; label: string }>;
-  edges: Array<{ source: string; target: string; label: string }>;
+  nodes: Array<{ id: string; title: string; content: string; node_type: string; tags: string[]; session_id?: string; links?: string[] }>;
+  edges: Array<{ source: string; target: string; weight?: number }>;
 }
 
 // ── Model definitions ──
