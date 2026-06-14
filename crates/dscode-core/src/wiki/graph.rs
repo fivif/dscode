@@ -78,8 +78,35 @@ impl Graph {
     pub fn from_nodes(nodes: Vec<KnowledgeNode>) -> Self {
         let mut graph = Self::new();
         graph.add_nodes(nodes);
-        graph.compute_semantic_edges(0.1);
+        // Higher threshold + edge cap per node for clean visualization
+        graph.compute_semantic_edges(0.25);
+        // Cap edges per node for better graph layout
+        graph.cap_edges_per_node(5);
         graph
+    }
+
+    /// Cap each node to at most N outgoing edges (keep strongest weights).
+    pub fn cap_edges_per_node(&mut self, max_per_node: usize) {
+        let mut node_edge_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // Sort by weight descending
+        self.edges.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        self.edges.retain(|e| {
+            let count = node_edge_counts.entry(e.source.clone()).or_insert(0);
+            if *count < max_per_node {
+                *count += 1;
+                true
+            } else {
+                false
+            }
+        });
+        // Rebuild adjacency
+        self.adjacency.clear();
+        for edge in &self.edges {
+            self.adjacency
+                .entry(edge.source.clone())
+                .or_default()
+                .push((edge.target.clone(), edge.weight));
+        }
     }
 
     /// Add nodes to the graph.
