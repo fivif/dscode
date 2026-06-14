@@ -219,21 +219,29 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       setSelected(d._data);
     });
 
-    // ── Drag ──
+    // ── Drag (direct update for smoothness, no simulation during drag) ──
     const drag = d3.drag<any, any>()
       .on('start', (ev, d: any) => {
-        if (!ev.active) simulation.alphaTarget(0.3).restart();
-        d.fx = d.x;
-        d.fy = d.y;
+        simulation.stop();
+        d.fx = d.x; d.fy = d.y;
       })
       .on('drag', (ev, d: any) => {
-        d.fx = ev.x;
-        d.fy = ev.y;
+        d.fx = ev.x; d.fy = ev.y;
+        d.x = ev.x; d.y = ev.y;
+        // Direct DOM update — skip simulation for smooth 60fps drag
+        d3.selectAll('circle').filter((n: any) => n.id === d.id)
+          .attr('cx', ev.x).attr('cy', ev.y);
+        d3.selectAll('text').filter((n: any) => n.id === d.id)
+          .attr('x', ev.x).attr('y', ev.y);
+        // Update connected edges
+        link.filter((l: any) => l.source.id === d.id || l.target.id === d.id)
+          .attr('x1', (l: any) => l.source.id === d.id ? ev.x : l.source.x)
+          .attr('y1', (l: any) => l.source.id === d.id ? ev.y : l.source.y)
+          .attr('x2', (l: any) => l.target.id === d.id ? ev.x : l.target.x)
+          .attr('y2', (l: any) => l.target.id === d.id ? ev.y : l.target.y);
       })
-      .on('end', (ev, d: any) => {
-        if (!ev.active) simulation.alphaTarget(0);
-        d.fx = null;
-        d.fy = null;
+      .on('end', () => {
+        simulation.alpha(0.05).restart();
       });
     node.call(drag);
 
