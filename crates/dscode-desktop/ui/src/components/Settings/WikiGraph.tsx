@@ -129,13 +129,12 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
 
     // ── Simulation ──
     const simulation = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(55))
-      .force('charge', d3.forceManyBody().strength(-90))
-      .force('x', d3.forceX(cw / 2).strength(0.005))
-      .force('y', d3.forceY(ch / 2).strength(0.005))
-      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 4))
-      .alphaDecay(0.02)
-      .alpha(0.3);
+      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50).strength(0.5))
+      .force('charge', d3.forceManyBody().strength(-50))
+      .force('center', d3.forceCenter(cw / 2, ch / 2))
+      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 8).strength(0.8))
+      .alphaDecay(0.015)
+      .alpha(0.5);
 
     // ── Edges ──
     const link = g.append('g')
@@ -208,10 +207,10 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       setSelected(d._data);
     });
 
-    // ── Drag ──
+    // ── Drag (pause simulation while dragging for smooth control) ──
     const drag = d3.drag<any, any>()
       .on('start', (ev, d: any) => {
-        if (!ev.active) simulation.alphaTarget(0.08).restart();
+        simulation.stop();  // Freeze layout during drag
         d.fx = d.x;
         d.fy = d.y;
       })
@@ -220,9 +219,9 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
         d.fy = ev.y;
       })
       .on('end', (ev, d: any) => {
-        if (!ev.active) simulation.alphaTarget(0);
         d.fx = null;
         d.fy = null;
+        simulation.alpha(0.1).restart();  // Gentle reheat
       });
     node.call(drag);
 
