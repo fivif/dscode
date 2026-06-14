@@ -562,9 +562,10 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
             }
             result.push(m);
         } else if m.role == Role::Tool {
-            // Only keep Tool messages whose ID was declared by a previous assistant
+            // Only keep Tool messages whose ID was declared by a previous assistant.
+            // Consume the ID so it can't be reused (OpenAI requires uniqueness).
             if let Some(ref id) = m.tool_call_id {
-                if pending_tc_ids.contains(id) {
+                if pending_tc_ids.remove(id) {
                     result.push(m);
                 }
             }
