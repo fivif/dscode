@@ -131,7 +131,6 @@ export default function InputBox({ onOpenWiki }: Props) {
             value={input}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
-            disabled={isStreaming}
           />
 
           {/* Slash command menu */}
