@@ -138,7 +138,7 @@ export default function WikiPage({ onBack }: { onBack: () => void }) {
         {tab === 'graph' && (
           <div className="p-4">
             {graph && graph.nodes?.length > 0 ? (
-              <WikiGraphView graph={graph} />
+              <WikiGraphView graph={graph} highlightId={selected?.id} />
             ) : (
               <p className="text-gray-500 text-sm text-center py-12">图谱加载中...</p>
             )}
