@@ -141,12 +141,12 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
 
     // ── Simulation ──
     const simulation = d3.forceSimulation(displayNodes)
-      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50).strength(0.3))
-      .force('charge', d3.forceManyBody().strength(-60))
+      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(55).strength(0.4))
+      .force('charge', d3.forceManyBody().strength(-80))
       .force('center', d3.forceCenter(cw / 2, ch / 2))
-      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 8).strength(1))
-      .alphaDecay(0.05)
-      .alpha(0.4);
+      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 10).strength(0.6))
+      .alphaDecay(0.008)
+      .alpha(0.6);
 
     // ── Edges ──
     const link = g.append('g')
@@ -249,19 +249,15 @@ export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
       });
     svg.call(zoom);
 
-    // ── Tick ──
+    // ── Tick (stop after 350 for smooth settling) ──
+    let tickCount = 0;
     simulation.on('tick', () => {
-      link
-        .attr('x1', (d: any) => d.source.x)
-        .attr('y1', (d: any) => d.source.y)
-        .attr('x2', (d: any) => d.target.x)
-        .attr('y2', (d: any) => d.target.y);
-      node
-        .attr('cx', (d: any) => d.x)
-        .attr('cy', (d: any) => d.y);
-      label
-        .attr('x', (d: any) => d.x)
-        .attr('y', (d: any) => d.y);
+      tickCount++;
+      link.attr('x1', (d: any) => d.source.x).attr('y1', (d: any) => d.source.y)
+        .attr('x2', (d: any) => d.target.x).attr('y2', (d: any) => d.target.y);
+      node.attr('cx', (d: any) => d.x).attr('cy', (d: any) => d.y);
+      label.attr('x', (d: any) => d.x).attr('y', (d: any) => d.y);
+      if (tickCount > 350) simulation.stop();
     });
 
     // ── Fit once layout settles ──

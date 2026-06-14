@@ -81,7 +81,7 @@ impl Graph {
         // Higher threshold + edge cap per node for clean visualization
         graph.compute_semantic_edges(0.25);
         // Cap edges per node for better graph layout
-        graph.cap_edges_per_node(5);
+        graph.cap_edges_per_node(8);
         graph
     }
 
