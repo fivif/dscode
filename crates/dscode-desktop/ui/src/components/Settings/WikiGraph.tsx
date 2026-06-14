@@ -1,203 +1,358 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
 import type { WikiGraph } from '@/lib/types';
 
 const NODE_COLORS: Record<string, string> = {
-  concept: '#a78bfa', fact: '#34d399', pattern: '#fbbf24',
-  decision: '#60a5fa', rule: '#f472b6',
+  concept: '#a78bfa',
+  fact: '#34d399',
+  pattern: '#fbbf24',
+  decision: '#60a5fa',
+  rule: '#f472b6',
 };
 
+const BG = '#0a0a0f';
+const EDGE_COLOR = '#374151';
+const GRAPH_HEIGHT = 420;
+
+function rScale(deg: number): number {
+  return Math.max(4, Math.min(16, 4 + deg * 1.2));
+}
+
+function computeDegrees(edges: Array<{ source: string; target: string }>): Map<string, number> {
+  const deg = new Map<string, number>();
+  for (const e of edges) {
+    deg.set(e.source, (deg.get(e.source) || 0) + 1);
+    deg.set(e.target, (deg.get(e.target) || 0) + 1);
+  }
+  return deg;
+}
+
+interface GraphState {
+  svg: d3.Selection<SVGSVGElement, unknown, null, undefined>;
+  zoom: d3.ZoomBehavior<SVGSVGElement, unknown>;
+  simulation: d3.Simulation<any, any>;
+  nodes: any[];
+  width: number;
+  height: number;
+}
+
 export default function WikiGraphView({ graph }: { graph: WikiGraph }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const hoverRef = useRef<any>(null);
-  const simRef = useRef<d3.Simulation<any, any> | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const stateRef = useRef<GraphState | null>(null);
   const [selected, setSelected] = useState<any>(null);
 
+  // ── Fit graph to bounds ──
+  const fitToBounds = useCallback(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    const { svg, zoom, simulation, width: cw, height: ch } = state;
+    const ns = simulation.nodes();
+    if (!ns.length) return;
+    const xExt = d3.extent(ns, (d: any) => d.x) as [number, number] | [undefined, undefined];
+    const yExt = d3.extent(ns, (d: any) => d.y) as [number, number] | [undefined, undefined];
+    if (xExt[0] == null || yExt[0] == null) return;
+    const dx = (xExt[1] as number) - (xExt[0] as number) || 1;
+    const dy = (yExt[1] as number) - (yExt[0] as number) || 1;
+    const cx = ((xExt[0] as number) + (xExt[1] as number)) / 2;
+    const cy = ((yExt[0] as number) + (yExt[1] as number)) / 2;
+    const pad = 40;
+    const scale = 0.85 / Math.max(dx / (cw - pad * 2), dy / (ch - pad * 2), 0.2);
+    const tx = cw / 2 - cx * scale;
+    const ty = ch / 2 - cy * scale;
+    svg.transition().duration(500).call(
+      zoom.transform,
+      d3.zoomIdentity.translate(tx, ty).scale(Math.min(scale, 2)),
+    );
+  }, []);
+
+  const zoomIn = useCallback(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    state.svg.transition().duration(300).call(state.zoom.scaleBy, 1.5);
+  }, []);
+
+  const zoomOut = useCallback(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    state.svg.transition().duration(300).call(state.zoom.scaleBy, 0.7);
+  }, []);
+
+  // ── Main render effect ──
   useEffect(() => {
-    if (!graph?.nodes?.length) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const container = canvas.parentElement;
-    if (!container) return;
+    const container = containerRef.current;
+    if (!container || !graph?.nodes?.length) return;
 
-    const W = container.clientWidth || 700;
-    const H = 420;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-    const ctx = canvas.getContext('2d')!;
-    ctx.scale(dpr, dpr);
-
-    // Compute degree for sizing
-    const deg = new Map<string, number>();
-    for (const e of graph.edges || []) {
-      deg.set(e.source, (deg.get(e.source) || 0) + 1);
-      deg.set(e.target, (deg.get(e.target) || 0) + 1);
+    // Kill previous simulation and clear DOM
+    if (stateRef.current) {
+      stateRef.current.simulation.stop();
+      stateRef.current = null;
     }
+    container.innerHTML = '';
 
-    const nodes: any[] = (graph.nodes || []).map((n: any) => ({
-      id: n.id || n.title, title: n.title || '?',
-      _deg: deg.get(n.id || n.title) || 0,
+    const cw = container.clientWidth || 700;
+    if (cw < 50) return;
+    const ch = GRAPH_HEIGHT;
+
+    // ── Prepare data ──
+    const deg = computeDegrees(graph.edges || []);
+    const nodes: any[] = graph.nodes.map((n) => ({
+      id: n.id,
+      title: n.title || n.id,
+      _deg: deg.get(n.id) || 0,
       _type: n.node_type || 'fact',
       _data: n,
+      x: cw / 2 + (Math.random() - 0.5) * 8,
+      y: ch / 2 + (Math.random() - 0.5) * 8,
     }));
 
-    const nodeMap = new Map(nodes.map(n => [n.id, n]));
+    const nodeMap = new Map<string, any>(nodes.map((n) => [n.id, n]));
     const edges = (graph.edges || [])
-      .filter((e: any) => nodeMap.has(e.source) && nodeMap.has(e.target))
-      .map((e: any) => ({ source: e.source, target: e.target }));
+      .filter((e) => nodeMap.has(e.source) && nodeMap.has(e.target))
+      .map((e) => ({ source: e.source, target: e.target }));
 
-    const rScale = (d: number) => Math.max(3, Math.min(20, 4 + d * 1.5));
+    // ── SVG container ──
+    const svg = d3.select(container)
+      .append('svg')
+      .attr('viewBox', [0, 0, cw, ch])
+      .attr('width', cw)
+      .attr('height', ch)
+      .style('display', 'block');
 
-    // D3 force simulation for physics only — Canvas for rendering
-    const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(50))
-      .force('charge', d3.forceManyBody().strength(-150))
-      .force('center', d3.forceCenter(W / 2, H / 2))
-      .force('collide', d3.forceCollide((d: any) => rScale(d._deg) + 5))
+    // Background rect
+    svg.append('rect')
+      .attr('width', cw)
+      .attr('height', ch)
+      .attr('fill', BG);
+
+    // ── Zoom behaviour ──
+    const g = svg.append('g');
+    const zoom = d3.zoom<SVGSVGElement, unknown>()
+      .scaleExtent([0.08, 8])
+      .on('zoom', (ev) => {
+        g.attr('transform', ev.transform);
+        const k = ev.transform.k;
+        // Labels: hide when zoomed out, scale with zoom
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (label.style as any)('display', k > 0.6 ? null : 'none');
+        label.attr('font-size', (d: any) =>
+          Math.max(6, Math.min(12, rScale(d._deg || 1) * k * 0.8)),
+        );
+        // Edge opacity fades when zoomed out
+        link.attr('stroke-opacity', Math.min(0.25, 0.06 + k * 0.10));
+      });
+    svg.call(zoom);
+
+    // ── Simulation ──
+    const simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(edges).id((d: any) => d.id).distance(55))
+      .force('charge', d3.forceManyBody().strength(-90))
+      .force('x', d3.forceX(cw / 2).strength(0.005))
+      .force('y', d3.forceY(ch / 2).strength(0.005))
+      .force('collide', d3.forceCollide((d: any) => rScale(d._deg || 1) + 4))
       .alphaDecay(0.02)
-      .alpha(0.4);
+      .alpha(0.3);
 
-    // Throttled render — only draw every 3 ticks
-    let tickCount = 0;
-    let throttleCount = 0;
-    let stopped = false;
+    // ── Edges ──
+    const link = g.append('g')
+      .selectAll('line')
+      .data(edges)
+      .join('line')
+      .attr('stroke', EDGE_COLOR)
+      .attr('stroke-width', 0.5)
+      .attr('stroke-opacity', 0.15);
 
-    function draw() {
-      ctx.clearRect(0, 0, W, H);
-      ctx.fillStyle = '#0a0a0f';
-      ctx.fillRect(0, 0, W, H);
+    // ── Nodes ──
+    const node = g.append('g')
+      .selectAll('circle')
+      .data(nodes)
+      .join('circle')
+      .attr('r', (d: any) => rScale(d._deg || 1))
+      .attr('fill', (d: any) => NODE_COLORS[d._type] || '#6b7280')
+      .attr('stroke', '#1a1b1e')
+      .attr('stroke-width', 1.5)
+      .style('cursor', 'pointer');
 
-      // Edges
-      ctx.strokeStyle = '#2a2d35';
-      ctx.lineWidth = 0.5;
-      ctx.beginPath();
-      for (const e of edges) {
-        const s = nodeMap.get(e.source), t = nodeMap.get(e.target);
-        if (!s || s.x == null || t.x == null) continue;
-        ctx.moveTo(s.x, s.y);
-        ctx.lineTo(t.x, t.y);
-      }
-      ctx.stroke();
+    // Tooltips (native SVG <title>)
+    node.append('title').text((d: any) => d.title || d.id);
 
-      // Nodes
-      for (const n of nodes) {
-        if (n.x == null) continue;
-        const r = rScale(n._deg);
-        const color = NODE_COLORS[n._type] || '#6b7280';
-        const isHover = hoverRef.current === n;
-        const rr = isHover ? r + 4 : r;
+    // ── Labels ──
+    const label = g.append('g')
+      .selectAll('text')
+      .data(nodes)
+      .join('text')
+      .text((d: any) => {
+        const t = d.title || '';
+        return t.length > 20 ? t.slice(0, 18) + '…' : t;
+      })
+      .attr('dx', 0)
+      .attr('dy', 14)
+      .attr('text-anchor', 'middle')
+      .attr('font-size', 8)
+      .attr('font-family', 'system-ui, -apple-system, sans-serif')
+      .attr('fill', '#8b8d91')
+      .style('pointer-events', 'none')
+      .style('user-select', 'none');
 
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, rr, 0, Math.PI * 2);
-        ctx.fillStyle = color;
-        ctx.fill();
-        ctx.strokeStyle = isHover ? '#fff' : '#1f2937';
-        ctx.lineWidth = isHover ? 2 : 1;
-        ctx.stroke();
-      }
-
-      // Labels (only on hover or when stopped with fewer nodes)
-      if (stopped || hoverRef.current) {
-        for (const n of nodes) {
-          if (n.x == null) continue;
-          const isHover = hoverRef.current === n;
-          if (!isHover && !stopped) continue;
-          if (!isHover && nodes.length > 60) continue;
-          const r = rScale(n._deg);
-          const label = n.title.length > 14 ? n.title.slice(0, 12) + '…' : n.title;
-          ctx.font = `${isHover ? 11 : 8}px system-ui, sans-serif`;
-          ctx.fillStyle = isHover ? '#e5e7eb' : '#6b7280';
-          ctx.textAlign = 'center';
-          ctx.fillText(label, n.x, n.y + r + 10);
-        }
-      }
-    }
-
-    sim.on('tick', () => {
-      throttleCount++;
-      if (throttleCount % 3 !== 0) return; // Draw every 3rd tick
-      tickCount = throttleCount;
-      draw();
-      if (tickCount > 150) { sim.stop(); stopped = true; draw(); }
+    // ── Hover ──
+    node.on('mouseenter', function (_, d: any) {
+      d3.select(this)
+        .transition().duration(120)
+        .attr('r', rScale(d._deg || 1) + 3)
+        .attr('stroke', '#fff')
+        .attr('stroke-width', 2.5);
+      label.filter((nd: any) => nd.id === d.id)
+        .transition().duration(120)
+        .attr('fill', '#e0e2e6')
+        .attr('font-size', 11);
     });
-    sim.on('end', () => { stopped = true; draw(); });
 
-    simRef.current = sim;
+    node.on('mouseleave', function (_, d: any) {
+      d3.select(this)
+        .transition().duration(120)
+        .attr('r', rScale(d._deg || 1))
+        .attr('stroke', '#1a1b1e')
+        .attr('stroke-width', 1.5);
+      label.filter((nd: any) => nd.id === d.id)
+        .transition().duration(120)
+        .attr('fill', '#8b8d91')
+        .attr('font-size', 8);
+    });
 
-    // Mouse interaction on canvas
-    canvas.onmousemove = (e) => {
-      const r = canvas.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      let found: any = null;
-      for (const n of nodes) {
-        if (n.x == null) continue;
-        const rr = rScale(n._deg) + 6;
-        if ((n.x - mx) ** 2 + (n.y - my) ** 2 < rr * rr) { found = n; break; }
-      }
-      hoverRef.current = found;
-      canvas.style.cursor = found ? 'pointer' : 'default';
-      draw();
-    };
+    // ── Click → select ──
+    node.on('click', (_, d: any) => {
+      setSelected(d._data);
+    });
 
-    canvas.onclick = (e) => {
-      if (!hoverRef.current) return;
-      setSelected(hoverRef.current._data);
-    };
-
-    // Drag via d3
+    // ── Drag ──
     const drag = d3.drag<any, any>()
-      .subject(() => hoverRef.current || undefined)
-      .on('start', (ev, d) => { if (!ev.active) sim.alphaTarget(0.05).restart(); d.fx = d.x; d.fy = d.y; })
-      .on('drag', (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
-      .on('end', (ev, d) => { if (!ev.active) sim.alphaTarget(0); d.fx = null; d.fy = null; });
-    d3.select(canvas).call(drag as any);
+      .on('start', (ev, d: any) => {
+        if (!ev.active) simulation.alphaTarget(0.08).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+      })
+      .on('drag', (ev, d: any) => {
+        d.fx = ev.x;
+        d.fy = ev.y;
+      })
+      .on('end', (ev, d: any) => {
+        if (!ev.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+      });
+    node.call(drag);
 
-    // Zoom with mouse wheel
-    let scale = 1, tx = 0, ty = 0;
-    canvas.onwheel = (e) => {
-      e.preventDefault();
-      const r = canvas.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      const factor = e.deltaY < 0 ? 1.15 : 0.85;
-      scale *= factor;
-      scale = Math.max(0.2, Math.min(5, scale));
-      tx = mx - (mx - tx) * factor;
-      ty = my - (my - ty) * factor;
-      ctx.setTransform(dpr * scale, 0, 0, dpr * scale, tx * dpr, ty * dpr);
-      draw();
+    // ── Tick (stop after 200) ──
+    let tickCount = 0;
+    simulation.on('tick', () => {
+      tickCount++;
+      link
+        .attr('x1', (d: any) => d.source.x)
+        .attr('y1', (d: any) => d.source.y)
+        .attr('x2', (d: any) => d.target.x)
+        .attr('y2', (d: any) => d.target.y);
+      node
+        .attr('cx', (d: any) => d.x)
+        .attr('cy', (d: any) => d.y);
+      label
+        .attr('x', (d: any) => d.x)
+        .attr('y', (d: any) => d.y);
+      if (tickCount > 200) {
+        simulation.stop();
+      }
+    });
+
+    // ── Fit once layout settles ──
+    simulation.on('end', () => {
+      requestAnimationFrame(fitToBounds);
+    });
+
+    stateRef.current = { svg, zoom, simulation, nodes, width: cw, height: ch };
+
+    return () => {
+      simulation.stop();
+      stateRef.current = null;
+      container.innerHTML = '';
     };
+  }, [graph, fitToBounds]);
 
-    draw();
-    return () => { sim.stop(); };
-  }, [graph]);
-
+  // ── Empty state ──
   if (!graph?.nodes?.length) {
-    return <p className="text-gray-500 text-sm text-center py-8">图谱为空，摄入会话数据后自动生成</p>;
+    return (
+      <div
+        className="flex flex-col items-center justify-center rounded-lg border border-border"
+        style={{ height: GRAPH_HEIGHT, backgroundColor: BG }}
+      >
+        <p className="text-gray-500 text-sm">图谱为空，摄入会话数据后自动生成</p>
+      </div>
+    );
   }
 
   return (
     <div>
-      <div className="rounded-lg border border-border overflow-hidden bg-[#0a0a0f]" style={{ height: 420 }}>
-        <canvas ref={canvasRef} style={{ width: '100%', height: 420 }} />
+      {/* Graph + toolbar */}
+      <div
+        className="rounded-lg border border-border overflow-hidden relative"
+        style={{ height: GRAPH_HEIGHT, backgroundColor: BG }}
+      >
+        <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+
+        {/* Toolbar */}
+        <div className="absolute top-2 right-2 flex gap-1 z-10">
+          <button
+            onClick={zoomIn}
+            className="w-7 h-7 flex items-center justify-center rounded bg-[#1f2937] text-gray-300 hover:bg-[#374151] text-sm font-mono select-none"
+            title="放大"
+          >
+            +
+          </button>
+          <button
+            onClick={zoomOut}
+            className="w-7 h-7 flex items-center justify-center rounded bg-[#1f2937] text-gray-300 hover:bg-[#374151] text-sm font-mono select-none"
+            title="缩小"
+          >
+            &minus;
+          </button>
+          <button
+            onClick={fitToBounds}
+            className="w-7 h-7 flex items-center justify-center rounded bg-[#1f2937] text-gray-300 hover:bg-[#374151] text-sm select-none"
+            title="适配视图"
+          >
+            &#x21A7;
+          </button>
+        </div>
       </div>
+
+      {/* Stats + usage hint */}
       <div className="flex items-center gap-2 mt-2">
-        <span className="text-[10px] text-gray-600">{graph.nodes.length} 节点 · {graph.edges?.length || 0} 边</span>
-        <span className="text-[10px] text-gray-500 ml-auto">滚轮缩放 · 拖拽移动</span>
+        <span className="text-[10px] text-gray-600">
+          {graph.nodes.length} 节点 &middot; {graph.edges?.length || 0} 边
+        </span>
+        <span className="text-[10px] text-gray-500 ml-auto">
+          滚轮缩放 &middot; 拖拽移动
+        </span>
       </div>
+
+      {/* Legend */}
       <div className="flex items-center gap-3 mt-1 flex-wrap">
         {Object.entries(NODE_COLORS).map(([type, color]) => (
           <span key={type} className="flex items-center gap-1 text-[10px] text-gray-500">
-            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />{type}
+            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
+            {type}
           </span>
         ))}
       </div>
+
+      {/* Selected node detail card */}
       {selected && (
         <div className="mt-3 p-3 bg-card border border-border rounded-lg">
           <div className="flex items-center gap-2 mb-1">
-            <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ backgroundColor: (NODE_COLORS[selected.node_type] || '#6b7280') + '30', color: NODE_COLORS[selected.node_type] || '#6b7280' }}>
+            <span
+              className="text-[10px] px-1.5 py-0.5 rounded"
+              style={{
+                backgroundColor: (NODE_COLORS[selected.node_type] || '#6b7280') + '30',
+                color: NODE_COLORS[selected.node_type] || '#6b7280',
+              }}
+            >
               {selected.node_type || 'fact'}
             </span>
             <h3 className="text-sm font-medium text-gray-200">{selected.title}</h3>
