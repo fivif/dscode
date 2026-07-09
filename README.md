@@ -18,6 +18,10 @@
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License" />
 </p>
 
+<p align="center">
+  <img src="screenshot.png" alt="DS Code Screenshot" width="800" />
+</p>
+
 ---
 
 ## 架构 Architecture
