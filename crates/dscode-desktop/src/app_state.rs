@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -7,7 +8,6 @@ use dscode_core::config::settings::Config;
 use dscode_core::session::manager::SessionManager;
 use dscode_core::tools::registry::ToolRegistry;
 use dscode_core::tools::background::TaskManager;
-use dscode_core::wiki::Engine;
 
 /// Handle to an in-progress forge task with cancellation support.
 pub struct ActiveForge {
@@ -32,13 +32,9 @@ pub struct AppState {
     /// Shared tool registry (bash, file ops, etc.).
     pub tool_registry: Arc<ToolRegistry>,
 
-    /// Handle to the currently running forge task, if any.
-    /// Allows the frontend to abort an in-progress agent turn.
-    pub active_forge_handle: Mutex<Option<ActiveForge>>,
-
-    /// The wiki engine (global + per-session knowledge graphs).
-    /// Lazily initialized on first wiki command.
-    pub wiki_engine: Mutex<Option<Engine>>,
+    /// In-flight forge tasks keyed by session_id — multiple sessions can run
+    /// agent turns concurrently; each session still serializes its own sends.
+    pub active_forges: Mutex<HashMap<String, ActiveForge>>,
 
     /// Per-session mutexes to prevent concurrent sends to the same session.
     /// Each session gets its own Mutex<()> — the guard is held for the
@@ -47,6 +43,9 @@ pub struct AppState {
 
     /// Background task manager for non-blocking command execution.
     pub task_manager: TaskManager,
+
+    /// Whether /teams multi-agent mode is active.
+    pub teams_mode: AtomicBool,
 }
 
 impl AppState {
@@ -57,21 +56,63 @@ impl AppState {
 
         let task_manager = TaskManager::new();
         let handle = task_manager.handle();
+        let notify_tx = task_manager.notify_tx();
 
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register_default_tools();
-        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone()));
-        tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle));
+        let live = task_manager.live_handle();
+        tool_registry.register(dscode_core::tools::background::DoBackground::new(
+            handle.clone(),
+            live.clone(),
+            notify_tx.clone(),
+        ));
+        tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle.clone()));
+        tool_registry.register(dscode_core::tools::background::DoTaskKill::new(
+            handle,
+            live,
+            notify_tx,
+        ));
 
         Self {
             config: Mutex::new(config),
             session_manager: Mutex::new(None),
             tool_registry: Arc::new(tool_registry),
-            active_forge_handle: Mutex::new(None),
-            wiki_engine: Mutex::new(None),
+            active_forges: Mutex::new(HashMap::new()),
             per_session_locks: Mutex::new(HashMap::new()),
             task_manager,
+            teams_mode: AtomicBool::new(false),
         }
+    }
+
+    /// Register a forge for a session, cancelling only a previous run on the
+    /// **same** session (other sessions keep running).
+    pub async fn set_active_forge(&self, session_id: String, forge: ActiveForge) {
+        let mut map = self.active_forges.lock().await;
+        if let Some(old) = map.remove(&session_id) {
+            old.cancel.cancel();
+            old.handle.abort();
+        }
+        map.insert(session_id, forge);
+    }
+
+    /// Abort one session's forge (or all if `session_id` is None — unused).
+    pub async fn abort_forge(&self, session_id: &str) -> bool {
+        let mut map = self.active_forges.lock().await;
+        if let Some(active) = map.remove(session_id) {
+            active.cancel.cancel();
+            if !active.handle.is_finished() {
+                active.handle.abort();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop finished forges so the map does not grow forever.
+    pub async fn prune_finished_forges(&self) {
+        let mut map = self.active_forges.lock().await;
+        map.retain(|_, f| !f.handle.is_finished());
     }
 
     /// Acquire a per-session lock to prevent concurrent request processing
@@ -114,16 +155,6 @@ impl AppState {
             .map_err(|e| format!("spawn_blocking panicked: {}", e))?
             .map_err(|e| format!("SessionManager init failed: {}", e))?;
             *guard = Some(mgr);
-        }
-        Ok(())
-    }
-
-    /// Get or create the wiki engine.
-    pub async fn ensure_wiki_engine(&self) -> Result<(), String> {
-        let mut guard = self.wiki_engine.lock().await;
-        if guard.is_none() {
-            let engine = Engine::new()?;
-            *guard = Some(engine);
         }
         Ok(())
     }

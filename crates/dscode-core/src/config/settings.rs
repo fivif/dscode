@@ -14,6 +14,11 @@ pub struct Config {
     #[serde(default = "default_router")]
     pub router_model: String,
 
+    /// Active channel for the default model (deepseek / openai / anthropic / ollama).
+    /// Needed because custom OpenAI-compatible ids often do not match name prefixes.
+    #[serde(default = "default_active_provider")]
+    pub active_provider: String,
+
     /// Provider configurations
     #[serde(default)]
     pub providers: ProviderConfigs,
@@ -37,14 +42,26 @@ pub struct Config {
     /// Extension settings
     #[serde(default)]
     pub extensions: ExtensionConfig,
+
+    /// HTTP / SOCKS proxy for outbound network
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+
+    /// Agent behaviour (global system prompt, etc.)
+    #[serde(default)]
+    pub agent: AgentConfig,
 }
 
 fn default_model() -> String {
-    "deepseek-v4-pro".into()
+    String::new()
 }
 
 fn default_router() -> String {
-    "deepseek-v4-flash".into()
+    String::new()
+}
+
+fn default_active_provider() -> String {
+    "deepseek".into()
 }
 
 impl Default for Config {
@@ -52,12 +69,15 @@ impl Default for Config {
         Self {
             default_model: default_model(),
             router_model: default_router(),
+            active_provider: default_active_provider(),
             providers: ProviderConfigs::default(),
             session: SessionConfig::default(),
             safety: SafetyConfig::default(),
             generation: GenerationConfig::default(),
             context: ContextConfig::default(),
             extensions: ExtensionConfig::default(),
+            proxy: ProxyConfig::default(),
+            agent: AgentConfig::default(),
         }
     }
 }
@@ -68,12 +88,74 @@ impl Config {
         let path = Self::config_path()?;
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            let config: Config = toml::from_str(&content)?;
+            let mut config: Config = toml::from_str(&content)?;
+            // Migrate legacy generation.proxy_url → proxy.url
+            if config.proxy.url.trim().is_empty()
+                && !config.generation.proxy_url.trim().is_empty()
+            {
+                config.proxy.url = config.generation.proxy_url.trim().to_string();
+            }
             Ok(config)
         } else {
             let config = Config::default();
             config.save()?;
             Ok(config)
+        }
+    }
+
+    /// Whether a non-empty, well-formed proxy URL is configured.
+    pub fn proxy_is_configured(&self) -> bool {
+        self.proxy.is_configured()
+    }
+
+    /// Effective proxy URL for a model channel (None = direct).
+    /// Global force wins when proxy is valid.
+    pub fn proxy_for_provider(&self, provider_key: &str) -> Option<&str> {
+        if !self.proxy.is_configured() {
+            return None;
+        }
+        if self.proxy.global {
+            return Some(self.proxy.url.trim());
+        }
+        let channel_wants = match provider_key {
+            "deepseek" => self.providers.deepseek.use_proxy,
+            "openai" => self.providers.openai.use_proxy,
+            "anthropic" => self.providers.anthropic.use_proxy,
+            "ollama" => self.providers.ollama.use_proxy,
+            _ => false,
+        };
+        if channel_wants {
+            Some(self.proxy.url.trim())
+        } else {
+            None
+        }
+    }
+
+    /// Effective proxy for the provider that serves `model`.
+    pub fn proxy_for_model(&self, model: &str) -> Option<&str> {
+        let key = self.provider_key_for_model(model);
+        self.proxy_for_provider(&key)
+    }
+
+    pub fn proxy_for_mcp(&self) -> Option<&str> {
+        if !self.proxy.is_configured() {
+            return None;
+        }
+        if self.proxy.global || self.extensions.mcp_use_proxy {
+            Some(self.proxy.url.trim())
+        } else {
+            None
+        }
+    }
+
+    pub fn proxy_for_skills(&self) -> Option<&str> {
+        if !self.proxy.is_configured() {
+            return None;
+        }
+        if self.proxy.global || self.extensions.skills_use_proxy {
+            Some(self.proxy.url.trim())
+        } else {
+            None
         }
     }
 
@@ -88,19 +170,68 @@ impl Config {
         Ok(())
     }
 
-    /// Get the active provider's API key and base URL for the given model.
+    /// Resolve which channel config to use for a model id.
+    ///
+    /// Prefer explicit `active_provider` when the model is the default (or when
+    /// name-prefix inference is ambiguous), so custom OpenAI-compatible gateways
+    /// with arbitrary model ids still hit the OpenAI channel credentials.
     pub fn provider_for_model(&self, model: &str) -> Option<ProviderConfig> {
-        if model.starts_with("deepseek") {
-            Some(self.providers.deepseek.clone())
-        } else if model.starts_with("openai/") || model.starts_with("gpt-") {
-            Some(self.providers.openai.clone())
-        } else if model.starts_with("anthropic/") || model.starts_with("claude-") {
-            Some(self.providers.anthropic.clone())
-        } else if model.starts_with("ollama/") {
-            Some(self.providers.ollama.clone())
-        } else {
-            // Default to DeepSeek (OpenAI-compatible)
-            Some(self.providers.deepseek.clone())
+        let key = self.provider_key_for_model(model);
+        self.provider_config_by_key(&key)
+    }
+
+    /// Channel key: deepseek | openai | anthropic | ollama
+    pub fn provider_key_for_model(&self, model: &str) -> String {
+        let m = model.trim();
+        // If this is the selected default model, trust active_provider first
+        // (custom gateway ids rarely match gpt-/claude- prefixes).
+        let active = self.active_provider.trim().to_lowercase();
+        if !m.is_empty()
+            && m == self.default_model.trim()
+            && matches!(
+                active.as_str(),
+                "deepseek" | "openai" | "anthropic" | "ollama"
+            )
+        {
+            return active;
+        }
+
+        if m.starts_with("deepseek") {
+            return "deepseek".into();
+        }
+        if m.starts_with("openai/")
+            || m.starts_with("gpt-")
+            || m.starts_with("o1")
+            || m.starts_with("o3")
+            || m.starts_with("o4")
+            || m.starts_with("chatgpt")
+        {
+            return "openai".into();
+        }
+        if m.starts_with("anthropic/") || m.starts_with("claude-") {
+            return "anthropic".into();
+        }
+        if m.starts_with("ollama/") || m.starts_with("llama") {
+            return "ollama".into();
+        }
+
+        // Fall back to active channel, then deepseek
+        if matches!(
+            active.as_str(),
+            "deepseek" | "openai" | "anthropic" | "ollama"
+        ) {
+            return active;
+        }
+        "deepseek".into()
+    }
+
+    pub fn provider_config_by_key(&self, key: &str) -> Option<ProviderConfig> {
+        match key {
+            "deepseek" => Some(self.providers.deepseek.clone()),
+            "openai" => Some(self.providers.openai.clone()),
+            "anthropic" => Some(self.providers.anthropic.clone()),
+            "ollama" => Some(self.providers.ollama.clone()),
+            _ => Some(self.providers.deepseek.clone()),
         }
     }
 
@@ -113,10 +244,6 @@ impl Config {
     pub fn data_dir() -> Result<PathBuf, ConfigError> {
         let home = dirs_next().ok_or(ConfigError::NoHomeDir)?;
         Ok(home.join(".dscode"))
-    }
-
-    pub fn wiki_dir() -> Result<PathBuf, ConfigError> {
-        Ok(Self::data_dir()?.join("wiki"))
     }
 
     pub fn sessions_dir() -> Result<PathBuf, ConfigError> {
@@ -156,21 +283,29 @@ impl Default for ProviderConfigs {
                 api_key: String::new(),
                 base_url: "https://api.deepseek.com/v1".into(),
                 enabled: true,
+                use_proxy: false,
+                ..Default::default()
             },
             openai: ProviderConfig {
                 api_key: String::new(),
                 base_url: "https://api.openai.com/v1".into(),
                 enabled: false,
+                use_proxy: false,
+                ..Default::default()
             },
             anthropic: ProviderConfig {
                 api_key: String::new(),
                 base_url: "https://api.anthropic.com".into(),
                 enabled: false,
+                use_proxy: false,
+                ..Default::default()
             },
             ollama: ProviderConfig {
                 api_key: String::new(),
                 base_url: "http://localhost:11434/v1".into(),
                 enabled: false,
+                use_proxy: false,
+                ..Default::default()
             },
         }
     }
@@ -184,9 +319,57 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Use configured HTTP proxy for this channel (ignored if proxy not configured;
+    /// forced on when `proxy.global` is true).
+    #[serde(default)]
+    pub use_proxy: bool,
+    /// Last successful `/models` scan for this channel (persisted). Empty = not scanned.
+    /// UI pickers use this list only — never invent hardcoded catalog entries.
+    #[serde(default)]
+    pub model_list: Vec<String>,
+    /// Last selected model id for this channel (optional UI hint / fallback).
+    #[serde(default)]
+    pub model: String,
 }
 
 fn default_true() -> bool { true }
+
+/// Outbound proxy settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Proxy URL, e.g. `http://127.0.0.1:7890` or `socks5://127.0.0.1:1080`.
+    /// Empty = not configured (channel/mcp/skill proxy toggles cannot enable).
+    #[serde(default)]
+    pub url: String,
+    /// When true and URL is valid, force proxy for the whole app (LLM / MCP / skills).
+    /// Individual toggles are treated as on and must not be turned off in UI.
+    #[serde(default)]
+    pub global: bool,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            global: false,
+        }
+    }
+}
+
+impl ProxyConfig {
+    /// Non-empty URL with a supported scheme.
+    pub fn is_configured(&self) -> bool {
+        let u = self.url.trim().to_lowercase();
+        if u.is_empty() {
+            return false;
+        }
+        u.starts_with("http://")
+            || u.starts_with("https://")
+            || u.starts_with("socks5://")
+            || u.starts_with("socks5h://")
+            || u.starts_with("socks4://")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -242,8 +425,8 @@ pub struct GenerationConfig {
     /// Temperature
     #[serde(default)]
     pub temperature: f64,
-    /// HTTP proxy URL (e.g. "http://127.0.0.1:10808")
-    #[serde(default = "default_proxy_url")]
+    /// Legacy proxy field — prefer top-level `[proxy].url`. Kept for migration.
+    #[serde(default)]
     pub proxy_url: String,
 }
 
@@ -253,14 +436,13 @@ impl Default for GenerationConfig {
             reasoning_effort: default_reasoning(),
             max_tokens: default_max_tokens(),
             temperature: 0.0,
-            proxy_url: default_proxy_url(),
+            proxy_url: String::new(),
         }
     }
 }
 
 fn default_reasoning() -> String { "max".into() }
 fn default_max_tokens() -> u32 { 8192 }
-fn default_proxy_url() -> String { "http://127.0.0.1:10808".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
@@ -290,6 +472,73 @@ pub struct ExtensionConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub skills_dirs: Vec<String>,
+    /// Use proxy when connecting MCP servers (if proxy configured; forced by global).
+    #[serde(default)]
+    pub mcp_use_proxy: bool,
+    /// Use proxy for skill package git clone downloads.
+    #[serde(default)]
+    pub skills_use_proxy: bool,
+}
+
+/// Global agent instructions (system prompt customisation).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentConfig {
+    /// User-written global prompt. Empty = use built-in default only.
+    #[serde(default)]
+    pub global_prompt: String,
+    /// When true and `global_prompt` is non-empty, replace the built-in system
+    /// prompt entirely. When false, append after the built-in prompt.
+    #[serde(default)]
+    pub replace_system_prompt: bool,
+}
+
+impl AgentConfig {
+    /// Build the effective system prompt given the built-in default text.
+    pub fn resolve_system_prompt(&self, default_prompt: &str) -> String {
+        let custom = self.global_prompt.trim();
+        if custom.is_empty() {
+            return default_prompt.to_string();
+        }
+        if self.replace_system_prompt {
+            custom.to_string()
+        } else {
+            format!(
+                "{default_prompt}\n\n## User global instructions\n{custom}"
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_config_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_empty_uses_default() {
+        let a = AgentConfig::default();
+        assert_eq!(a.resolve_system_prompt("DEFAULT"), "DEFAULT");
+    }
+
+    #[test]
+    fn resolve_appends_by_default() {
+        let a = AgentConfig {
+            global_prompt: "  speak Chinese  ".into(),
+            replace_system_prompt: false,
+        };
+        let out = a.resolve_system_prompt("DEFAULT");
+        assert!(out.starts_with("DEFAULT"));
+        assert!(out.contains("speak Chinese"));
+        assert!(out.contains("User global instructions"));
+    }
+
+    #[test]
+    fn resolve_replace() {
+        let a = AgentConfig {
+            global_prompt: "ONLY CUSTOM".into(),
+            replace_system_prompt: true,
+        };
+        assert_eq!(a.resolve_system_prompt("DEFAULT"), "ONLY CUSTOM");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +549,88 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+}
+
+/// Build a reqwest Client with optional proxy.
+pub fn build_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    use std::time::Duration;
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(180));
+    if let Some(url) = proxy_url.map(str::trim).filter(|u| !u.is_empty()) {
+        let proxy = reqwest::Proxy::all(url).map_err(|e| format!("无效代理 URL: {e}"))?;
+        builder = builder.proxy(proxy);
+    } else {
+        // Avoid picking up ambient HTTP_PROXY from environment when user wants direct
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))
+}
+
+/// Proxy-related env keys we set/clear on child processes.
+const PROXY_ENV_KEYS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+/// Apply standard proxy env vars to a std process Command (git skill install).
+pub fn apply_proxy_env(cmd: &mut std::process::Command, proxy_url: Option<&str>) {
+    apply_proxy_env_inner(cmd, proxy_url);
+}
+
+/// Apply standard proxy env vars to a tokio process Command (MCP npx).
+pub fn apply_proxy_env_tokio(cmd: &mut tokio::process::Command, proxy_url: Option<&str>) {
+    apply_proxy_env_inner(cmd, proxy_url);
+}
+
+fn apply_proxy_env_inner<C: ProxyEnvCmd>(cmd: &mut C, proxy_url: Option<&str>) {
+    if let Some(url) = proxy_url.map(str::trim).filter(|u| !u.is_empty()) {
+        for k in &[
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.set_env(k, url);
+        }
+    } else {
+        for k in PROXY_ENV_KEYS {
+            cmd.remove_env(k);
+        }
+    }
+}
+
+trait ProxyEnvCmd {
+    fn set_env(&mut self, key: &str, val: &str);
+    fn remove_env(&mut self, key: &str);
+}
+
+impl ProxyEnvCmd for std::process::Command {
+    fn set_env(&mut self, key: &str, val: &str) {
+        self.env(key, val);
+    }
+    fn remove_env(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+impl ProxyEnvCmd for tokio::process::Command {
+    fn set_env(&mut self, key: &str, val: &str) {
+        self.env(key, val);
+    }
+    fn remove_env(&mut self, key: &str) {
+        self.env_remove(key);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

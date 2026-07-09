@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use dscode_core::agent::forge::Forge;
 use dscode_core::agent::stream::{StreamEvent, ToolStatus, UsageInfo};
 use dscode_core::config::settings::Config;
-use dscode_core::providers::openai::OpenAiProvider;
+use dscode_core::providers::create_provider;
 use dscode_core::providers::trait_def::{Message, MessageContent, Role};
 use dscode_core::session::manager::{Session, SessionGroups, SessionManager};
 use dscode_core::tools::registry::ToolRegistry;
@@ -132,9 +132,10 @@ impl AppState {
 
         let task_manager = dscode_core::tools::background::TaskManager::new();
         let handle = task_manager.handle();
+        let notify_tx = task_manager.notify_tx();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register_default_tools();
-        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone()));
+        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone(), notify_tx));
         tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle));
         let tool_registry = Arc::new(tool_registry);
 
@@ -402,6 +403,7 @@ impl AppState {
                 id,
                 name,
                 description,
+                arguments: _,
             } => {
                 self.messages.push(UiMessage::ToolCard {
                     id,
@@ -467,6 +469,37 @@ impl AppState {
                     subject,
                     predicate,
                     object,
+                });
+            }
+            StreamEvent::TeamAgentStart { agent_id, task } => {
+                self.messages.push(UiMessage::Assistant {
+                    content: format!("▶ Agent `{agent_id}` started: {task}"),
+                    timestamp: Utc::now().timestamp(),
+                });
+            }
+            StreamEvent::TeamAgentOutput { agent_id, content } => {
+                self.streaming_accumulator
+                    .push_str(&format!("[{agent_id}] {content}"));
+                self.messages.push(UiMessage::Assistant {
+                    content: format!("[{agent_id}] {content}"),
+                    timestamp: Utc::now().timestamp(),
+                });
+            }
+            StreamEvent::TeamAgentEnd {
+                agent_id,
+                success,
+                summary,
+            } => {
+                let mark = if success { "✓" } else { "✗" };
+                self.messages.push(UiMessage::Assistant {
+                    content: format!("{mark} Agent `{agent_id}` finished: {summary}"),
+                    timestamp: Utc::now().timestamp(),
+                });
+            }
+            StreamEvent::TeamComplete { completed, failed } => {
+                self.messages.push(UiMessage::Assistant {
+                    content: format!("Team complete — {completed} ok, {failed} failed"),
+                    timestamp: Utc::now().timestamp(),
                 });
             }
             StreamEvent::Error { content } => {
@@ -852,11 +885,18 @@ pub async fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
                 .cloned()
                 .collect::<Vec<_>>();
 
-            let provider =
-                OpenAiProvider::from_config(&app.state.model_name, &app.state.config);
+            let provider = match create_provider(&app.state.model_name, &app.state.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    app.state.messages.push(UiMessage::Error {
+                        content: format!("Provider error: {e}"),
+                    });
+                    continue;
+                }
+            };
             let forge = Arc::new(Forge::new(
-                Box::new(provider),
-                app.tool_registry.clone(),
+                provider,
+                app.state.tool_registry.clone(),
                 app.state.working_dir.clone(),
             ));
 

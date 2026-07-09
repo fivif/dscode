@@ -166,17 +166,26 @@ impl Monitor {
                 entry.current_tool = None;
             }
             StreamEvent::Complete { usage: _ } => {
-                if !matches!(entry.status, AgentStatus::Failed(_)) {
+                if !matches!(entry.status, AgentStatus::Completed | AgentStatus::Failed(_)) {
                     entry.status = AgentStatus::Completed;
                     self.finished_count += 1;
                 }
             }
             StreamEvent::Error { content } => {
-                entry.status = AgentStatus::Failed(content.clone());
-                self.finished_count += 1;
+                if !matches!(entry.status, AgentStatus::Completed | AgentStatus::Failed(_)) {
+                    entry.status = AgentStatus::Failed(content.clone());
+                    self.finished_count += 1;
+                }
             }
             StreamEvent::Fact { .. } => {
                 // Facts are informational; don't change status.
+            }
+            StreamEvent::TeamAgentStart { .. }
+            | StreamEvent::TeamAgentOutput { .. }
+            | StreamEvent::TeamAgentEnd { .. }
+            | StreamEvent::TeamComplete { .. }
+            | StreamEvent::PlanQuestion { .. } => {
+                // Team / plan UI events are handled at a higher level.
             }
         }
     }

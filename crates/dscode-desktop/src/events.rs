@@ -18,6 +18,10 @@ pub fn emit_event(app_handle: &tauri::AppHandle, event: &StreamEvent, session_id
         "session_id": session_id,
         "event": event,
     });
+    // Log team events explicitly for debugging.
+    if matches!(event, StreamEvent::TeamAgentStart { .. } | StreamEvent::TeamAgentOutput { .. } | StreamEvent::TeamAgentEnd { .. }) {
+        tracing::info!(?event, "emit_event: team event");
+    }
     if let Err(e) = app_handle.emit("stream-event", payload) {
         warn!(%e, "Failed to emit stream-event to frontend");
     }

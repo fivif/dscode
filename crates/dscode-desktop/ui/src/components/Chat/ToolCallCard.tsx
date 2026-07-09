@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import type { ToolCallRecord } from '@/lib/types';
+import { IconCheck, IconDot, IconX } from '@/components/icons';
 
 interface Props { tool: ToolCallRecord; }
 
@@ -9,17 +10,18 @@ const COLORS: Record<ToolCallRecord['status'], string> = {
   error: 'border-red-500/50',
 };
 
-const ICONS: Record<ToolCallRecord['status'], string> = {
-  running: '●',
-  success: '✓',
-  error: '✗',
-};
-
 const ICON_COLORS: Record<ToolCallRecord['status'], string> = {
   running: 'text-amber-400',
   success: 'text-emerald-400',
   error: 'text-red-400',
 };
+
+function StatusIcon({ status }: { status: ToolCallRecord['status'] }) {
+  const cls = `${ICON_COLORS[status]} ${status === 'running' ? 'animate-pulse' : ''} shrink-0`;
+  if (status === 'running') return <IconDot className={cls} size={10} />;
+  if (status === 'success') return <IconCheck className={cls} size={12} />;
+  return <IconX className={cls} size={12} />;
+}
 
 export default function ToolCallCard({ tool }: Props) {
   const [expanded, setExpanded] = useState(false);
@@ -46,9 +48,7 @@ export default function ToolCallCard({ tool }: Props) {
         className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-white/[0.03] transition-colors"
         onClick={handleToggle}
       >
-        <span className={`text-[10px] font-mono ${ICON_COLORS[tool.status]} ${tool.status === 'running' ? 'animate-pulse' : ''}`}>
-          {ICONS[tool.status]}
-        </span>
+        <StatusIcon status={tool.status} />
         <span className="text-[11px] text-gray-300 font-mono truncate flex-1">{tool.name}</span>
         {tool.status === 'running' && (
           <span className="text-[10px] text-amber-400/70 animate-pulse">running</span>

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 #[allow(unused_imports)]
+use crate::agent::stream::StreamEvent;
 use crate::magi::scheduler::{MagiError, MagiRound, MagiScheduler, Promotion};
 use crate::providers::trait_def::{LlmProvider, ProviderError};
 use crate::tools::registry::ToolRegistry;
@@ -14,11 +15,21 @@ use crate::tools::registry::ToolRegistry;
 use super::decomposer::decompose_task;
 use super::stall::StallDetector;
 
+/// Optional progress sink for UI streaming.
+pub type ProgressTx = tokio::sync::mpsc::UnboundedSender<StreamEvent>;
+
 /// Default maximum number of re-decomposition cycles before giving up.
-const DEFAULT_MAX_REDECOMPOSE_CYCLES: u32 = 5;
+const DEFAULT_MAX_REDECOMPOSE_CYCLES: u32 = 3;
 
 /// Default stall threshold — three consecutive rounds with no improvement.
 const DEFAULT_STALL_ROUNDS: usize = 3;
+
+/// Practical defaults for interactive /auto (was 10×30 — felt hung forever).
+const DEFAULT_MAGI_MAX_ROUNDS: u32 = 3;
+const DEFAULT_MAGI_MAX_STEPS: u32 = 12;
+
+/// Max concurrent MAGI spirals when Teams is combined with /auto.
+const DEFAULT_MAX_PARALLEL: usize = 4;
 
 /// Errors that can occur during the auto-runner loop.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +118,12 @@ pub struct AutoRunner {
     max_recompose_cycles: u32,
     /// Number of consecutive no-progress rounds that trigger a stall.
     stall_rounds: usize,
+    /// Optional UI progress channel.
+    progress: Option<ProgressTx>,
+    /// When true (Teams mode ON + /auto), run ready subtasks concurrently.
+    teams_parallel: bool,
+    /// Cap on concurrent MAGI spirals in teams_parallel mode.
+    max_parallel: usize,
 }
 
 impl AutoRunner {
@@ -122,11 +139,60 @@ impl AutoRunner {
             runtime_provider: Arc::new(runtime_provider),
             tools,
             working_dir,
-            magi_max_rounds: 10,
-            magi_max_steps: 30,
+            magi_max_rounds: DEFAULT_MAGI_MAX_ROUNDS,
+            magi_max_steps: DEFAULT_MAGI_MAX_STEPS,
             max_recompose_cycles: DEFAULT_MAX_REDECOMPOSE_CYCLES,
             stall_rounds: DEFAULT_STALL_ROUNDS,
+            progress: None,
+            teams_parallel: false,
+            max_parallel: DEFAULT_MAX_PARALLEL,
         }
+    }
+
+    /// Attach a progress event channel for UI streaming.
+    pub fn with_progress(mut self, tx: ProgressTx) -> Self {
+        self.progress = Some(tx);
+        self
+    }
+
+    /// Enable Teams-style parallel MAGI for independent ready subtasks.
+    pub fn with_teams_parallel(mut self, on: bool) -> Self {
+        self.teams_parallel = on;
+        self
+    }
+
+    /// Override max concurrent MAGI spirals when teams_parallel is on.
+    pub fn with_max_parallel(mut self, n: usize) -> Self {
+        self.max_parallel = n.max(1);
+        self
+    }
+
+    /// UI agent id — `at-N` when auto+teams so the frontend labels "Auto · Teams".
+    fn agent_id_for(&self, task_id: usize) -> String {
+        if self.teams_parallel {
+            format!("at-{task_id}")
+        } else {
+            format!("subtask-{task_id}")
+        }
+    }
+
+    fn emit(&self, event: StreamEvent) {
+        if let Some(ref tx) = self.progress {
+            let _ = tx.send(event);
+        }
+    }
+
+    fn emit_token(&self, content: impl Into<String>) {
+        self.emit(StreamEvent::Token {
+            content: content.into(),
+        });
+    }
+
+    fn emit_thinking(&self, content: impl Into<String>, step: u32) {
+        self.emit(StreamEvent::Thinking {
+            content: content.into(),
+            step,
+        });
     }
 
     /// Override the max MAGI rounds per subtask.
@@ -164,6 +230,20 @@ impl AutoRunner {
     /// 5. Repeat until all subtasks are resolved or re-decomposition cycles
     ///    are exhausted.
     pub async fn run(&self, prd: &str, session_id: &str) -> Result<AutoRunResult, AutoError> {
+        let mode_line = if self.teams_parallel {
+            format!(
+                "## /auto + Teams — parallel auto spirals\n\n\
+                 Teams is ON: ready subtasks run concurrently (max {} at a time).\n\n\
+                 Decomposing task into subtasks…\n\n",
+                self.max_parallel
+            )
+        } else {
+            "## /auto — auto spiral\n\n\
+             Decomposing task into subtasks…\n\n\
+             _Tip: turn on **TEAM** to run independent subtasks in parallel._\n\n"
+                .to_string()
+        };
+        self.emit_token(mode_line);
         let mut subtasks = decompose_task(&**self.runtime_provider, prd).await?;
 
         if subtasks.is_empty() {
@@ -174,9 +254,25 @@ impl AutoRunner {
         info!(
             session = %session_id,
             subtask_count = subtasks.len(),
+            teams_parallel = self.teams_parallel,
             "AutoRunner: task decomposed into {} subtasks",
             subtasks.len()
         );
+
+        self.emit_token(format!(
+            "### Plan ({} subtasks){}\n\n{}\n\n",
+            subtasks.len(),
+            if self.teams_parallel {
+                " · **parallel auto**"
+            } else {
+                " · sequential auto"
+            },
+            subtasks
+                .iter()
+                .map(|s| format!("- [ ] **#{}** {}", s.id, s.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
 
         let mut all_rounds: Vec<Vec<MagiRound>> = Vec::new();
         let mut stall_detector = StallDetector::new(self.stall_rounds);
@@ -184,11 +280,9 @@ impl AutoRunner {
         let mut consecutive_recompose_failures = 0u32;
 
         loop {
-            // Find the next ready subtask
-            let ready = find_next_ready(&subtasks);
+            let ready_indices = find_all_ready(&subtasks);
 
-            let Some(task_idx) = ready else {
-                // Check if there's any work left
+            if ready_indices.is_empty() {
                 let pending_count = subtasks
                     .iter()
                     .filter(|s| s.status == SubtaskStatus::Pending)
@@ -199,7 +293,6 @@ impl AutoRunner {
                     break;
                 }
 
-                // Remaining subtasks are blocked on failures
                 warn!(
                     session = %session_id,
                     pending = pending_count,
@@ -208,95 +301,57 @@ impl AutoRunner {
                 break;
             };
 
-            // Extract task data before taking a mutable reference to subtasks.
-            let (task_id, task_desc) = {
-                let task = &subtasks[task_idx];
-                (task.id, task.description.clone())
+            // Sequential: one; Teams parallel: up to max_parallel ready tasks
+            let batch: Vec<usize> = if self.teams_parallel {
+                ready_indices
+                    .into_iter()
+                    .take(self.max_parallel)
+                    .collect()
+            } else {
+                vec![ready_indices[0]]
             };
 
-            info!(
-                session = %session_id,
-                subtask_id = task_id,
-                description = %task_desc,
-                "AutoRunner: executing subtask"
-            );
+            if self.teams_parallel && batch.len() > 1 {
+                self.emit_token(format!(
+                    "\n---\n### Parallel wave — {} auto spirals\n\n",
+                    batch.len()
+                ));
+            }
 
-            subtasks[task_idx].status = SubtaskStatus::InProgress;
+            // Mark + announce all in batch
+            let mut jobs: Vec<(usize, usize, String, String)> = Vec::new();
+            for &task_idx in &batch {
+                let task_id = subtasks[task_idx].id;
+                let task_desc = subtasks[task_idx].description.clone();
+                let agent_id = self.agent_id_for(task_id);
+                subtasks[task_idx].status = SubtaskStatus::InProgress;
+                self.emit(StreamEvent::TeamAgentStart {
+                    agent_id: agent_id.clone(),
+                    task: task_desc.clone(),
+                });
+                self.emit_token(format!(
+                    "\n### Subtask #{task_id}: {task_desc}\n\n\
+                     Running auto spiral (review → execute → evaluate)…\n\n"
+                ));
+                jobs.push((task_idx, task_id, task_desc, agent_id));
+            }
 
-            // Create a MAGI scheduler for this subtask by cloning Arc'd providers
-            let scheduler = MagiScheduler::from_arc_providers(
-                Arc::clone(&self.provider),
-                Arc::clone(&self.runtime_provider),
-                Arc::clone(&self.tools),
-                self.working_dir.clone(),
-            )
-            .with_max_rounds(self.magi_max_rounds)
-            .with_max_steps_per_round(self.magi_max_steps);
+            // Run batch (parallel when >1)
+            let outcomes = self
+                .run_magi_batch(prd, session_id, &jobs)
+                .await;
 
-            // Run the MAGI spiral
-            let subtask_prd = format!(
-                "Original PRD:\n{}\n\nSubtask:\n{}",
-                prd, task_desc
-            );
-
-            let subtask_session = format!("{}-s{}", session_id, task_id);
-
-            match scheduler.run_spiral(&subtask_prd, &subtask_session).await {
-                Ok(rounds) => {
-                    // Record the quality from the last round
-                    let last_quality = rounds
-                        .last()
-                        .map(|r| r.promotion.quality_score)
-                        .unwrap_or(0.0);
-
-                    stall_detector.record(last_quality);
-
-                    // Check if Melchior stopped naturally (should_stop)
-                    let naturally_done = rounds
-                        .last()
-                        .map(|r| r.promotion.should_stop)
-                        .unwrap_or(false);
-
-                    if naturally_done || last_quality >= 70.0 {
-                        subtasks[task_idx].status = SubtaskStatus::Done;
-                        info!(
-                            session = %session_id,
-                            subtask_id = task_id,
-                            quality = last_quality,
-                            rounds = rounds.len(),
-                            "AutoRunner: subtask completed"
-                        );
-                    } else {
-                        // Low quality — mark as failed for now; re-decomposition may fix it
-                        subtasks[task_idx].status = SubtaskStatus::Failed(format!(
-                            "Low quality score {:.1}/100 after {} rounds",
-                            last_quality,
-                            rounds.len()
-                        ));
-                        warn!(
-                            session = %session_id,
-                            subtask_id = task_id,
-                            quality = last_quality,
-                            "AutoRunner: subtask quality too low"
-                        );
-                    }
-
-                    all_rounds.push(rounds);
-                }
-                Err(e) => {
-                    subtasks[task_idx].status =
-                        SubtaskStatus::Failed(format!("MAGI error: {}", e));
-                    warn!(
-                        session = %session_id,
-                        subtask_id = task_id,
-                        error = %e,
-                        "AutoRunner: subtask failed"
-                    );
-                    // Push empty rounds for this failed subtask to maintain alignment
-                    all_rounds.push(vec![]);
-                    // Record a zero-quality data point for stall detection
-                    stall_detector.record(0.0);
-                }
+            for (task_idx, task_id, agent_id, spiral) in outcomes {
+                self.apply_spiral_result(
+                    &mut subtasks,
+                    &mut all_rounds,
+                    &mut stall_detector,
+                    session_id,
+                    task_idx,
+                    task_id,
+                    &agent_id,
+                    spiral,
+                );
             }
 
             // Check for stall
@@ -402,12 +457,244 @@ impl AutoRunner {
             "AutoRunner: run complete"
         );
 
+        let done_n = subtasks.iter().filter(|s| s.status == SubtaskStatus::Done).count();
+        let fail_n = subtasks.iter().filter(|s| matches!(s.status, SubtaskStatus::Failed(_))).count();
+        self.emit(StreamEvent::TeamComplete {
+            completed: done_n,
+            failed: fail_n,
+        });
+        self.emit_token(format!(
+            "\n---\n### /auto complete\n\n- Done: {done_n}\n- Failed: {fail_n}\n- Avg quality: {total_quality:.1}/100\n- Stalled: {stalled}\n\n"
+        ));
+
         Ok(AutoRunResult {
             subtasks,
             rounds_per_subtask: all_rounds,
             total_quality,
             stalled,
         })
+    }
+
+    /// Run one or more MAGI spirals (concurrent when teams_parallel and batch > 1).
+    async fn run_magi_batch(
+        &self,
+        prd: &str,
+        session_id: &str,
+        jobs: &[(usize, usize, String, String)], // (idx, id, desc, agent_id)
+    ) -> Vec<(usize, usize, String, Result<Vec<MagiRound>, MagiError>)> {
+        if jobs.len() <= 1 {
+            let mut out = Vec::new();
+            for (task_idx, task_id, task_desc, agent_id) in jobs {
+                let spiral = self
+                    .run_one_magi(prd, session_id, *task_id, task_desc, agent_id)
+                    .await;
+                out.push((*task_idx, *task_id, agent_id.clone(), spiral));
+            }
+            return out;
+        }
+
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let mut futs = FuturesUnordered::new();
+        for (task_idx, task_id, task_desc, agent_id) in jobs {
+            let provider = Arc::clone(&self.provider);
+            let runtime = Arc::clone(&self.runtime_provider);
+            let tools = Arc::clone(&self.tools);
+            let wd = self.working_dir.clone();
+            let max_rounds = self.magi_max_rounds;
+            let max_steps = self.magi_max_steps;
+            let progress = self.progress.clone();
+            let prd = prd.to_string();
+            let session_id = session_id.to_string();
+            let task_idx = *task_idx;
+            let task_id = *task_id;
+            let task_desc = task_desc.clone();
+            let agent_id = agent_id.clone();
+
+            futs.push(async move {
+                let mut scheduler = MagiScheduler::from_arc_providers(
+                    provider, runtime, tools, wd,
+                )
+                .with_max_rounds(max_rounds)
+                .with_max_steps_per_round(max_steps);
+                if let Some(tx) = progress {
+                    scheduler = scheduler.with_progress(crate::magi::execute::MagiProgress {
+                        tx,
+                        agent_id: agent_id.clone(),
+                    });
+                }
+                let subtask_prd = format!("Original PRD:\n{prd}\n\nSubtask:\n{task_desc}");
+                let subtask_session = format!("{session_id}-s{task_id}");
+                let spiral = scheduler.run_spiral(&subtask_prd, &subtask_session).await;
+                (task_idx, task_id, agent_id, spiral)
+            });
+        }
+
+        let mut out = Vec::new();
+        while let Some(item) = futs.next().await {
+            out.push(item);
+        }
+        out
+    }
+
+    async fn run_one_magi(
+        &self,
+        prd: &str,
+        session_id: &str,
+        task_id: usize,
+        task_desc: &str,
+        agent_id: &str,
+    ) -> Result<Vec<MagiRound>, MagiError> {
+        let mut scheduler = MagiScheduler::from_arc_providers(
+            Arc::clone(&self.provider),
+            Arc::clone(&self.runtime_provider),
+            Arc::clone(&self.tools),
+            self.working_dir.clone(),
+        )
+        .with_max_rounds(self.magi_max_rounds)
+        .with_max_steps_per_round(self.magi_max_steps);
+
+        if let Some(ref tx) = self.progress {
+            scheduler = scheduler.with_progress(crate::magi::execute::MagiProgress {
+                tx: tx.clone(),
+                agent_id: agent_id.to_string(),
+            });
+        }
+
+        let subtask_prd = format!("Original PRD:\n{prd}\n\nSubtask:\n{task_desc}");
+        let subtask_session = format!("{session_id}-s{task_id}");
+        scheduler.run_spiral(&subtask_prd, &subtask_session).await
+    }
+
+    fn apply_spiral_result(
+        &self,
+        subtasks: &mut [Subtask],
+        all_rounds: &mut Vec<Vec<MagiRound>>,
+        stall_detector: &mut StallDetector,
+        session_id: &str,
+        task_idx: usize,
+        task_id: usize,
+        agent_id: &str,
+        spiral: Result<Vec<MagiRound>, MagiError>,
+    ) {
+        match spiral {
+            Ok(rounds) => {
+                for r in &rounds {
+                    self.emit_thinking(
+                        format!(
+                            "Subtask #{task_id} round {}: quality={:.0}/100 stop={} — {}\n",
+                            r.round_number,
+                            r.promotion.quality_score,
+                            r.promotion.should_stop,
+                            r.promotion.stop_reason,
+                        ),
+                        r.round_number,
+                    );
+                    let exec_preview: String = r.execution.chars().take(400).collect();
+                    if !exec_preview.is_empty() {
+                        self.emit_token(format!(
+                            "**#{task_id} Round {}**\n\n{exec_preview}\n\n",
+                            r.round_number
+                        ));
+                    }
+                }
+
+                let last_quality = rounds
+                    .last()
+                    .map(|r| r.promotion.quality_score)
+                    .unwrap_or(0.0);
+                stall_detector.record(last_quality);
+                let naturally_done = rounds
+                    .last()
+                    .map(|r| r.promotion.should_stop)
+                    .unwrap_or(false);
+
+                if naturally_done || last_quality >= 70.0 {
+                    subtasks[task_idx].status = SubtaskStatus::Done;
+                    info!(
+                        session = %session_id,
+                        subtask_id = task_id,
+                        quality = last_quality,
+                        rounds = rounds.len(),
+                        "AutoRunner: subtask completed"
+                    );
+                    self.emit(StreamEvent::TeamAgentEnd {
+                        agent_id: agent_id.to_string(),
+                        success: true,
+                        summary: format!(
+                            "quality={last_quality:.0}/100, rounds={}",
+                            rounds.len()
+                        ),
+                    });
+                    self.emit_token(format!(
+                        "✅ Subtask #{task_id} done (quality {last_quality:.0}/100, {} rounds)\n\n",
+                        rounds.len()
+                    ));
+                } else {
+                    subtasks[task_idx].status = SubtaskStatus::Failed(format!(
+                        "Low quality score {:.1}/100 after {} rounds",
+                        last_quality,
+                        rounds.len()
+                    ));
+                    warn!(
+                        session = %session_id,
+                        subtask_id = task_id,
+                        quality = last_quality,
+                        "AutoRunner: subtask quality too low"
+                    );
+                    self.emit(StreamEvent::TeamAgentEnd {
+                        agent_id: agent_id.to_string(),
+                        success: false,
+                        summary: format!("low quality {last_quality:.0}/100"),
+                    });
+                }
+                all_rounds.push(rounds);
+            }
+            Err(MagiError::MaxRounds(max, rounds)) => {
+                let last_quality = rounds
+                    .last()
+                    .map(|r| r.promotion.quality_score)
+                    .unwrap_or(0.0);
+                stall_detector.record(last_quality);
+                if last_quality >= 60.0 {
+                    subtasks[task_idx].status = SubtaskStatus::Done;
+                    self.emit(StreamEvent::TeamAgentEnd {
+                        agent_id: agent_id.to_string(),
+                        success: true,
+                        summary: format!("max rounds {max}, quality={last_quality:.0}"),
+                    });
+                    self.emit_token(format!(
+                        "⚠️ Subtask #{task_id} reached max auto rounds ({max}) with quality {last_quality:.0}/100 — accepting partial result.\n\n"
+                    ));
+                } else {
+                    subtasks[task_idx].status = SubtaskStatus::Failed(format!(
+                        "Max auto rounds ({max}) with quality {last_quality:.0}/100"
+                    ));
+                    self.emit(StreamEvent::TeamAgentEnd {
+                        agent_id: agent_id.to_string(),
+                        success: false,
+                        summary: format!("max rounds, quality={last_quality:.0}"),
+                    });
+                }
+                all_rounds.push(rounds);
+            }
+            Err(e) => {
+                subtasks[task_idx].status = SubtaskStatus::Failed(format!("auto error: {e}"));
+                warn!(
+                    session = %session_id,
+                    subtask_id = task_id,
+                    error = %e,
+                    "AutoRunner: subtask failed"
+                );
+                self.emit(StreamEvent::TeamAgentEnd {
+                    agent_id: agent_id.to_string(),
+                    success: false,
+                    summary: e.to_string(),
+                });
+                all_rounds.push(vec![]);
+                stall_detector.record(0.0);
+            }
+        }
     }
 }
 
@@ -426,18 +713,28 @@ fn compute_average_quality(all_rounds: &[Vec<MagiRound>]) -> f64 {
     }
 }
 
+/// All subtasks ready to execute (dependencies satisfied).
+fn find_all_ready(subtasks: &[Subtask]) -> Vec<usize> {
+    subtasks
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.status == SubtaskStatus::Pending
+                && s.dependencies.iter().all(|dep_id| {
+                    subtasks
+                        .iter()
+                        .find(|t| t.id == *dep_id)
+                        .map(|t| t.status == SubtaskStatus::Done)
+                        .unwrap_or(false)
+                })
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Find the next subtask that is ready to execute (all dependencies satisfied).
 fn find_next_ready(subtasks: &[Subtask]) -> Option<usize> {
-    subtasks.iter().position(|s| {
-        if s.status != SubtaskStatus::Pending {
-            return false;
-        }
-        s.dependencies.iter().all(|dep_id| {
-            subtasks
-                .iter()
-                .any(|t| t.id == *dep_id && t.status == SubtaskStatus::Done)
-        })
-    })
+    find_all_ready(subtasks).into_iter().next()
 }
 
 #[cfg(test)]

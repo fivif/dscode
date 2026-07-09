@@ -69,7 +69,7 @@ impl Dispatcher {
         Self {
             tools,
             working_dir,
-            max_iterations: 25,
+            max_iterations: 200,
         }
     }
 
@@ -103,13 +103,15 @@ impl Dispatcher {
 
     /// Spawn sub-agents for a set of task assignments and collect results.
     ///
-    /// Each sub-agent gets its own `Forge` instance and runs in a separate
-    /// Tokio task.  Results are collected via the returned channel receiver.
+    /// Uses [`futures::stream::FuturesUnordered`] for concurrent execution
+    /// with per-agent progress emission.  When `event_tx` is provided, each
+    /// agent start / completion is reported in real time.
     pub async fn dispatch(
         &self,
         assignments: &TaskAssignments,
         session_id: &str,
         provider_factory: impl Fn() -> Box<dyn LlmProvider> + Send + Sync + 'static,
+        event_tx: Option<mpsc::UnboundedSender<super::monitor::AgentStreamEvent>>,
     ) -> Vec<SubAgentResult> {
         if assignments.sub_tasks.is_empty() {
             warn!("Dispatcher: no sub-tasks to dispatch");
@@ -119,7 +121,12 @@ impl Dispatcher {
         let task_count = assignments.sub_tasks.len();
         info!(count = task_count, "Dispatcher: spawning sub-agents");
 
-        let (tx, mut rx) = mpsc::channel::<SubAgentResult>(task_count);
+        // Cap concurrent agents to 3 — prevents rate-limiting and connection exhaustion.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
+
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let mut futures = FuturesUnordered::new();
 
         for sub_task in &assignments.sub_tasks {
             let sub_task = sub_task.clone();
@@ -127,31 +134,51 @@ impl Dispatcher {
             let working_dir = self.working_dir.clone();
             let max_iterations = self.max_iterations;
             let session_id = session_id.to_string();
-            let tx = tx.clone();
             let provider = provider_factory();
+            let mon_tx = event_tx.clone();
+            let agent_id = sub_task.id.clone();
 
-            tokio::spawn(async move {
-                let result = run_sub_agent(
-                    provider,
-                    tools,
-                    working_dir,
-                    &session_id,
-                    &sub_task,
-                    max_iterations,
-                )
-                .await;
-
-                if tx.send(result).await.is_err() {
-                    debug!("Dispatcher: result channel closed");
+            let sem = semaphore.clone();
+            futures.push(Box::pin(async move {
+                // Wait for a concurrency slot.
+                let _permit = sem.acquire().await;
+                // Notify: agent started
+                if let Some(ref tx) = mon_tx {
+                    let _ = tx.send(super::monitor::AgentStreamEvent {
+                        agent_id: agent_id.clone(),
+                        event: StreamEvent::Token {
+                            content: "[STARTED]".into(),
+                        },
+                    });
                 }
-            });
+
+                let result = run_sub_agent(
+                    provider, tools, working_dir,
+                    session_id, sub_task, max_iterations,
+                ).await;
+
+                // Notify: agent finished
+                if let Some(ref tx) = mon_tx {
+                    let ev = if result.success {
+                        StreamEvent::Token { content: result.output.clone() }
+                    } else {
+                        StreamEvent::Error {
+                            content: result.error.clone().unwrap_or_default(),
+                        }
+                    };
+                    let _ = tx.send(super::monitor::AgentStreamEvent {
+                        agent_id: agent_id.clone(),
+                        event: ev,
+                    });
+                }
+
+                (agent_id, result)
+            }));
         }
 
-        // Drop the sender so the receiver closes when all tasks finish.
-        drop(tx);
-
+        // Collect results as they complete (FuturesUnordered yields in completion order).
         let mut results = Vec::with_capacity(task_count);
-        while let Some(result) = rx.recv().await {
+        while let Some((_agent_id, result)) = futures.next().await {
             results.push(result);
         }
 
@@ -270,14 +297,20 @@ async fn run_sub_agent(
     provider: Box<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
     working_dir: PathBuf,
-    session_id: &str,
-    sub_task: &SubTask,
+    session_id: String,
+    sub_task: SubTask,
     max_iterations: u32,
 ) -> SubAgentResult {
     let system_prompt = format!(
-        "You are a specialized sub-agent working on a specific task.\n\
+        "You are a specialized sub-agent. Complete your task and output ONLY the final result.\n\
          Context: {}\n\
-         Complete your assigned task and return a clear, concise answer.",
+         \n\
+         RULES:\n\
+         1. Use tools to do real work — read files, run commands, edit code.\n\
+         2. Your FINAL response must be the polished deliverable, NOT a thought log.\n\
+         3. Do NOT include phrases like \"Let me start by...\" or \"Now I'll...\".\n\
+         4. If you need to create a file, create it. If you need to run a command, run it.\n\
+         5. End with a brief one-line confirmation of what you produced.",
         sub_task.context
     );
 
@@ -287,15 +320,10 @@ async fn run_sub_agent(
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
+    let prompt = sub_task.prompt.clone();
     let result = forge
-        .execute(&sub_task.prompt, session_id, vec![], event_tx)
+        .execute(&prompt, &session_id, vec![], event_tx)
         .await;
-
-    // Wait briefly to allow any in-flight events to land in the channel
-    // before draining. `try_recv()` is non-blocking and may miss events
-    // that were sent just before the `execute()` future resolved but
-    // haven't been buffered yet.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Collect text output from events.
     let mut output = String::new();

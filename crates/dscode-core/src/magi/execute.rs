@@ -16,8 +16,43 @@ use crate::providers::trait_def::{
 use crate::tools::registry::ToolRegistry;
 #[allow(unused_imports)]
 use crate::tools::trait_def::{ToolContext, ToolError};
+use crate::safety::guard::SafetyGuard;
 
+use crate::agent::stream::{StreamEvent, ToolStatus};
 use super::scheduler::MagiError;
+
+/// Optional UI progress sink for MAGI /auto (prevents "silent hang" UX).
+pub type MagiProgressTx = tokio::sync::mpsc::UnboundedSender<StreamEvent>;
+
+/// Progress context for a Balthasar run (lives on the subtask agent card + main stream).
+#[derive(Clone)]
+pub struct MagiProgress {
+    pub tx: MagiProgressTx,
+    /// e.g. `subtask-1` — drives TeamAgentOutput on the UI card
+    pub agent_id: String,
+}
+
+impl MagiProgress {
+    fn emit(&self, event: StreamEvent) {
+        let _ = self.tx.send(event);
+    }
+
+    fn heartbeat(&self, line: impl Into<String>) {
+        let line = line.into();
+        self.emit(StreamEvent::TeamAgentOutput {
+            agent_id: self.agent_id.clone(),
+            content: format!("{line}\n"),
+        });
+        self.emit(StreamEvent::Token {
+            content: format!("_{line}_\n"),
+        });
+    }
+}
+
+/// Per-call LLM timeout — avoids infinite "排队/执行中" when the API stalls.
+const CHAT_TIMEOUT_SECS: u64 = 120;
+/// Soft cap on a single tool execution.
+const TOOL_TIMEOUT_SECS: u64 = 90;
 
 /// The system prompt that primes Balthasar for execution.
 const BALTHASAR_SYSTEM_PROMPT: &str = r#"You are Balthasar, the execution brain of the MAGI system.
@@ -30,6 +65,8 @@ Use the available tools to read, write, edit, and execute code.
 Focus on the areas highlighted by Casper's review.
 Produce clean, well-tested, working code.
 
+Be efficient: prefer concrete file edits over long analysis. Do not re-scan the whole monorepo.
+
 After completing your work, provide a summary of:
 - What you changed or created
 - What files were modified
@@ -38,13 +75,7 @@ After completing your work, provide a summary of:
 /// Execute a subtask using the agent loop.
 ///
 /// # Arguments
-/// * `provider` — the primary LLM provider for the agent loop.
-/// * `tools` — the shared tool registry.
-/// * `working_dir` — the working directory for path resolution.
-/// * `session_id` — session identifier for logging.
-/// * `prd` — the full PRD text.
-/// * `scrutiny` — Casper's latest scrutiny report.
-/// * `max_steps` — maximum ReAct iterations before giving up.
+/// * `progress` — optional UI sink; when set, emits step/tool heartbeats so the UI is not stuck.
 ///
 /// # Returns
 /// The combined text output from the agent's execution rounds.
@@ -56,6 +87,7 @@ pub async fn execute_subtask(
     prd: &str,
     scrutiny: &str,
     max_steps: u32,
+    progress: Option<&MagiProgress>,
 ) -> Result<String, MagiError> {
     let tool_defs = tools.to_openai_tools();
 
@@ -89,6 +121,8 @@ pub async fn execute_subtask(
 
     // ── ReAct loop ──
     for step in 1..=max_steps {
+        clean_orphaned_tool_calls(&mut messages);
+
         debug!(
             session = %session_id,
             step,
@@ -97,7 +131,35 @@ pub async fn execute_subtask(
             "Balthasar: calling provider"
         );
 
-        let response = provider.chat(messages.clone(), tool_defs.clone()).await?;
+        if let Some(p) = progress {
+            p.heartbeat(format!("Auto step {step}/{max_steps} — thinking…"));
+        }
+
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(CHAT_TIMEOUT_SECS),
+            provider.chat(messages.clone(), tool_defs.clone()),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(MagiError::Provider(e)),
+            Err(_) => {
+                warn!(
+                    session = %session_id,
+                    step,
+                    timeout_s = CHAT_TIMEOUT_SECS,
+                    "Balthasar: chat timed out"
+                );
+                if let Some(p) = progress {
+                    p.heartbeat(format!(
+                        "Auto step {step}: LLM call timed out after {CHAT_TIMEOUT_SECS}s"
+                    ));
+                }
+                return Err(MagiError::Parse(format!(
+                    "Auto LLM call timed out after {CHAT_TIMEOUT_SECS}s (step {step})"
+                )));
+            }
+        };
 
         // Accumulate text content
         if !response.content.is_empty() {
@@ -105,6 +167,13 @@ pub async fn execute_subtask(
                 final_output.push('\n');
             }
             final_output.push_str(&response.content);
+            if let Some(p) = progress {
+                let preview: String = response.content.chars().take(200).collect();
+                p.emit(StreamEvent::TeamAgentOutput {
+                    agent_id: p.agent_id.clone(),
+                    content: format!("{preview}\n"),
+                });
+            }
         }
 
         // Build assistant message
@@ -134,6 +203,17 @@ pub async fn execute_subtask(
             );
 
             for tc in &response.tool_calls {
+                let tname = tc.function.name.clone();
+                if let Some(p) = progress {
+                    p.heartbeat(format!("tool `{tname}`…"));
+                    p.emit(StreamEvent::ToolStart {
+                        id: tc.id.clone(),
+                        name: tname.clone(),
+                        description: format!("auto / {tname}"),
+                        arguments: tc.function.arguments.clone(),
+                    });
+                }
+
                 let tool_result = execute_balthasar_tool(
                     tools,
                     tc,
@@ -141,6 +221,26 @@ pub async fn execute_subtask(
                     session_id,
                 )
                 .await;
+
+                if let Some(p) = progress {
+                    let ok = !tool_result.starts_with("Failed")
+                        && !tool_result.starts_with("Tool error")
+                        && !tool_result.starts_with("error:");
+                    let preview: String = tool_result.chars().take(300).collect();
+                    p.emit(StreamEvent::ToolEnd {
+                        id: tc.id.clone(),
+                        status: if ok {
+                            ToolStatus::Success
+                        } else {
+                            ToolStatus::Error
+                        },
+                        result: preview.clone(),
+                    });
+                    p.emit(StreamEvent::TeamAgentOutput {
+                        agent_id: p.agent_id.clone(),
+                        content: format!("`{tname}` → {preview}\n"),
+                    });
+                }
 
                 messages.push(Message {
                     role: Role::Tool,
@@ -163,6 +263,9 @@ pub async fn execute_subtask(
                 output_len = final_output.len(),
                 "Balthasar: execution complete"
             );
+            if let Some(p) = progress {
+                p.heartbeat(format!("Auto finished at step {step}"));
+            }
             return Ok(final_output);
         }
 
@@ -182,7 +285,10 @@ pub async fn execute_subtask(
         "Balthasar: max steps reached, returning accumulated output"
     );
     if final_output.is_empty() {
-        final_output = "(Balthasar produced no output within the step budget)".to_string();
+        final_output = "(Auto produced no output within the step budget)".to_string();
+    }
+    if let Some(p) = progress {
+        p.heartbeat(format!("Auto hit step budget ({max_steps})"));
     }
     Ok(final_output)
 }
@@ -208,10 +314,7 @@ async fn execute_balthasar_tool(
         }
     };
 
-    // Create a proper event channel so tool events are consumed rather than
-    // dropped. Spawn a background task that logs or forwards events to a
-    // debug callback. This prevents the "dropped receiver" warning that
-    // occurs when tools emit events but nobody is listening.
+    // Drain tool-internal events (avoid "dropped receiver" warnings).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sid = session_id.to_string();
     let tname = tool_name.clone();
@@ -231,17 +334,23 @@ async fn execute_balthasar_tool(
         session_id: session_id.to_string(),
         tool_call_id: tc.id.clone(),
         sender: tx,
+        safety_guard: Arc::new(SafetyGuard::new(&[], true)),
     };
 
-    match tools.execute(tool_name, args, &ctx).await {
-        Ok(result) => {
+    let fut = tools.execute(tool_name, args, &ctx);
+    match tokio::time::timeout(std::time::Duration::from_secs(TOOL_TIMEOUT_SECS), fut).await {
+        Ok(Ok(result)) => {
             if result.success {
                 result.output
             } else {
                 result.error.as_deref().unwrap_or(&result.output).to_string()
             }
         }
-        Err(e) => e.to_string(),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => format!(
+            "Tool '{}' timed out after {}s",
+            tool_name, TOOL_TIMEOUT_SECS
+        ),
     }
 }
 
@@ -257,6 +366,50 @@ fn build_execution_prompt(prd: &str, scrutiny: &str) -> String {
          When you are finished, provide a clear summary of what you accomplished.",
         prd, scrutiny
     )
+}
+
+/// Clean orphaned tool_calls and ghost assistant messages in-place.
+/// Mirrors forge.rs:clean_orphaned_tool_calls to keep the message vector
+/// valid for provider API calls — prevents 400 errors from the provider.
+fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
+    let responded: std::collections::HashSet<String> = messages
+        .iter().filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.clone()).collect();
+
+    for msg in messages.iter_mut() {
+        if let Some(ref mut tc) = msg.tool_calls {
+            tc.retain(|t| responded.contains(&t.id));
+            if tc.is_empty() {
+                msg.tool_calls = None;
+            }
+        }
+        // Always strip tool_call_id from Assistant messages — it belongs
+        // only on Tool-role messages per OpenAI protocol.
+        if msg.role == Role::Assistant && msg.tool_call_id.is_some() {
+            msg.tool_call_id = None;
+        }
+    }
+
+    let valid_ids: std::collections::HashSet<String> = messages.iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flat_map(|tc| tc.iter().map(|t| t.id.clone())).collect();
+
+    messages.retain(|m| {
+        if m.role != Role::Tool { return true; }
+        m.tool_call_id.as_ref().map_or(false, |id| valid_ids.contains(id))
+    });
+
+    // Remove ghost Assistant messages: after cleaning orphaned tool_calls,
+    // an assistant may have empty content, no tool_calls, and no reasoning.
+    // These cause 400 errors: "messages with role 'assistant' must have
+    // content or tool_calls".
+    messages.retain(|m| {
+        if m.role != Role::Assistant { return true; }
+        if !m.content.is_empty() { return true; }
+        if m.tool_calls.is_some() { return true; }
+        if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
+        false
+    });
 }
 
 #[cfg(test)]
@@ -311,7 +464,9 @@ mod tests {
         > {
             unimplemented!()
         }
-    }
+    
+    fn clone_box(&self) -> Box<dyn LlmProvider> { panic!("clone_box not used in tests") }
+}
 
     // ------------------------------------------------------------------
     // Stub tool
@@ -369,6 +524,7 @@ mod tests {
             "PRD: Build a hello world",
             "Scrutiny: Looks fine",
             10,
+            None,
         )
         .await;
 
@@ -413,6 +569,7 @@ mod tests {
             "PRD: Test echo tool",
             "Scrutiny: Verify echo works",
             10,
+            None,
         )
         .await;
 
@@ -453,6 +610,7 @@ mod tests {
             "PRD: Loop forever",
             "Scrutiny: needs work",
             3,
+            None,
         )
         .await;
 

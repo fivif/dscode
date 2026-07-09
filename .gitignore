@@ -44,5 +44,8 @@ Thumbs.db
 *.db-wal
 *.db-shm
 
+# External git repos
+llm_wiki/
+
 # Cargo lock (workspace crate, not end-user app)
 # Cargo.lock is committed for deterministic builds in this project

@@ -184,7 +184,9 @@ mod tests {
         > {
             unimplemented!()
         }
-    }
+    
+    fn clone_box(&self) -> Box<dyn LlmProvider> { panic!("clone_box not used in tests") }
+}
 
     #[tokio::test]
     async fn test_scrutinize_first_round() {

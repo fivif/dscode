@@ -41,7 +41,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let lines = build_message_lines(state);
     let visible_height = inner.height as usize;
 
-    let start = state.scroll_offset.min(lines.len().saturating_sub(1));
+    let start = state.chat_scroll_offset.min(lines.len().saturating_sub(1));
     let end = (start + visible_height).min(lines.len());
     let visible_lines: Vec<Line> = lines[start..end].to_vec();
 

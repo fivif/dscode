@@ -1,4 +1,4 @@
-//! Plan phase state machine — five distinct stages from initial understanding
+//! Plan phase state machine — five distinct stages from scope discovery
 //! through final approval. The state machine governs the planning interview
 //! process and persists intermediate state so long-running plans survive restarts.
 
@@ -6,23 +6,25 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// The five phases of the plan engine.
+/// The six phases of the plan engine.
 ///
 /// Progression is linear but phases can cycle back on revisions:
-/// `Review → Design` when the review uncovers flaws, or
-/// `Approved → Design` when a human rejects the plan.
+/// `Quality → Risks` when the QA review uncovers issues, or
+/// `Approved → Scope` when a human rejects the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPhase {
-    /// Gather requirements, ask clarifying questions, explore the codebase.
-    InitialUnderstanding,
-    /// Architect the solution: component design, data flow, interface surfaces.
+    /// SCOPE — Understand project boundaries and goals.
+    Scope,
+    /// REQUIREMENTS — Deep-dive into features, constraints, dependencies.
+    Requirements,
+    /// DESIGN — Architecture, component design, data models.
     Design,
-    /// Validate the design against requirements and constraints.
-    Review,
-    /// Produce the final, concrete PRD with file paths, estimates, and steps.
-    FinalPlan,
-    /// The plan has been accepted (by human or auto-approval).
+    /// RISKS — Technical risks, mitigations, trade-offs.
+    Risks,
+    /// QUALITY — Success criteria, testing strategy, acceptance.
+    Quality,
+    /// The plan has been accepted and the PRD is ready.
     Approved,
 }
 
@@ -30,10 +32,11 @@ impl PlanPhase {
     /// Returns the next phase in the default progression.
     pub fn next(self) -> Option<PlanPhase> {
         match self {
-            PlanPhase::InitialUnderstanding => Some(PlanPhase::Design),
-            PlanPhase::Design => Some(PlanPhase::Review),
-            PlanPhase::Review => Some(PlanPhase::FinalPlan),
-            PlanPhase::FinalPlan => Some(PlanPhase::Approved),
+            PlanPhase::Scope => Some(PlanPhase::Requirements),
+            PlanPhase::Requirements => Some(PlanPhase::Design),
+            PlanPhase::Design => Some(PlanPhase::Risks),
+            PlanPhase::Risks => Some(PlanPhase::Quality),
+            PlanPhase::Quality => Some(PlanPhase::Approved),
             PlanPhase::Approved => None,
         }
     }
@@ -46,10 +49,11 @@ impl PlanPhase {
     /// Human-readable phase label.
     pub fn label(self) -> &'static str {
         match self {
-            PlanPhase::InitialUnderstanding => "Initial Understanding",
-            PlanPhase::Design => "Design",
-            PlanPhase::Review => "Review",
-            PlanPhase::FinalPlan => "Final Plan",
+            PlanPhase::Scope => "1. Scope",
+            PlanPhase::Requirements => "2. Requirements",
+            PlanPhase::Design => "3. Design",
+            PlanPhase::Risks => "4. Risks",
+            PlanPhase::Quality => "5. Quality",
             PlanPhase::Approved => "Approved",
         }
     }
@@ -83,7 +87,7 @@ pub struct PlanState {
     /// Estimated number of remaining questions before the current phase can complete.
     pub questions_remaining: u32,
 
-    /// The draft PRD document, once the FinalPlan phase has produced one.
+    /// The draft PRD document, once the Quality phase has produced one.
     pub draft_prd: Option<super::prd::PrdDocument>,
 
     /// Arbitrary metadata gathered during the interview (key-value pairs).
@@ -100,15 +104,15 @@ pub struct PlanState {
 }
 
 impl PlanState {
-    /// Create a new plan state in the InitialUnderstanding phase.
+    /// Create a new plan state in the Scope phase.
     pub fn new(plan_id: String, title: String) -> Self {
         let now = Utc::now();
         Self {
-            phase: PlanPhase::InitialUnderstanding,
+            phase: PlanPhase::Scope,
             plan_id,
             title,
             questions_asked: 0,
-            questions_remaining: 5,
+            questions_remaining: 3,
             draft_prd: None,
             metadata: HashMap::new(),
             created_at: now,
@@ -127,7 +131,7 @@ impl PlanState {
         Some(next)
     }
 
-    /// Go back to a specific phase (e.g., from Review back to Design).
+    /// Go back to a specific phase (e.g., from Quality back to Risks).
     pub fn retreat_to(&mut self, phase: PlanPhase) {
         self.phase = phase;
         self.updated_at = Utc::now();
@@ -175,31 +179,30 @@ mod tests {
 
     #[test]
     fn test_phase_progression() {
-        assert_eq!(
-            PlanPhase::InitialUnderstanding.next(),
-            Some(PlanPhase::Design)
-        );
-        assert_eq!(PlanPhase::Design.next(), Some(PlanPhase::Review));
-        assert_eq!(PlanPhase::Review.next(), Some(PlanPhase::FinalPlan));
-        assert_eq!(PlanPhase::FinalPlan.next(), Some(PlanPhase::Approved));
+        assert_eq!(PlanPhase::Scope.next(), Some(PlanPhase::Requirements));
+        assert_eq!(PlanPhase::Requirements.next(), Some(PlanPhase::Design));
+        assert_eq!(PlanPhase::Design.next(), Some(PlanPhase::Risks));
+        assert_eq!(PlanPhase::Risks.next(), Some(PlanPhase::Quality));
+        assert_eq!(PlanPhase::Quality.next(), Some(PlanPhase::Approved));
         assert_eq!(PlanPhase::Approved.next(), None);
     }
 
     #[test]
     fn test_can_advance() {
-        assert!(PlanPhase::InitialUnderstanding.can_advance());
+        assert!(PlanPhase::Scope.can_advance());
+        assert!(PlanPhase::Requirements.can_advance());
         assert!(PlanPhase::Design.can_advance());
-        assert!(PlanPhase::Review.can_advance());
-        assert!(PlanPhase::FinalPlan.can_advance());
+        assert!(PlanPhase::Risks.can_advance());
+        assert!(PlanPhase::Quality.can_advance());
         assert!(!PlanPhase::Approved.can_advance());
     }
 
     #[test]
     fn test_plan_state_new() {
         let state = PlanState::new("plan-1".into(), "Test Plan".into());
-        assert_eq!(state.phase, PlanPhase::InitialUnderstanding);
+        assert_eq!(state.phase, PlanPhase::Scope);
         assert_eq!(state.questions_asked, 0);
-        assert_eq!(state.questions_remaining, 5);
+        assert_eq!(state.questions_remaining, 3);
         assert!(state.draft_prd.is_none());
         assert!(!state.is_complete());
     }
@@ -207,9 +210,10 @@ mod tests {
     #[test]
     fn test_plan_state_advance() {
         let mut state = PlanState::new("plan-1".into(), "Test Plan".into());
+        assert_eq!(state.advance_phase(), Some(PlanPhase::Requirements));
         assert_eq!(state.advance_phase(), Some(PlanPhase::Design));
-        assert_eq!(state.advance_phase(), Some(PlanPhase::Review));
-        assert_eq!(state.advance_phase(), Some(PlanPhase::FinalPlan));
+        assert_eq!(state.advance_phase(), Some(PlanPhase::Risks));
+        assert_eq!(state.advance_phase(), Some(PlanPhase::Quality));
         assert_eq!(state.advance_phase(), Some(PlanPhase::Approved));
         assert!(state.is_complete());
         assert_eq!(state.advance_phase(), None);
@@ -218,8 +222,9 @@ mod tests {
     #[test]
     fn test_plan_state_retreat() {
         let mut state = PlanState::new("plan-1".into(), "Test Plan".into());
+        state.advance_phase(); // Requirements
         state.advance_phase(); // Design
-        state.advance_phase(); // Review
+        state.advance_phase(); // Risks
         state.retreat_to(PlanPhase::Design);
         assert_eq!(state.phase, PlanPhase::Design);
     }
@@ -227,13 +232,13 @@ mod tests {
     #[test]
     fn test_question_tracking() {
         let mut state = PlanState::new("plan-1".into(), "Test Plan".into());
-        assert_eq!(state.questions_remaining, 5);
+        assert_eq!(state.questions_remaining, 3);
         state.question_asked();
         assert_eq!(state.questions_asked, 1);
-        assert_eq!(state.questions_remaining, 4);
+        assert_eq!(state.questions_remaining, 2);
         state.question_asked();
         assert_eq!(state.questions_asked, 2);
-        assert_eq!(state.questions_remaining, 3);
+        assert_eq!(state.questions_remaining, 1);
     }
 
     #[test]
@@ -247,10 +252,11 @@ mod tests {
 
     #[test]
     fn test_plan_state_display() {
-        assert_eq!(PlanPhase::InitialUnderstanding.to_string(), "Initial Understanding");
-        assert_eq!(PlanPhase::Design.to_string(), "Design");
-        assert_eq!(PlanPhase::Review.to_string(), "Review");
-        assert_eq!(PlanPhase::FinalPlan.to_string(), "Final Plan");
+        assert_eq!(PlanPhase::Scope.to_string(), "1. Scope");
+        assert_eq!(PlanPhase::Requirements.to_string(), "2. Requirements");
+        assert_eq!(PlanPhase::Design.to_string(), "3. Design");
+        assert_eq!(PlanPhase::Risks.to_string(), "4. Risks");
+        assert_eq!(PlanPhase::Quality.to_string(), "5. Quality");
         assert_eq!(PlanPhase::Approved.to_string(), "Approved");
     }
 }

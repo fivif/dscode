@@ -3,9 +3,11 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::agent::stream::StreamEvent;
 use crate::providers::trait_def::ToolDef;
+use crate::safety::guard::SafetyGuard;
 
 /// Context passed to every tool invocation, providing the session environment
 /// and a channel to emit streaming events back to the agent loop.
@@ -19,6 +21,8 @@ pub struct ToolContext {
     pub tool_call_id: String,
     /// Channel to emit StreamEvents (e.g. ToolProgress, ToolEnd).
     pub sender: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    /// Safety guard for command and path validation during tool execution.
+    pub safety_guard: Arc<SafetyGuard>,
 }
 
 /// The result of a single tool invocation.

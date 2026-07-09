@@ -55,6 +55,40 @@ pub enum StreamEvent {
         #[serde(default)]
         usage: Option<UsageInfo>,
     },
+    /// A /teams sub-agent has started.
+    TeamAgentStart {
+        agent_id: String,
+        task: String,
+    },
+    /// Streaming output from a /teams sub-agent.
+    TeamAgentOutput {
+        agent_id: String,
+        content: String,
+    },
+    /// A /teams sub-agent has finished.
+    TeamAgentEnd {
+        agent_id: String,
+        success: bool,
+        summary: String,
+    },
+    /// All /teams sub-agents have completed.
+    TeamComplete {
+        completed: usize,
+        failed: usize,
+    },
+    /// /plan interview question with clickable options for the UI.
+    PlanQuestion {
+        phase: String,
+        question: String,
+        #[serde(default)]
+        recommended: String,
+        #[serde(default)]
+        options: Vec<String>,
+        #[serde(default)]
+        remaining: u32,
+        #[serde(default)]
+        auto_notes: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

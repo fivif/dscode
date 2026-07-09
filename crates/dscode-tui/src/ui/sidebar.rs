@@ -53,12 +53,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     // Scroll the list so the selected item is visible.
     let visible_height = inner.height as usize;
     let offset = state.session_select_index.map(|i| {
-        if i < state.scroll_offset {
+        if i < state.sidebar_scroll_offset {
             i
-        } else if i >= state.scroll_offset + visible_height {
+        } else if i >= state.sidebar_scroll_offset + visible_height {
             i - visible_height + 1
         } else {
-            state.scroll_offset
+            state.sidebar_scroll_offset
         }
     }).unwrap_or(0);
 

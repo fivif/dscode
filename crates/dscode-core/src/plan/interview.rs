@@ -195,13 +195,13 @@ pub struct InterviewEngine {
 }
 
 impl InterviewEngine {
-    /// Create a new interview engine starting in InitialUnderstanding.
+    /// Create a new interview engine starting in the Scope phase.
     pub fn new(working_dir: PathBuf) -> Self {
         Self {
             questions: Vec::new(),
             decision_tree: std::collections::HashMap::new(),
             history: Vec::new(),
-            phase: PlanPhase::InitialUnderstanding,
+            phase: PlanPhase::Scope,
             working_dir,
             cursor: 0,
         }
@@ -418,7 +418,7 @@ impl InterviewEngine {
 
     async fn detect_framework(&self) -> Option<String> {
         // Check Cargo.toml dependencies for Rust frameworks
-        if let Ok(content) = std::fs::read_to_string(self.working_dir.join("Cargo.toml")) {
+        if let Ok(content) = tokio::fs::read_to_string(self.working_dir.join("Cargo.toml")).await {
             let content_lower = content.to_lowercase();
             let mut frameworks = Vec::new();
             if content_lower.contains("actix-web") {
@@ -448,7 +448,7 @@ impl InterviewEngine {
         if self.working_dir.join("Cargo.toml").exists() {
             let has_tests_dir = self.working_dir.join("tests").is_dir();
             let has_inline_tests = if let Ok(content) =
-                std::fs::read_to_string(self.working_dir.join("Cargo.toml"))
+                tokio::fs::read_to_string(self.working_dir.join("Cargo.toml")).await
             {
                 // Check if any test-related dependencies exist
                 content.contains("rstest")
@@ -476,8 +476,7 @@ impl Default for InterviewEngine {
     }
 }
 
-/// Create a standard set of initial interview questions for the
-/// InitialUnderstanding phase.
+/// Create a standard set of initial interview questions for the Scope phase.
 pub fn default_interview_questions(working_dir: &PathBuf) -> Vec<Question> {
     let cwd = working_dir.display().to_string();
     vec![
@@ -485,36 +484,54 @@ pub fn default_interview_questions(working_dir: &PathBuf) -> Vec<Question> {
             "q1",
             format!("What programming language is the project using? (Working directory: {})", cwd),
             "Let me explore the codebase to detect the language automatically.",
-            PlanPhase::InitialUnderstanding,
+            PlanPhase::Scope,
         ),
         Question::new(
             "q2",
             "What is the primary goal of this task? Describe in 1-2 sentences.",
             "Implement the requested feature with tests and documentation.",
-            PlanPhase::InitialUnderstanding,
+            PlanPhase::Scope,
         ),
         Question::new(
             "q3",
             "Are there any existing patterns or conventions in the codebase that must be followed?",
             "Follow the existing module structure, error handling patterns (thiserror), and test conventions.",
-            PlanPhase::InitialUnderstanding,
-        ),
-        Question::new(
-            "q4",
-            "What are the acceptance criteria? How will we know the task is done?",
-            "All tests pass, code compiles without warnings, and the implementation matches the specification.",
-            PlanPhase::InitialUnderstanding,
-        ),
-        Question::new(
-            "q5",
-            "Are there any constraints or non-functional requirements (performance, security, compatibility)?",
-            "No special constraints beyond idiomatic code and thread safety (Send + Sync).",
-            PlanPhase::InitialUnderstanding,
+            PlanPhase::Scope,
         ),
     ]
 }
 
-/// Create design-phase questions based on the initial understanding answers.
+/// Create requirements-phase questions about features, constraints, and dependencies.
+pub fn requirements_questions() -> Vec<Question> {
+    vec![
+        Question::new(
+            "r1",
+            "What are the specific features or capabilities that must be delivered? List them concretely.",
+            "Implement the core functionality described in the task with appropriate error handling and edge-case coverage.",
+            PlanPhase::Requirements,
+        ),
+        Question::new(
+            "r2",
+            "What are the key constraints? (performance, memory, latency, compatibility, API stability)",
+            "Thread safety (Send + Sync), idiomatic Rust conventions, no breaking changes to public APIs.",
+            PlanPhase::Requirements,
+        ),
+        Question::new(
+            "r3",
+            "What external dependencies or services does this feature interact with?",
+            "Use existing workspace crates where possible. No new external service dependencies unless specified.",
+            PlanPhase::Requirements,
+        ),
+        Question::new(
+            "r4",
+            "What are the acceptance criteria? How will we know the task is done?",
+            "All tests pass, code compiles without warnings, and the implementation matches the specification.",
+            PlanPhase::Requirements,
+        ),
+    ]
+}
+
+/// Create design-phase questions based on architecture and component design.
 pub fn design_questions() -> Vec<Question> {
     vec![
         Question::new(
@@ -544,13 +561,73 @@ pub fn design_questions() -> Vec<Question> {
     ]
 }
 
+/// Create risks-phase questions for technical risk assessment.
+pub fn risks_questions() -> Vec<Question> {
+    vec![
+        Question::new(
+            "k1",
+            "What are the highest-risk components or changes in this plan?",
+            "Changes to core abstractions and public API surfaces carry the most risk. New dependencies should be vetted.",
+            PlanPhase::Risks,
+        ),
+        Question::new(
+            "k2",
+            "What could go wrong with this approach? Are there edge cases or failure modes?",
+            "Concurrent access patterns, resource cleanup, error propagation across module boundaries.",
+            PlanPhase::Risks,
+        ),
+        Question::new(
+            "k3",
+            "What mitigations can be put in place for the identified risks?",
+            "Comprehensive unit tests, integration tests for critical paths, fuzz testing for parsing/serialization boundaries.",
+            PlanPhase::Risks,
+        ),
+        Question::new(
+            "k4",
+            "Are there any backwards-compatibility concerns with existing code?",
+            "No breaking changes to public APIs. Use deprecation warnings if renaming. Maintain trait implementations.",
+            PlanPhase::Risks,
+        ),
+    ]
+}
+
+/// Create quality-phase questions for success criteria and testing strategy.
+pub fn quality_questions() -> Vec<Question> {
+    vec![
+        Question::new(
+            "y1",
+            "What testing strategy should be applied? (unit, integration, property, fuzz)",
+            "Unit tests for all new public functions, integration tests for cross-module workflows, property tests for data structures.",
+            PlanPhase::Quality,
+        ),
+        Question::new(
+            "y2",
+            "What are the specific success metrics for this implementation?",
+            "All tests pass, clippy produces no warnings, no panics in error paths, documentation covers all public items.",
+            PlanPhase::Quality,
+        ),
+        Question::new(
+            "y3",
+            "What documentation needs to be created or updated?",
+            "Module-level docs, function-level docs with examples, and any architectural decision records (ADRs) for significant choices.",
+            PlanPhase::Quality,
+        ),
+        Question::new(
+            "y4",
+            "How should the implementation be verified before marking complete?",
+            "Run full test suite, cargo clippy, cargo doc, and manual review of the diff against the original requirements.",
+            PlanPhase::Quality,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_question_new() {
-        let q = Question::new("q1", "What language?", "Rust", PlanPhase::InitialUnderstanding);
+        let q = Question::new("q1", "What language?", "Rust", PlanPhase::Scope);
         assert_eq!(q.id, "q1");
         assert_eq!(q.text, "What language?");
         assert_eq!(q.recommended_answer, "Rust");
@@ -560,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_question_answer() {
-        let mut q = Question::new("q1", "What language?", "Rust", PlanPhase::InitialUnderstanding);
+        let mut q = Question::new("q1", "What language?", "Rust", PlanPhase::Scope);
         assert!(!q.is_answered());
         q.answer_with("Rust");
         assert!(q.is_answered());
@@ -570,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_question_auto_answer() {
-        let mut q = Question::new("q1", "What language?", "Rust", PlanPhase::InitialUnderstanding);
+        let mut q = Question::new("q1", "What language?", "Rust", PlanPhase::Scope);
         q.auto_answer("Rust");
         assert!(q.is_answered());
         assert!(q.auto_answered);
@@ -593,8 +670,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = InterviewEngine::new(tmp.path().to_path_buf());
         engine
-            .add_question(Question::new("q1", "What lang?", "Rust", PlanPhase::InitialUnderstanding))
-            .add_question(Question::new("q2", "Goal?", "Implement", PlanPhase::InitialUnderstanding));
+            .add_question(Question::new("q1", "What lang?", "Rust", PlanPhase::Scope))
+            .add_question(Question::new("q2", "Goal?", "Implement", PlanPhase::Scope));
 
         assert_eq!(engine.remaining_count(), 2);
 
@@ -630,7 +707,7 @@ mod tests {
     async fn test_interview_history() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = InterviewEngine::new(tmp.path().to_path_buf());
-        engine.add_question(Question::new("q1", "Lang?", "Rust", PlanPhase::InitialUnderstanding));
+        engine.add_question(Question::new("q1", "Lang?", "Rust", PlanPhase::Scope));
 
         let _ = engine.next_action().await;
         engine.answer_current("Rust");
@@ -651,7 +728,7 @@ mod tests {
             "q1",
             "What programming language is the project using?",
             "unknown",
-            PlanPhase::InitialUnderstanding,
+            PlanPhase::Scope,
         ));
 
         let action = engine.next_action().await;
@@ -675,8 +752,15 @@ mod tests {
     fn test_default_interview_questions() {
         let dir = PathBuf::from("/tmp/test");
         let questions = default_interview_questions(&dir);
-        assert_eq!(questions.len(), 5);
-        assert!(questions.iter().all(|q| q.phase == PlanPhase::InitialUnderstanding));
+        assert_eq!(questions.len(), 3);
+        assert!(questions.iter().all(|q| q.phase == PlanPhase::Scope));
+    }
+
+    #[test]
+    fn test_requirements_questions() {
+        let questions = requirements_questions();
+        assert_eq!(questions.len(), 4);
+        assert!(questions.iter().all(|q| q.phase == PlanPhase::Requirements));
     }
 
     #[test]
@@ -684,5 +768,19 @@ mod tests {
         let questions = design_questions();
         assert_eq!(questions.len(), 4);
         assert!(questions.iter().all(|q| q.phase == PlanPhase::Design));
+    }
+
+    #[test]
+    fn test_risks_questions() {
+        let questions = risks_questions();
+        assert_eq!(questions.len(), 4);
+        assert!(questions.iter().all(|q| q.phase == PlanPhase::Risks));
+    }
+
+    #[test]
+    fn test_quality_questions() {
+        let questions = quality_questions();
+        assert_eq!(questions.len(), 4);
+        assert!(questions.iter().all(|q| q.phase == PlanPhase::Quality));
     }
 }

@@ -2,13 +2,15 @@ import { useEffect, useRef } from 'react';
 import MessageBubble from './MessageBubble';
 import ThinkingBlockView from './ThinkingBlock';
 import ToolCallCard from './ToolCallCard';
+import FactCard from './FactCard';
+import TeamPanel from './TeamPanel';
+import PlanChoiceCard from './PlanChoiceCard';
 import { useChatStore } from '@/stores/chatStore';
 
 export default function ChatArea() {
   const messages = useChatStore((s) => s.messages);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamError = useChatStore((s) => s.streamError);
-  const outputFormat = useChatStore((s) => s.outputFormat);
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRaf = useRef<number>(0);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -42,12 +44,28 @@ export default function ChatArea() {
       {messages.map((msg) => {
         const thinking = msg.thinking_blocks || [];
         const toolCalls = msg.tool_calls || [];
-        const isToolOnly = toolCalls.length > 0 && !msg.content && !thinking.length;
+        const teamAgentsOnMsg = msg.team_agents || [];
         return (
           <div key={msg.id} className="mb-4">
-            {thinking.length > 0 && <ThinkingBlockView blocks={thinking} />}
-            {msg.content && <MessageBubble message={msg} isHtml={outputFormat === 'html'} />}
+            {thinking.length > 0 && (
+              <ThinkingBlockView
+                blocks={thinking}
+                streaming={isStreaming && msg === messages[messages.length - 1]}
+              />
+            )}
+            {msg.content && <MessageBubble message={msg} />}
             {toolCalls.map((tc: any) => <ToolCallCard key={tc.id} tool={tc} />)}
+            {msg.fact_cards && msg.fact_cards.length > 0 && <FactCard facts={msg.fact_cards} />}
+            {msg.plan_choice && (
+              <PlanChoiceCard messageId={msg.id} choice={msg.plan_choice} />
+            )}
+            {teamAgentsOnMsg.length > 0 && (
+              <TeamPanel
+                agents={teamAgentsOnMsg}
+                kind={msg.agent_panel_kind || 'teams'}
+                compact
+              />
+            )}
           </div>
         );
       })}

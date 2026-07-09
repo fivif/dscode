@@ -24,15 +24,18 @@ impl SafetyGuard {
     pub fn new(blocked_commands: &[String], allow_write_outside_project: bool) -> Self {
         let blocked_patterns = blocked_commands
             .iter()
-            .filter_map(|pat| match Regex::new(pat) {
-                Ok(re) => Some(re),
-                Err(e) => {
-                    warn!(
-                        pattern = %pat,
-                        error = %e,
-                        "SafetyGuard: skipping invalid blocked_command regex pattern"
-                    );
-                    None
+            .filter_map(|pat| {
+                let bounded = format!(r"\b{}\b", pat);
+                match Regex::new(&bounded) {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        warn!(
+                            pattern = %pat,
+                            error = %e,
+                            "SafetyGuard: skipping invalid blocked_command regex pattern"
+                        );
+                        None
+                    }
                 }
             })
             .collect();
@@ -63,6 +66,28 @@ impl SafetyGuard {
     /// Returns `Ok(())` if the command is safe, or `Err(msg)` describing
     /// which pattern was matched.
     pub fn check_command(&self, cmd: &str) -> Result<(), String> {
+        // Hard-block critical destructive patterns (always on, independent of config)
+        const HARD_BLOCKS: &[&str] = &[
+            r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|--force\s+)*(/|/\*|~|--no-preserve-root)",
+            r"mkfs\.",
+            r"dd\s+if=",
+            r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
+            r"chmod\s+-R\s+777\s+/",
+            r"sudo\s+rm\s+",
+            r">\s*/dev/sd[a-z]",
+            r"curl\s+.*\|\s*(ba)?sh",
+            r"wget\s+.*\|\s*(ba)?sh",
+        ];
+        for pat in HARD_BLOCKS {
+            if let Ok(re) = Regex::new(pat) {
+                if re.is_match(cmd) {
+                    return Err(format!(
+                        "Blocked command: '{cmd}' matches critical safety pattern"
+                    ));
+                }
+            }
+        }
+
         for pat in &self.blocked_patterns {
             if pat.is_match(cmd) {
                 return Err(format!(
@@ -145,7 +170,7 @@ impl SafetyGuard {
             Err(_) => {
                 // Path doesn't exist on disk yet — find the longest existing
                 // ancestor, canonicalize it, then check containment.
-                let existing_ancestor = find_existing_ancestor(&normalized);
+                let existing_ancestor = find_existing_ancestor(&normalized, project_root);
                 let canon_ancestor = existing_ancestor.canonicalize().map_err(|e| {
                     format!("Failed to canonicalize ancestor '{}': {}", existing_ancestor.display(), e)
                 })?;
@@ -170,14 +195,15 @@ impl SafetyGuard {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Walk up from `path` to find the longest ancestor that exists on disk.
-fn find_existing_ancestor(path: &Path) -> PathBuf {
+/// Falls back to `project_root` when reaching the filesystem root.
+fn find_existing_ancestor(path: &Path, project_root: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
     while !current.exists() {
         if let Some(parent) = current.parent() {
             current = parent.to_path_buf();
         } else {
-            // Reached filesystem root — fallback to "."
-            return PathBuf::from(".");
+            // Reached filesystem root — fallback to project_root
+            return project_root.to_path_buf();
         }
     }
     current

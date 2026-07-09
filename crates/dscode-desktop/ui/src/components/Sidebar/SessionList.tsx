@@ -8,6 +8,7 @@ interface Props {
   activeId: string | null;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
+  onRename: (id: string, title: string) => void;
 }
 
 const LABELS: Record<SessionGroup, string> = {
@@ -18,7 +19,7 @@ const LABELS: Record<SessionGroup, string> = {
   Older: '更早',
 };
 
-export default function SessionList({ sessions, activeId, onSelect, onDelete }: Props) {
+export default function SessionList({ sessions, activeId, onSelect, onDelete, onRename }: Props) {
   const groups = useMemo(() => groupSessions(sessions), [sessions]);
   const order: SessionGroup[] = ['Today', 'Yesterday', 'This Week', 'This Month', 'Older'];
 
@@ -70,6 +71,7 @@ export default function SessionList({ sessions, activeId, onSelect, onDelete }: 
                 isActive={s.id === activeId}
                 onSelect={onSelect}
                 onDelete={onDelete}
+                onRename={onRename}
               />
             ))}
           </div>

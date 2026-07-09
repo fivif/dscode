@@ -6,7 +6,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use crate::agent::stream::{StreamEvent, ToolStatus};
+use tracing::warn;
+
+use crate::agent::stream::StreamEvent;
 use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 
 /// Commands or command patterns that are unconditionally blocked.
@@ -21,6 +23,39 @@ const DANGEROUS_COMMANDS: &[&str] = &[
     "sudo rm",
     "sudo mv",
 ];
+
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10MB
+
+/// Kill an entire Unix process group (negative pid). No-op on non-Unix / invalid pid.
+/// Used after the main shell exits so background children (`cmd &`) cannot keep
+/// stdout/stderr pipes open and hang the tool forever.
+fn kill_process_group(pgid: Option<u32>) {
+    #[cfg(unix)]
+    {
+        let Some(pid) = pgid.filter(|&p| p > 1) else {
+            return;
+        };
+        let pid = pid as i32;
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        const SIGKILL: i32 = 9;
+        // TERM first so well-behaved children can exit cleanly
+        let _ = unsafe { kill(-pid, SIGTERM) };
+        // Brief grace, then KILL remaining (including zombies' group mates)
+        std::thread::sleep(Duration::from_millis(80));
+        let r = unsafe { kill(-pid, SIGKILL) };
+        if r != 0 {
+            // ESRCH = already gone — expected when no orphans
+            tracing::debug!(pgid = pid, "kill process group finished (may already be empty)");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+    }
+}
 
 /// Check whether a command string contains any blocked dangerous pattern.
 fn is_dangerous(command: &str) -> Option<&'static str> {
@@ -77,10 +112,10 @@ impl Tool for DoBash {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the project working directory. \
-         Captures stdout and stderr. Commands are subject to a timeout. \
-         Use this to run build commands, linters, tests, git operations, \
-         file listing, and other shell tasks."
+        "Execute a short shell command and wait for it to finish (timeout applies). \
+         Good for: ls, git, tests, one-shot builds, curl checks. \
+         NEVER use for long-running servers/watchers (vite, npm run dev, cargo watch) — \
+         those hang this tool forever; use do_background instead, then do_task_kill to stop."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -129,16 +164,19 @@ impl Tool for DoBash {
             ));
         }
 
+        if let Err(reason) = ctx.safety_guard.check_command(command) {
+            return Ok(ToolResult::err(
+                "",
+                format!("Blocked command: {reason}"),
+            ));
+        }
+
         let timeout_secs = args["timeout"]
             .as_u64()
             .unwrap_or(self.default_timeout_secs)
             .min(600);
         // T4: Minimum timeout of 5 seconds to prevent zero-timeout immediate failures
         let timeout_secs = timeout_secs.max(5);
-
-        let description = args["description"]
-            .as_str()
-            .unwrap_or("executing command");
 
         // T5: Verify working directory exists
         if !ctx.working_dir.exists() {
@@ -154,14 +192,6 @@ impl Tool for DoBash {
                 ctx.working_dir.display()
             )));
         }
-
-        // Emit ToolStart
-        let _ = ctx.sender.send(StreamEvent::ToolStart {
-            id: ctx.tool_call_id.clone(),
-            name: self.name().into(),
-            description: description.into(),
-            arguments: String::new(),
-        });
 
         // Emit ToolProgress with a description
         let _ = ctx.sender.send(StreamEvent::ToolProgress {
@@ -189,6 +219,9 @@ impl Tool for DoBash {
         let mut child = cmd.spawn().map_err(|e| {
             ToolError::Internal(format!("Failed to spawn command: {}", e))
         })?;
+
+        // process_group(0) ⇒ child's pid is the process-group id. Capture before wait/reap.
+        let pgid: Option<u32> = child.id();
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -240,27 +273,63 @@ impl Tool for DoBash {
         let exit_status = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait())
             .await;
 
-        // T2: Await reader tasks so all output is consumed before we drain channels.
-        // Drop the senders so channels close when tasks finish.
+        // Always reap the process group after the shell exits (or on timeout).
+        //
+        // Bug we hit: `npx vite &; …; echo done` — bash prints "done" and exits, but
+        // background vite still holds the inherited stdout/stderr write ends. Reader
+        // tasks then never see EOF → do_bash hangs "running" forever (until tool timeout).
+        // Killing the process group closes those pipes so readers finish.
+        if exit_status.is_err() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        kill_process_group(pgid);
+
+        // Drop our channel senders (reader tasks hold the other clones until they exit).
         drop(tx_out);
         drop(tx_err);
 
-        // Await reader tasks to completion — they will finish when their pipes close
-        if let Some(h) = stdout_handle {
-            let _ = h.await;
-        }
-        if let Some(h) = stderr_handle {
-            let _ = h.await;
+        // Bounded wait for readers — never block the tool on orphan pipe holders.
+        let reader_deadline = Duration::from_secs(2);
+        let readers = async {
+            if let Some(h) = stdout_handle {
+                let _ = h.await;
+            }
+            if let Some(h) = stderr_handle {
+                let _ = h.await;
+            }
+        };
+        if tokio::time::timeout(reader_deadline, readers).await.is_err() {
+            warn!(
+                "do_bash: stdout/stderr readers still open after {reader_deadline:?} \
+                 (orphaned background process holding pipes?); collecting partial output"
+            );
         }
 
         match exit_status {
             Ok(Ok(status)) => {
                 let mut output = String::new();
+                let mut total_bytes: usize = 0;
                 while let Ok(chunk) = rx_out.try_recv() {
+                    total_bytes += chunk.len();
+                    if total_bytes > MAX_OUTPUT_BYTES {
+                        output.push_str("\n[output truncated at 10MB]\n");
+                        break;
+                    }
                     output.push_str(&chunk);
                 }
-                while let Ok(chunk) = rx_err.try_recv() {
-                    output.push_str(&chunk);
+                while total_bytes <= MAX_OUTPUT_BYTES {
+                    match rx_err.try_recv() {
+                        Ok(chunk) => {
+                            total_bytes += chunk.len();
+                            if total_bytes > MAX_OUTPUT_BYTES {
+                                output.push_str("\n[output truncated at 10MB]\n");
+                                break;
+                            }
+                            output.push_str(&chunk);
+                        }
+                        Err(_) => break,
+                    }
                 }
 
                 let success = status.success();
@@ -275,42 +344,14 @@ impl Tool for DoBash {
                     )
                 };
 
-                let _ = ctx.sender.send(StreamEvent::ToolEnd {
-                    id: ctx.tool_call_id.clone(),
-                    status: if success {
-                        ToolStatus::Success
-                    } else {
-                        ToolStatus::Error
-                    },
-                    result: result.output.clone(),
-                });
-
                 Ok(result)
             }
             Ok(Err(e)) => {
                 let msg = format!("Command failed: {}", e);
-                let _ = ctx.sender.send(StreamEvent::ToolEnd {
-                    id: ctx.tool_call_id.clone(),
-                    status: ToolStatus::Error,
-                    result: msg.clone(),
-                });
                 Ok(ToolResult::err("", msg))
             }
             Err(_elapsed) => {
-                // T3: Timeout — kill the entire process group, not just the child
-                #[cfg(unix)]
-                {
-                    let pid = child.id().unwrap_or(0) as i32;
-                    if pid > 0 {
-                        // SIGKILL = 9 on all unix platforms
-                        const SIGKILL: i32 = 9;
-                        extern "C" {
-                            fn kill(pid: i32, sig: i32) -> i32;
-                        }
-                        // Send SIGKILL to the entire process group (negative pid = pgid)
-                        unsafe { kill(-pid, SIGKILL) };
-                    }
-                }
+                // Process was already killed in the pre-await block above.
 
                 // Drain any remaining output
                 while let Ok(chunk) = rx_out.try_recv() {
@@ -321,12 +362,6 @@ impl Tool for DoBash {
                     let _ = chunk;
                 }
 
-                let msg = format!("Command timed out after {}s", timeout_secs);
-                let _ = ctx.sender.send(StreamEvent::ToolEnd {
-                    id: ctx.tool_call_id.clone(),
-                    status: ToolStatus::Error,
-                    result: msg.clone(),
-                });
                 Err(ToolError::Timeout(timeout_secs))
             }
         }
@@ -347,6 +382,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_echo".into(),
             sender: tx,
+            safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         };
 
         let result = tool
@@ -364,6 +400,44 @@ mod tests {
         assert!(result.output.contains("hello"));
     }
 
+    /// Background jobs inherit stdout; without process-group cleanup, readers hang.
+    #[tokio::test]
+    async fn test_bash_background_job_does_not_hang_tool() {
+        let tool = DoBash::with_timeout(15);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = ToolContext {
+            working_dir: PathBuf::from("/tmp"),
+            session_id: "test".into(),
+            tool_call_id: "call_bg".into(),
+            sender: tx,
+            safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        };
+
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "sleep 120 & echo --- done ---",
+                    "description": "Background sleep must not hang do_bash"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "do_bash hung on background job ({:?})",
+            started.elapsed()
+        );
+        assert!(result.success, "output={}", result.output);
+        assert!(
+            result.output.contains("--- done ---"),
+            "output={}",
+            result.output
+        );
+    }
+
     #[tokio::test]
     async fn test_bash_failing_command() {
         let tool = DoBash::new();
@@ -373,6 +447,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_fail".into(),
             sender: tx,
+            safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         };
 
         let result = tool
@@ -399,6 +474,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_empty".into(),
             sender: tx,
+            safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         };
 
         let result = tool
@@ -424,6 +500,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_timeout".into(),
             sender: tx,
+            safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         };
 
         let result = tool

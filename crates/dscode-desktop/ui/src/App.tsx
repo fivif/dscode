@@ -10,9 +10,7 @@ import { useConfigStore } from '@/stores/configStore';
 import { useChatStore } from '@/stores/chatStore';
 import { useSessionStore } from '@/stores/sessionStore';
 
-type Page = 'chat' | 'settings' | 'mcp' | 'skills' | 'wiki';
-
-import WikiPage from '@/components/Settings/WikiPage';
+type Page = 'chat' | 'settings' | 'mcp' | 'skills';
 
 export default function App() {
   const [page, setPage] = useState<Page>('chat');
@@ -78,13 +76,12 @@ export default function App() {
         {page === 'chat' && (
           <>
             <ChatArea />
-            <InputBox onOpenWiki={() => setPage('wiki')} />
+            <InputBox />
           </>
         )}
         {page === 'settings' && <SettingsPage onBack={() => setPage('chat')} />}
         {page === 'mcp' && <McpPage onBack={() => setPage('chat')} />}
         {page === 'skills' && <SkillsPage onBack={() => setPage('chat')} />}
-        {page === 'wiki' && <WikiPage onBack={() => setPage('chat')} />}
       </main>
     </div>
   );

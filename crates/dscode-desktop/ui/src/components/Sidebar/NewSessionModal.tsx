@@ -24,8 +24,10 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
     setLoading(true);
     setError('');
     try {
-      const t = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-      const session = await createSession(`对话 ${t}`, workspace);
+      // Provisional title from workspace folder; auto-renamed on first message
+      const folder = workspace.split(/[/\\]/).filter(Boolean).pop();
+      const title = folder ? folder : '新对话';
+      const session = await createSession(title, workspace);
       if (session) {
         onCreated(session.id);
         onClose();

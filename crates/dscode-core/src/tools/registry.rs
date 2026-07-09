@@ -1,37 +1,37 @@
 //! ToolRegistry — the agent's collection of available tools.
 //!
 //! Provides registration, lookup, and schema generation for the LLM API
-//! (OpenAI-compatible tools array).
+//! (OpenAI-compatible tools array). Supports runtime registration (MCP).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::providers::trait_def::ToolDef;
 use crate::tools::trait_def::{Tool, ToolError, ToolResult};
 
 /// A thread-safe registry of all tools available to the agent.
 ///
-/// Tools are stored behind `Arc<Box<dyn Tool>>` so they can be shared
-/// across the agent loop and dispatched concurrently.
+/// Tools are stored behind `Arc` so they can be shared across the agent loop.
+/// Interior mutability allows MCP tools to be registered after startup.
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<Box<dyn Tool>>>,
+    tools: RwLock<HashMap<String, Arc<Box<dyn Tool>>>>,
 }
 
 impl ToolRegistry {
     /// Create a new, empty tool registry.
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register a tool under its `name()`.
     ///
-    /// Panics if a tool with the same name is already registered
-    /// (build-time configuration, not runtime).
+    /// Panics if a tool with the same name is already registered.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         let name = tool.name().to_string();
-        let prev = self.tools.insert(name.clone(), Arc::new(Box::new(tool)));
+        let mut map = self.tools.write().expect("tool registry lock");
+        let prev = map.insert(name.clone(), Arc::new(Box::new(tool)));
         assert!(
             prev.is_none(),
             "Tool '{}' is already registered — each tool must have a unique name",
@@ -39,14 +39,25 @@ impl ToolRegistry {
         );
     }
 
+    /// Register or replace a tool (used for MCP hot-reload).
+    pub fn register_or_replace<T: Tool + 'static>(&self, tool: T) {
+        let name = tool.name().to_string();
+        let mut map = self.tools.write().expect("tool registry lock");
+        map.insert(name, Arc::new(Box::new(tool)));
+    }
+
+    /// Remove tools matching a predicate (e.g. all `mcp_*`).
+    pub fn unregister_where(&self, pred: impl Fn(&str) -> bool) {
+        let mut map = self.tools.write().expect("tool registry lock");
+        map.retain(|name, _| !pred(name));
+    }
+
     /// Look up a tool by name. Returns `None` if not found.
     pub fn get(&self, name: &str) -> Option<Arc<Box<dyn Tool>>> {
-        self.tools.get(name).cloned()
+        self.tools.read().expect("tool registry lock").get(name).cloned()
     }
 
     /// Execute a tool by name with the given arguments and context.
-    ///
-    /// Returns `ToolError::NotFound` if the tool is not registered.
     pub async fn execute(
         &self,
         name: &str,
@@ -61,35 +72,47 @@ impl ToolRegistry {
 
     /// Return all registered tool names.
     pub fn list_tools(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.tools.keys().cloned().collect();
+        let map = self.tools.read().expect("tool registry lock");
+        let mut names: Vec<String> = map.keys().cloned().collect();
         names.sort();
         names
     }
 
+    /// Tool name + description pairs for UI.
+    pub fn list_tools_detailed(&self) -> Vec<(String, String)> {
+        let map = self.tools.read().expect("tool registry lock");
+        let mut out: Vec<_> = map
+            .values()
+            .map(|t| (t.name().to_string(), t.description().to_string()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Produce the OpenAI-compatible `Vec<ToolDef>` for sending in API requests.
     pub fn to_openai_tools(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| t.to_openai_tool()).collect()
+        let map = self.tools.read().expect("tool registry lock");
+        map.values().map(|t| t.to_openai_tool()).collect()
     }
 
     /// Register the default set of built-in tools.
-    ///
-    /// This is a convenience method that wires up `do_bash`, `do_file_read`,
-    /// `do_file_write`, and `do_file_edit` in one call.
     pub fn register_default_tools(&mut self) {
         self.register(crate::tools::bash::DoBash::new());
         self.register(crate::tools::file_ops::DoFileRead::new());
         self.register(crate::tools::file_ops::DoFileWrite::new());
         self.register(crate::tools::file_ops::DoFileEdit::new());
+        self.register(crate::tools::skill_ops::DoSkillList::new());
+        self.register(crate::tools::skill_ops::DoSkillInstall::new());
     }
 
     /// Return the number of registered tools.
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.tools.read().expect("tool registry lock").len()
     }
 
     /// Return true if no tools are registered.
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools.read().expect("tool registry lock").is_empty()
     }
 }
 
@@ -164,6 +187,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_1".into(),
             sender: tx,
+            safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         };
 
         let result = reg.execute("do_stub", serde_json::json!({}), &ctx).await;
@@ -182,6 +206,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_1".into(),
             sender: tx,
+            safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         };
 
         let result = reg.execute("nonexistent", serde_json::json!({}), &ctx).await;

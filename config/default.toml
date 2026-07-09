@@ -1,0 +1,89 @@
+# DS Code — Configuration Template
+#
+# Copy this file to ~/.dscode/config.toml and customize.
+# All fields are optional — defaults are shown below.
+
+# ── Default Model ─────────────────────────────────────────────
+default_model = "deepseek/deepseek-v4-pro"
+
+# Optional: lightweight model for routing/classification tasks
+# router_model = "deepseek/deepseek-v4-lite"
+
+# ── LLM Providers ─────────────────────────────────────────────
+
+[providers.deepseek]
+api_key = "sk-your-deepseek-api-key"
+base_url = "https://api.deepseek.com/v1"
+enabled = true
+
+[providers.openai]
+api_key = "sk-your-openai-api-key"
+base_url = "https://api.openai.com/v1"
+enabled = false
+
+[providers.anthropic]
+api_key = "sk-ant-your-anthropic-api-key"
+base_url = "https://api.anthropic.com/v1"
+enabled = false
+
+[providers.ollama]
+api_key = ""
+base_url = "http://localhost:11434/v1"
+enabled = false
+
+# ── Context Window ────────────────────────────────────────────
+
+[context]
+# Maximum context window size in tokens
+window_tokens = 1000000
+
+# Compression triggers when usage exceeds this fraction of window
+compress_threshold = 0.8
+
+# ── Generation Parameters ─────────────────────────────────────
+
+[generation]
+max_tokens = 8192
+temperature = 0.7
+reasoning_effort = "medium"    # "low" | "medium" | "high" (DeepSeek R1)
+
+# ── Session ───────────────────────────────────────────────────
+
+[session]
+# Auto-delete sessions older than N days (0 = keep forever). PRD default: 30.
+retention_days = 30
+
+# ── Safety ────────────────────────────────────────────────────
+
+[safety]
+# Timeout for tool execution (seconds)
+tool_timeout_secs = 120
+
+# Maximum tool execution timeout (seconds, hard cap)
+max_timeout_secs = 600
+
+# Blocked command patterns (regex)
+blocked_patterns = [
+    "rm\\s+-rf\\s+/",
+    "mkfs\\.",
+    "dd\\s+if=",
+    ":\\s*\\(\\s*\\)\\s*\\{\\s*:\\s*\\|\\s*:\\s*\\&\\s*\\}\\s*;\\s*:",
+    "chmod\\s+-R\\s+777\\s+/",
+    "sudo\\s+rm",
+    "sudo\\s+mv",
+]
+
+# Allowed commands (if set, only these commands can run)
+# allowed_commands = ["git", "cargo", "npm", "pnpm", "yarn", "ls", "cat", "grep", "find"]
+
+# ── Extensions ────────────────────────────────────────────────
+
+[extensions]
+# MCP server configurations
+# [[extensions.mcp_servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+
+# Skills directory (YAML .skill.md files)
+# skills_dir = "~/.dscode/skills"

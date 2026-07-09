@@ -209,7 +209,9 @@ mod tests {
         > {
             unimplemented!()
         }
-    }
+    
+    fn clone_box(&self) -> Box<dyn LlmProvider> { panic!("clone_box not used in tests") }
+}
 
     // ------------------------------------------------------------------
     // Parsing tests (unit)

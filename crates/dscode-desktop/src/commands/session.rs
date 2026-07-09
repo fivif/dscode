@@ -103,6 +103,22 @@ pub async fn update_session_workspace(
     sm.update_workspace(&session_id, &workspace)
 }
 
+/// Rename a session (manual rename from sidebar).
+#[tauri::command]
+pub async fn update_session_title(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    info!(%session_id, %title, "session: rename");
+    state.ensure_session_manager().await?;
+    let sm_guard = state.session_manager.lock().await;
+    let sm = sm_guard
+        .as_ref()
+        .ok_or_else(|| "Session manager not initialized".to_string())?;
+    sm.update_title(&session_id, &title)
+}
+
 /// Delete a session and all its messages.
 #[tauri::command]
 pub async fn delete_session(

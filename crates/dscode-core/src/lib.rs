@@ -6,7 +6,6 @@
 //! - Multi-provider LLM adapters
 //! - Tool registry with sandboxed execution
 //! - MAGI three-brain auto-spiral scheduler
-//! - Two-layer knowledge wiki
 //! - Multi-agent team dispatch
 //! - Plan interview engine
 //! - MCP + SKILLS extension system
@@ -23,7 +22,6 @@ pub mod safety;
 pub mod session;
 pub mod teams;
 pub mod tools;
-pub mod wiki;
 
 pub mod prelude {
     pub use crate::agent::forge::Forge;

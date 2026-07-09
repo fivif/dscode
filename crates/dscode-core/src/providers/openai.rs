@@ -25,7 +25,8 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
-        let client = build_client("");
+        let client = crate::config::settings::build_http_client(None)
+            .expect("Failed to build HTTP client");
         Self {
             api_key,
             base_url,
@@ -45,6 +46,8 @@ impl OpenAiProvider {
                 api_key: String::new(),
                 base_url: "https://api.deepseek.com/v1".into(),
                 enabled: true,
+                use_proxy: false,
+                ..Default::default()
             });
 
         let mut base_url = provider_conf.base_url.trim_end_matches('/').to_string();
@@ -59,7 +62,8 @@ impl OpenAiProvider {
             None => model.to_string(),
         };
 
-        let client = build_client(&conf.generation.proxy_url);
+        let client = crate::config::settings::build_http_client(conf.proxy_for_model(model))
+            .expect("Failed to build HTTP client");
 
         Self {
             api_key: provider_conf.api_key,
@@ -71,19 +75,6 @@ impl OpenAiProvider {
             client,
         }
     }
-}
-
-/// Build a reqwest Client with optional proxy support.
-fn build_client(proxy_url: &str) -> Client {
-    let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(180));
-    if !proxy_url.is_empty() {
-        let proxy = reqwest::Proxy::all(proxy_url)
-            .expect("Failed to build proxy");
-        builder = builder.proxy(proxy);
-    }
-    builder.build().expect("Failed to build HTTP client")
 }
 
 #[async_trait]
@@ -227,6 +218,18 @@ impl LlmProvider for OpenAiProvider {
 
         Ok(Box::pin(stream))
     }
+
+    fn clone_box(&self) -> Box<dyn LlmProvider> {
+        Box::new(Self {
+            api_key: self.api_key.clone(),
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            reasoning_effort: self.reasoning_effort.clone(),
+            client: self.client.clone(),
+        })
+    }
 }
 
 impl OpenAiProvider {
@@ -339,8 +342,6 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
         usage: None,
     };
 
-    let mut has_valid_data = false;
-
     for line in text.lines() {
         let data = match line.strip_prefix("data: ") {
             Some(d) => d.trim(),
@@ -351,7 +352,6 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
             if result.finish_reason.is_none() {
                 result.finish_reason = Some("stop".into());
             }
-            has_valid_data = true;
             continue;
         }
         if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
@@ -364,15 +364,13 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
                                 result.content.as_deref().unwrap_or(""),
                                 c
                             ));
-                            has_valid_data = true;
-                        }
+                                        }
                         if let Some(rc) = delta["reasoning_content"].as_str() {
                             // P3: Accumulate reasoning_content across deltas with push_str / +=
                             let mut accumulated = result.reasoning_content.unwrap_or_default();
                             accumulated.push_str(rc);
                             result.reasoning_content = Some(accumulated);
-                            has_valid_data = true;
-                        }
+                                        }
                         // Accumulate tool calls from delta
                         if let Some(tc_deltas) = delta["tool_calls"].as_array() {
                             let mut parsed: Vec<ToolCallDelta> = vec![];
@@ -390,14 +388,12 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
                             }
                             if !parsed.is_empty() {
                                 result.tool_calls = Some(parsed);
-                                has_valid_data = true;
-                            }
+                                                }
                         }
                     }
                     if let Some(fr) = choice["finish_reason"].as_str() {
                         result.finish_reason = Some(fr.to_string());
-                        has_valid_data = true;
-                    }
+                                }
                 }
             }
             if let Some(usage) = chunk.get("usage") {
@@ -411,15 +407,13 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
                         .as_u64()
                         .unwrap_or(0),
                 });
-                has_valid_data = true;
-            }
+                }
         }
     }
 
-    // P9: Filter out empty chunks — return Err to signal "no meaningful data"
-    if !has_valid_data {
-        return Err(ProviderError::Parse("Empty SSE chunk".into()));
-    }
-
+    // If no meaningful data was found (e.g., keep-alive frame "data:\n"),
+    // return an all-None chunk. The caller safely ignores it — all fields
+    // are Optional and the forge consumer gates every access on is_some().
+    // This is normal SSE protocol behavior, not an error.
     Ok(result)
 }

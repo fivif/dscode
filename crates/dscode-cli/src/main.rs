@@ -5,7 +5,7 @@ use dscode_core::{
     agent::forge::Forge,
     agent::stream::StreamEvent,
     config::settings::Config,
-    providers::openai::OpenAiProvider,
+    providers::create_provider,
     providers::trait_def::{Message, MessageContent, Role},
     session::manager::SessionManager,
     tools::registry::ToolRegistry,
@@ -18,11 +18,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let message = if args.len() > 1 {
-        args[1..].join(" ")
+    let (teams_mode, message) = if args.len() > 1 && args[1] == "--teams" {
+        (true, args[2..].join(" "))
+    } else if args.len() > 1 {
+        (false, args[1..].join(" "))
     } else {
-        eprintln!("Usage: dscode-cli <message>");
-        eprintln!("Example: dscode-cli \"List all .rs files\"");
+        eprintln!("Usage: dscode-cli [--teams] <message>");
         std::process::exit(1);
     };
 
@@ -30,8 +31,9 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let working_dir = std::env::current_dir()?;
 
-    // Setup provider
-    let provider = OpenAiProvider::from_config(&config.default_model, &config);
+    // Setup provider (OpenAI-compat or Anthropic based on model)
+    let provider = create_provider(&config.default_model, &config)
+        .map_err(|e| anyhow::anyhow!("Provider: {e}"))?;
 
     // Setup tools
     let mut registry = ToolRegistry::new();
@@ -41,7 +43,8 @@ async fn main() -> Result<()> {
     let registry = Arc::new(registry);
 
     // Setup forge
-    let forge = Forge::new(Box::new(provider), registry.clone(), working_dir.clone());
+    let forge = Forge::new(provider, registry.clone(), working_dir.clone())
+        .with_teams_mode(teams_mode);
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
     // Create initial session
@@ -110,6 +113,19 @@ async fn main() -> Result<()> {
                         u.output_tokens as f64 / 1000.0,
                     );
                 }
+            }
+            StreamEvent::TeamAgentStart { agent_id, task } => {
+                println!("  🔵 {} started: {}", agent_id, task.chars().take(60).collect::<String>());
+            }
+            StreamEvent::TeamAgentOutput { agent_id, content } => {
+                print!("  [{}] {}", agent_id, content);
+            }
+            StreamEvent::TeamAgentEnd { agent_id, success, summary } => {
+                let icon = if success { "✅" } else { "❌" };
+                println!("\n  {icon} {} done: {}", agent_id, summary);
+            }
+            StreamEvent::TeamComplete { completed, failed } => {
+                println!("\n--- Teams: {} done, {} failed ---", completed, failed);
             }
             _ => {}
         }

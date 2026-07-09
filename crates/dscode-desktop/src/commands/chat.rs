@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use dscode_core::agent::forge::Forge;
 use dscode_core::agent::stream::StreamEvent;
-use dscode_core::providers::openai::OpenAiProvider;
+use dscode_core::providers::create_provider;
 use dscode_core::providers::trait_def::{FunctionCall, Message, MessageContent, Role, ToolCall};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -16,65 +16,47 @@ use crate::events;
 /// Send a user message to the agent and stream the response back to the
 /// frontend via `stream-event` Tauri events.
 ///
-/// # Flow
-/// 1. Acquires a per-session mutex to prevent concurrent sends to the same session.
-/// 2. Reads the current config and creates an [`OpenAiProvider`].
-/// 3. Loads conversation history from the session manager.
-/// 4. Persists the user message to the session.
-/// 5. Builds a [`Forge`] with registered tools and the current working dir.
-/// 6. Spawns a background Tokio task that runs `forge.execute()` and relays
-///    every [`StreamEvent`] to the frontend.
-/// 7. Stores the task handle and [`CancellationToken`] so the frontend can abort it.
+/// `attachments` — optional absolute file paths (from dialog / staged uploads).
+/// Files are copied into the workspace `.dscode/uploads/` and described in the
+/// prompt so the agent can open them with tools.
 #[tauri::command]
 pub async fn send_message(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
     session_id: String,
     message: String,
+    teams_mode: bool,
+    attachments: Option<Vec<String>>,
 ) -> Result<(), String> {
-    info!(%session_id, msg_len = message.len(), "chat: send_message");
+    let att_n = attachments.as_ref().map(|a| a.len()).unwrap_or(0);
+    info!(%session_id, msg_len = message.len(), teams_mode, att_n, "chat: send_message");
+
+    // Toggle teams_mode in persistent state based on the message.
+    if message.trim().eq_ignore_ascii_case("/teams") || message.trim().eq_ignore_ascii_case("/teams on") {
+        state.teams_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else if message.trim().eq_ignore_ascii_case("/teams off") || message.trim().eq_ignore_ascii_case("/teams stop") {
+        state.teams_mode.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // DB5: Per-session mutex — prevent concurrent sends to the same session.
     let _session_guard = state.acquire_session_lock(&session_id).await;
 
-    // 1. Read config and create provider.
-    let (api_key, base_url, model, max_tokens, temperature, reasoning_effort, context_cfg) = {
+    // 1. Read config and create the correct provider (OpenAI-compat / Anthropic).
+    let (provider, context_cfg, system_prompt) = {
         let config = state.config.lock().await;
-        let pc = config
-            .provider_for_model(&config.default_model)
-            .ok_or_else(|| format!("No provider config for model '{}'", config.default_model))?;
-        (
-            pc.api_key.clone(),
-            pc.base_url.clone(),
-            config.default_model.clone(),
-            config.generation.max_tokens,
-            config.generation.temperature,
-            config.generation.reasoning_effort.clone(),
-            config.context.clone(),
-        )
+        let model = config.default_model.clone();
+        let provider = create_provider(&model, &config)
+            .map_err(|e| format!("Failed to create provider for '{model}': {e}"))?;
+        let system_prompt = config
+            .agent
+            .resolve_system_prompt(dscode_core::agent::forge::DEFAULT_SYSTEM_PROMPT);
+        (provider, config.context.clone(), system_prompt)
     };
-
-    // Strip provider prefix from model name (e.g. "openai/gpt-4o" -> "gpt-4o").
-    let actual_model = match model.split_once('/') {
-        Some((_, m)) => m.to_string(),
-        None => model.clone(),
-    };
-
-    // Ensure /v1 path for OpenAI-compatible endpoints
-    let mut base_url = base_url.trim_end_matches('/').to_string();
-    if !base_url.ends_with("/v1") && !base_url.contains("/v1/") {
-        base_url = format!("{}/v1", base_url);
-    }
-
-    let mut provider = OpenAiProvider::new(api_key, base_url, actual_model);
-    provider.max_tokens = max_tokens;
-    provider.temperature = temperature;
-    provider.reasoning_effort = Some(reasoning_effort);
 
     // DB4: Hold session_manager lock once for all session DB operations.
     state.ensure_session_manager().await?;
 
-    let (history, working_dir) = {
+    let (history, working_dir, full_message) = {
         let sm_guard = state.session_manager.lock().await;
         let sm = sm_guard
             .as_ref()
@@ -85,12 +67,26 @@ pub async fn send_message(
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
         let history = session.messages;
 
-        // 3. Persist the user message.
+        let wd = if session.workspace.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        } else {
+            PathBuf::from(&session.workspace)
+        };
+
+        let paths = attachments.unwrap_or_default();
+        let full_message = crate::attachments::build_message_with_attachments(
+            &message,
+            &paths,
+            &wd,
+            &session_id,
+        )?;
+
+        // 3. Persist the user message (with attachment context for history continuity).
         sm.add_message(
             &session_id,
             &Message {
                 role: Role::User,
-                content: MessageContent::Text(message.clone()),
+                content: MessageContent::Text(full_message.clone()),
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
@@ -99,22 +95,40 @@ pub async fn send_message(
             },
         )?;
 
-        let wd = if session.workspace.is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        // Auto-name from user-visible text when possible
+        let title_src = if message.trim().is_empty() && !paths.is_empty() {
+            format!(
+                "附件: {}",
+                paths
+                    .iter()
+                    .filter_map(|p| PathBuf::from(p).file_name()?.to_str().map(|s| s.to_string()))
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         } else {
-            PathBuf::from(&session.workspace)
+            message.clone()
         };
+        if let Ok(Some(new_title)) = sm.maybe_auto_title(&session_id, &title_src) {
+            info!(%session_id, %new_title, "session: auto-titled");
+            let _ = app_handle.emit(
+                "session-title-updated",
+                serde_json::json!({ "session_id": session_id, "title": new_title }),
+            );
+        }
 
-        (history, wd)
+        (history, wd, full_message)
     };
 
-    // 4. Build the Forge using the session's workspace.
+    // 4. Build the Forge using the session's workspace + global system prompt.
     let forge = Forge::new(
-        Box::new(provider),
+        provider,
         state.tool_registry.clone(),
         working_dir,
     )
-    .with_context_config(context_cfg);
+    .with_system_prompt(system_prompt)
+    .with_context_config(context_cfg)
+    .with_teams_mode(teams_mode);
 
     // 5. Spawn the agent loop in a background task with cancellation support.
     let app_handle_clone = app_handle.clone();
@@ -126,10 +140,6 @@ pub async fn send_message(
     let event_loop_cancel = cancel.clone();
     let forge_cancel = cancel.clone();
 
-    // Clone conversation history for background wiki ingestion after forge completes.
-    let ingest_messages = history.clone();
-    let ingest_sid = session_id.clone();
-
     let handle = tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
@@ -138,7 +148,7 @@ pub async fn send_message(
             tokio::select! {
                 biased;
                 _ = forge_cancel.cancelled() => Ok(()),
-                result = forge.execute(&message, &session_id_clone, history, tx) => result,
+                result = forge.execute(&full_message, &session_id_clone, history, tx) => result,
             }
         });
 
@@ -307,49 +317,32 @@ pub async fn send_message(
             }
         }
         drop(sm_guard);
-
-        // After forge completes, spawn background wiki ingestion.
-        tokio::spawn(async move {
-            dscode_core::wiki::ingestor::auto_ingest(ingest_sid, ingest_messages);
-        });
     });
 
-    // Store the handle and cancellation token so `abort` can cancel it.
-    {
-        let mut guard = state.active_forge_handle.lock().await;
-        if let Some(old) = guard.take() {
-            old.cancel.cancel();
-            old.handle.abort();
-        }
-        *guard = Some(ActiveForge { cancel, handle });
-    }
+    // Per-session forge — does NOT cancel other sessions' runs.
+    state.prune_finished_forges().await;
+    state
+        .set_active_forge(session_id.clone(), ActiveForge { cancel, handle })
+        .await;
 
     Ok(())
 }
 
-/// Abort the currently running forge task.
+/// Abort the forge task for a specific session.
 ///
-/// This cancels the [`CancellationToken`] shared with the forge and event-loop
-/// tasks, causing both to stop. Accumulated assistant text and thinking content
-/// are persisted before the tasks exit. The frontend should treat this as an
-/// interrupted turn.
+/// Cancels only that session's agent turn; other concurrent sessions continue.
 #[tauri::command]
-pub async fn abort(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    info!("chat: abort requested");
-
-    let mut guard = state.active_forge_handle.lock().await;
-    if let Some(active) = guard.take() {
-        // DB3: Cancel the token — this stops both the forge (LLM call) and
-        // the event loop. The handle.abort() is a safety net.
-        active.cancel.cancel();
-        // Give tasks a moment to respond to cancellation.
+pub async fn abort(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    info!(%session_id, "chat: abort requested");
+    if state.abort_forge(&session_id).await {
+        // Brief yield so cancel handlers can persist partial content.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if !active.handle.is_finished() {
-            active.handle.abort();
-        }
-        info!("chat: forge task aborted");
+        info!(%session_id, "chat: forge task aborted");
     } else {
-        info!("chat: no active forge task to abort");
+        info!(%session_id, "chat: no active forge for session");
     }
     Ok(())
 }
@@ -357,29 +350,73 @@ pub async fn abort(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// List all registered tools (built-in + MCP).
 #[tauri::command]
 pub async fn list_tools(state: tauri::State<'_, AppState>) -> Result<Vec<ToolInfo>, String> {
-    Ok(state.tool_registry.list_tools().into_iter().map(|name| {
-        let desc = state.tool_registry.get(&name)
-            .map(|t| t.description().to_string())
-            .unwrap_or_default();
-        ToolInfo { name, description: desc }
-    }).collect())
+    Ok(state
+        .tool_registry
+        .list_tools_detailed()
+        .into_iter()
+        .map(|(name, description)| ToolInfo { name, description })
+        .collect())
 }
 
 #[derive(serde::Serialize, Clone)]
 pub struct ToolInfo { pub name: String, pub description: String }
 
-/// List all loaded skills.
+/// List all loaded skills (including bundled scripts/references/assets).
+/// Scans DS Code + Claude + agents.sh + project skill directories.
+/// Shows every package path (same name under different roots appears multiple times)
+/// so each copy can be deleted independently.
 #[tauri::command]
 pub async fn list_skills() -> Result<Vec<SkillInfo>, String> {
     let mut loader = dscode_core::extensions::skills::SkillLoader::new();
-    loader.load_from_dir(&dscode_core::extensions::skills::SkillLoader::default_skills_dir()).ok();
-    Ok(loader.list_all().iter().map(|s| SkillInfo {
-        name: s.name.clone(),
-        description: s.description.clone(),
-        triggers: s.triggers.clone(),
-        hidden: s.hidden,
-        body: s.body.clone(),
-    }).collect())
+    let count = loader
+        .load_all_packages(&[], None)
+        .map_err(|e| format!("加载 Skills 失败: {e}"))?;
+    info!(%count, "skills: listed (multi-path, all packages)");
+    Ok(loader
+        .list_all()
+        .iter()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            triggers: s.triggers.clone(),
+            hidden: s.hidden,
+            body: s.body.clone(),
+            root: s.root.display().to_string(),
+            resources: s
+                .resources
+                .iter()
+                .map(|r| SkillResourceInfo {
+                    relative_path: r.relative_path.clone(),
+                    absolute_path: r.absolute_path.clone(),
+                    kind: match r.kind {
+                        dscode_core::extensions::skills::SkillResourceKind::Script => {
+                            "script".into()
+                        }
+                        dscode_core::extensions::skills::SkillResourceKind::Reference => {
+                            "reference".into()
+                        }
+                        dscode_core::extensions::skills::SkillResourceKind::Asset => {
+                            "asset".into()
+                        }
+                        dscode_core::extensions::skills::SkillResourceKind::Other => {
+                            "other".into()
+                        }
+                    },
+                    size_bytes: r.size_bytes,
+                    executable: r.executable,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct SkillResourceInfo {
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub executable: bool,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -389,65 +426,174 @@ pub struct SkillInfo {
     pub triggers: Vec<String>,
     pub hidden: bool,
     pub body: String,
+    pub root: String,
+    pub resources: Vec<SkillResourceInfo>,
 }
 
-/// Create or update a skill file.
-#[tauri::command]
-pub async fn save_skill(name: String, description: String, body: String) -> Result<(), String> {
-    let dir = dscode_core::extensions::skills::SkillLoader::default_skills_dir().join(&name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create dir: {}", e))?;
-    let content = format!("---\nname: {}\ndescription: {}\n---\n\n{}", name, description, body);
-    std::fs::write(dir.join("SKILL.md"), content).map_err(|e| format!("Cannot write: {}", e))?;
-    Ok(())
+/// A file bundled into the skill package (scripts/references/assets).
+#[derive(serde::Deserialize, Clone)]
+pub struct SkillFileInput {
+    /// Relative path under skill root, e.g. `scripts/review.sh`
+    pub path: String,
+    pub content: String,
 }
 
-/// Delete a skill directory.
+/// Create or update a skill package.
+/// `triggers` optional; `files` optional bundled scripts/docs.
 #[tauri::command]
-pub async fn delete_skill(name: String) -> Result<(), String> {
-    let dir = dscode_core::extensions::skills::SkillLoader::default_skills_dir().join(&name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("Cannot delete: {}", e))?;
-    }
-    Ok(())
+pub async fn save_skill(
+    name: String,
+    description: String,
+    body: String,
+    triggers: Option<String>,
+    files: Option<Vec<SkillFileInput>>,
+) -> Result<String, String> {
+    let trigger_list: Vec<String> = triggers
+        .unwrap_or_default()
+        .split(|c| c == ',' || c == ';' || c == '\n' || c == '|' || c == '，' || c == '；')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let file_pairs: Vec<(String, String)> = files
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| (f.path, f.content))
+        .collect();
+
+    let path = dscode_core::extensions::skills::SkillLoader::save_skill(
+        &name,
+        &description,
+        &body,
+        &trigger_list,
+        &file_pairs,
+    )?;
+    info!(path = %path.display(), files = file_pairs.len(), "skills: saved package");
+    Ok(path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| path.display().to_string()))
 }
 
-/// Manually trigger wiki knowledge ingestion from a session's messages.
-///
-/// Reads the latest messages from the given session, extracts key facts,
-/// decisions, file edits, and errors, and persists them as knowledge nodes
-/// in the wiki engine. Runs in a background task — non-blocking.
+/// Write a single file into an existing skill package (scripts/references/assets).
 #[tauri::command]
-pub async fn wiki_ingest(
+pub async fn write_skill_file(
+    skill_name: String,
+    relative_path: String,
+    content: String,
+) -> Result<String, String> {
+    let path = dscode_core::extensions::skills::SkillLoader::write_skill_file(
+        &skill_name,
+        &relative_path,
+        &content,
+    )?;
+    Ok(path.display().to_string())
+}
+
+/// Reveal the skills root directory path (for Finder / file manager).
+#[tauri::command]
+pub async fn skills_dir() -> Result<String, String> {
+    Ok(dscode_core::extensions::skills::SkillLoader::default_skills_dir()
+        .display()
+        .to_string())
+}
+
+/// Install a third-party skill package from GitHub / skills.sh.
+/// Spec: `owner/repo` or `owner/repo/skill-path`.
+#[tauri::command]
+pub async fn install_skill_package(package: String) -> Result<String, String> {
+    info!(%package, "skills: install package");
+    let report =
+        dscode_core::extensions::skills::SkillLoader::install_from_spec(package.trim())?;
+    Ok(report.message)
+}
+
+/// Stage raw file bytes (paste / drag from webview) into session uploads.
+/// Returns absolute path for use in `send_message` attachments.
+#[tauri::command]
+pub async fn stage_upload(
     state: tauri::State<'_, AppState>,
     session_id: String,
-) -> Result<(), String> {
-    info!(%session_id, "wiki_ingest: manual trigger");
-
-    state.ensure_session_manager().await?;
-
-    let messages = {
+    name: String,
+    base64_data: String,
+) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data.trim())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if bytes.len() > crate::attachments::MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "File too large ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let workspace = {
+        state.ensure_session_manager().await?;
         let sm_guard = state.session_manager.lock().await;
         let sm = sm_guard
             .as_ref()
             .ok_or_else(|| "Session manager not initialized".to_string())?;
-
-        let session = sm
-            .get_session(&session_id)?
-            .ok_or_else(|| format!("Session '{}' not found", session_id))?;
-        session.messages
+        sm.get_session(&session_id)?
+            .and_then(|s| {
+                if s.workspace.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s.workspace))
+                }
+            })
     };
+    crate::attachments::stage_bytes(
+        &name,
+        &bytes,
+        workspace.as_deref(),
+        &session_id,
+    )
+}
 
-    if messages.is_empty() {
-        return Err("No messages in session to ingest".to_string());
+/// Delete a skill package.
+///
+/// Prefer `root` (absolute package path from list_skills) so multi-path skills
+/// under ~/.claude/skills etc. can be removed — not only ~/.dscode/skills.
+#[tauri::command]
+pub async fn delete_skill(name: String, root: Option<String>) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() || name.contains("..") {
+        return Err("非法 Skill 名称".into());
     }
+    // Slash only illegal when used as bare name (root path is separate)
+    if root.as_ref().map(|r| r.trim().is_empty()).unwrap_or(true)
+        && (name.contains('/') || name.contains('\\'))
+    {
+        return Err("非法 Skill 名称".into());
+    }
+    info!(%name, root = ?root, "skills: delete");
+    let msg = dscode_core::extensions::skills::SkillLoader::delete_skill_package(
+        name,
+        root.as_deref(),
+        None,
+    )?;
+    info!(%msg, "skills: deleted");
+    Ok(msg)
+}
 
-    info!(
-        session = %session_id,
-        msg_count = messages.len(),
-        "wiki_ingest: spawning background task"
-    );
+/// Subscribe to real-time background task notifications.
+///
+/// Spawns a background Tokio task that listens on the [`TaskManager`] broadcast
+/// channel and emits `task-notification` Tauri events to the frontend for each
+/// task start, progress, and completion. The frontend should call this once at
+/// startup to enable push-based task monitoring.
+#[tauri::command]
+pub async fn subscribe_task_events(
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let mut rx = state.task_manager.subscribe();
 
-    dscode_core::wiki::ingestor::auto_ingest(session_id, messages);
+    tokio::spawn(async move {
+        while let Ok(notification) = rx.recv().await {
+            let _ = app_handle.emit("task-notification", &notification);
+        }
+    });
 
     Ok(())
 }

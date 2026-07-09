@@ -182,16 +182,26 @@ pub trait LlmProvider: Send + Sync {
         messages: Vec<Message>,
         tools: Vec<ToolDef>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderError>> + Send>>, ProviderError>;
+
+    /// Clone this provider into a new boxed instance.
+    /// Required so Forge can spawn sub-agents that each own their provider.
+    fn clone_box(&self) -> Box<dyn LlmProvider>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("API error: {status} - {message}")]
     Api { status: u16, message: String },
     #[error("Parse error: {0}")]
     Parse(String),
     #[error("No API key configured for this provider")]
     NoApiKey,
+}
+
+impl From<reqwest::Error> for ProviderError {
+    fn from(e: reqwest::Error) -> Self {
+        ProviderError::Http(e.to_string())
+    }
 }

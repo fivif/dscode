@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 
@@ -68,7 +69,7 @@ fn resolve_path(path: &str, working_dir: &Path) -> Result<PathBuf, ToolError> {
                     working_dir.display()
                 )));
             }
-            return Ok(candidate);
+            return Ok(resolved);
         }
     };
 
@@ -448,6 +449,7 @@ mod tests {
             session_id: "test".into(),
             tool_call_id: "call_fops".into(),
             sender: tx,
+            safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
         }
     }
 

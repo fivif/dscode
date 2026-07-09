@@ -131,7 +131,12 @@ export default function Airplane() {
 
       {/* HUD */}
       <div className="absolute top-4 left-4 pointer-events-auto bg-black/40 backdrop-blur rounded-xl p-4 text-white font-mono text-sm space-y-2">
-        <div className="text-lg font-bold">✈️ 飞机控制</div>
+        <div className="text-lg font-bold flex items-center gap-2">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z" />
+          </svg>
+          飞机控制
+        </div>
         <div>位置: ({Math.round(pos.x)}, {Math.round(pos.y)})</div>
         <div className="flex items-center gap-2">
           <span>速度:</span>

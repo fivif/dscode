@@ -167,6 +167,197 @@ impl SessionManager {
         }
     }
 
+    /// Rename a session.
+    pub fn update_title(&self, session_id: &str, title: &str) -> Result<(), String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("Title must not be empty".into());
+        }
+        // Keep sidebar readable
+        let title: String = title.chars().take(80).collect();
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![title, Utc::now().timestamp(), session_id],
+            )
+            .map_err(|e| format!("Failed to update title: {}", e))?;
+        if affected == 0 {
+            Err("Session not found".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Pure mode / control messages that must not steal the session title.
+    pub fn is_control_only_message(user_message: &str) -> bool {
+        let t = user_message.trim().to_lowercase();
+        matches!(
+            t.as_str(),
+            "/teams"
+                | "/teams on"
+                | "/teams off"
+                | "/teams stop"
+                | "/plan"
+                | "/auto"
+                | "/teams:"
+                | "/plan:"
+                | "/auto:"
+        )
+    }
+
+    /// Whether the title looks auto-generated / placeholder (safe to overwrite).
+    pub fn is_placeholder_title(title: &str) -> bool {
+        let t = title.trim();
+        if t.is_empty() {
+            return true;
+        }
+        let lower = t.to_lowercase();
+        lower == "新对话"
+            || lower == "new chat"
+            || lower == "untitled"
+            || lower == "new session"
+            || t.starts_with("对话 ")
+            || t.starts_with("Chat ")
+            || t.starts_with("Session ")
+            // workspace-folder-only provisional names from create flow
+            || t.starts_with("📂 ") // legacy emoji prefix (migrating away)
+            // weak titles from mode-only toggles / empty slash commands
+            || t == "Teams · 多 Agent 协作"
+            || t == "Plan · 需求规划"
+            || t == "Auto · 自动执行"
+            || lower == "teams · 多 agent 协作"
+    }
+
+    /// Derive a short sidebar title from the first user message.
+    pub fn derive_title_from_message(user_message: &str) -> String {
+        let raw = user_message.trim();
+        if raw.is_empty() || Self::is_control_only_message(raw) {
+            return "新对话".into();
+        }
+
+        // Prefer first non-empty line
+        let first = raw
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or(raw)
+            .to_string();
+
+        // Normalize slash commands into readable titles
+        let (prefix, body_owned): (&str, String) = if let Some(rest) = first
+            .strip_prefix("/plan")
+            .filter(|r| r.is_empty() || r.starts_with(|c: char| c.is_whitespace() || c == ':'))
+        {
+            (
+                "Plan · ",
+                rest.trim().trim_start_matches(':').trim().to_string(),
+            )
+        } else if let Some(rest) = first
+            .strip_prefix("/auto")
+            .filter(|r| r.is_empty() || r.starts_with(|c: char| c.is_whitespace() || c == ':'))
+        {
+            (
+                "Auto · ",
+                rest.trim().trim_start_matches(':').trim().to_string(),
+            )
+        } else if let Some(rest) = first
+            .strip_prefix("/teams")
+            .filter(|r| r.is_empty() || r.starts_with(|c: char| c.is_whitespace() || c == ':'))
+        {
+            let rest = rest
+                .trim()
+                .strip_prefix("on")
+                .map(|r| r.trim())
+                .unwrap_or(rest.trim())
+                .trim_start_matches(':')
+                .trim()
+                .to_string();
+            ("Teams · ", rest)
+        } else if first.starts_with('/') {
+            // Skill or other slash invoke: "/grill-me clarify auth" → body without command token
+            let mut parts = first.splitn(2, char::is_whitespace);
+            let _cmd = parts.next();
+            let rest = parts.next().unwrap_or("").trim().to_string();
+            if rest.is_empty() {
+                // bare skill name — use command without leading slash
+                let name = first.trim_start_matches('/').to_string();
+                ("", name)
+            } else {
+                ("", rest)
+            }
+        } else {
+            ("", first)
+        };
+
+        let body = if body_owned.is_empty() {
+            match prefix {
+                "Plan · " => "需求规划".to_string(),
+                "Auto · " => "自动执行".to_string(),
+                "Teams · " => "多 Agent 协作".to_string(),
+                _ => "新对话".to_string(),
+            }
+        } else {
+            body_owned
+        };
+
+        // Collapse whitespace
+        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let max_chars = 32usize;
+        let mut core: String = collapsed.chars().take(max_chars).collect();
+        if collapsed.chars().count() > max_chars {
+            core.push('…');
+        }
+
+        let title = format!("{prefix}{core}");
+        if title.trim().is_empty() {
+            "新对话".into()
+        } else {
+            title
+        }
+    }
+
+    /// Auto-rename session from first real user message when still using a placeholder title.
+    /// Returns `Some(new_title)` if renamed, else `None`.
+    pub fn maybe_auto_title(&self, session_id: &str, user_message: &str) -> Result<Option<String>, String> {
+        // Never name the session after pure mode toggles
+        if Self::is_control_only_message(user_message) {
+            return Ok(None);
+        }
+
+        let current = self
+            .conn
+            .query_row(
+                "SELECT title FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| format!("Failed to read title: {e}"))?;
+
+        if !Self::is_placeholder_title(&current) {
+            return Ok(None);
+        }
+
+        let new_title = Self::derive_title_from_message(user_message);
+        if Self::is_placeholder_title(&new_title) {
+            return Ok(None);
+        }
+        self.update_title(session_id, &new_title)?;
+        Ok(Some(new_title))
+    }
+
+    /// Provisional title for a brand-new session (before first message).
+    pub fn provisional_title(workspace: &str) -> String {
+        let folder = std::path::Path::new(workspace)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty());
+        match folder {
+            Some(name) => name.to_string(),
+            None => "新对话".into(),
+        }
+    }
+
     /// Load a session by id, including all messages ordered by creation time.
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>, String> {
         let mut stmt = self
@@ -607,3 +798,71 @@ impl<T> Optional<T> for Result<T, rusqlite::Error> {
         }
     }
 }
+
+#[cfg(test)]
+mod title_tests {
+    use super::SessionManager;
+
+    #[test]
+    fn derive_plain_message() {
+        let t = SessionManager::derive_title_from_message("修复登录模块的 token 过期问题");
+        assert!(t.contains("修复登录"));
+        assert!(t.chars().count() <= 40);
+    }
+
+    #[test]
+    fn derive_plan_command() {
+        let t = SessionManager::derive_title_from_message("/plan 实现用户注册流程");
+        assert!(t.starts_with("Plan · "));
+        assert!(t.contains("实现用户注册"));
+    }
+
+    #[test]
+    fn derive_empty_plan() {
+        // Bare /plan is control-only — does not produce a sticky title
+        assert!(SessionManager::is_control_only_message("/plan"));
+        let t = SessionManager::derive_title_from_message("/plan");
+        assert_eq!(t, "新对话");
+    }
+
+    #[test]
+    fn placeholder_detection() {
+        assert!(SessionManager::is_placeholder_title("对话 03:08"));
+        assert!(SessionManager::is_placeholder_title("📂 DS_code")); // legacy
+        assert!(SessionManager::is_placeholder_title("新对话"));
+        assert!(SessionManager::is_placeholder_title("Teams · 多 Agent 协作"));
+        assert!(!SessionManager::is_placeholder_title("Plan · 实现登录"));
+        assert!(!SessionManager::is_placeholder_title("手动改过的名字"));
+    }
+
+    #[test]
+    fn control_only_skipped() {
+        assert!(SessionManager::is_control_only_message("/teams"));
+        assert!(SessionManager::is_control_only_message("/teams off"));
+        assert!(!SessionManager::is_control_only_message("/teams 做一个番茄钟"));
+    }
+
+    #[test]
+    fn derive_teams_with_body() {
+        let t = SessionManager::derive_title_from_message("/teams 做一个番茄时钟");
+        assert!(t.starts_with("Teams · "));
+        assert!(t.contains("番茄"));
+    }
+
+    #[test]
+    fn derive_skill_slash() {
+        let t = SessionManager::derive_title_from_message("/grill-me 澄清登录需求");
+        assert!(t.contains("澄清登录"));
+        assert!(!t.starts_with('/'));
+    }
+
+    #[test]
+    fn provisional_from_workspace() {
+        assert_eq!(
+            SessionManager::provisional_title("/Users/zay/Desktop/DS_code"),
+            "DS_code"
+        );
+        assert_eq!(SessionManager::provisional_title(""), "新对话");
+    }
+}
+

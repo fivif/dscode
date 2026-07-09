@@ -11,15 +11,19 @@ use tracing::{info, warn};
 use crate::providers::trait_def::{LlmProvider, ProviderError};
 use crate::tools::registry::ToolRegistry;
 
-use super::execute::execute_subtask;
+use super::execute::{execute_subtask, MagiProgress};
 use super::promote::promote;
 use super::scrutinize::scrutinize;
+use crate::agent::stream::StreamEvent;
 
 /// Default maximum number of MAGI spiral rounds.
-const DEFAULT_MAX_ROUNDS: u32 = 10;
+const DEFAULT_MAX_ROUNDS: u32 = 3;
 
 /// Default maximum ReAct steps per Balthasar execution.
-const DEFAULT_MAX_STEPS_PER_ROUND: u32 = 30;
+const DEFAULT_MAX_STEPS_PER_ROUND: u32 = 12;
+
+/// Casper/Melchior single LLM call timeout.
+const PHASE_LLM_TIMEOUT_SECS: u64 = 120;
 
 /// Errors that can occur during a MAGI spiral.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +90,8 @@ pub struct MagiScheduler {
     max_rounds: u32,
     /// Maximum ReAct steps per Balthasar execution round.
     max_steps_per_round: u32,
+    /// Optional UI progress (Token + TeamAgentOutput + tools).
+    progress: Option<MagiProgress>,
 }
 
 impl MagiScheduler {
@@ -105,6 +111,7 @@ impl MagiScheduler {
             working_dir,
             max_rounds: DEFAULT_MAX_ROUNDS,
             max_steps_per_round: DEFAULT_MAX_STEPS_PER_ROUND,
+            progress: None,
         }
     }
 
@@ -123,6 +130,7 @@ impl MagiScheduler {
             working_dir,
             max_rounds: DEFAULT_MAX_ROUNDS,
             max_steps_per_round: DEFAULT_MAX_STEPS_PER_ROUND,
+            progress: None,
         }
     }
 
@@ -136,6 +144,29 @@ impl MagiScheduler {
     pub fn with_max_steps_per_round(mut self, n: u32) -> Self {
         self.max_steps_per_round = n;
         self
+    }
+
+    /// Attach UI progress (same channel as AutoRunner / Forge).
+    pub fn with_progress(mut self, progress: MagiProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    fn emit_phase(&self, line: impl Into<String>) {
+        let line = line.into();
+        if let Some(ref p) = self.progress {
+            let _ = p.tx.send(StreamEvent::TeamAgentOutput {
+                agent_id: p.agent_id.clone(),
+                content: format!("{line}\n"),
+            });
+            let _ = p.tx.send(StreamEvent::Token {
+                content: format!("_{line}_\n"),
+            });
+            let _ = p.tx.send(StreamEvent::Thinking {
+                content: format!("{line}\n"),
+                step: 0,
+            });
+        }
     }
 
     /// Run the full MAGI spiral on a PRD (Product Requirements Document).
@@ -159,35 +190,72 @@ impl MagiScheduler {
                 max_rounds = self.max_rounds,
                 "MAGI: starting round"
             );
+            self.emit_phase(format!(
+                "Auto round {round_num}/{} — reviewing…",
+                self.max_rounds
+            ));
 
             // ---- 1. Casper: scrutinize ----
             let previous_scrutiny = rounds.last().map(|r| r.scrutiny.as_str()).unwrap_or("");
-            let scrutiny = scrutinize(
-                &**self.provider,
-                prd,
-                &rounds,
-                previous_scrutiny,
+            let scrutiny = retry_with_backoff(
+                || async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(PHASE_LLM_TIMEOUT_SECS),
+                        scrutinize(&**self.provider, prd, &rounds, previous_scrutiny),
+                    )
+                    .await
+                    .map_err(|_| {
+                        MagiError::Parse(format!(
+                            "Casper timed out after {PHASE_LLM_TIMEOUT_SECS}s (round {round_num})"
+                        ))
+                    })?
+                },
+                2,
             )
             .await?;
 
+            let scr_preview: String = scrutiny.chars().take(280).collect();
+            self.emit_phase(format!("Review done — {scr_preview}…"));
+
             // ---- 2. Balthasar: execute ----
-            let execution = execute_subtask(
-                &**self.provider,
-                &self.tools,
-                &self.working_dir,
-                session_id,
-                prd,
-                &scrutiny,
-                self.max_steps_per_round,
+            self.emit_phase(format!(
+                "Round {round_num} — executing (max {} steps)…",
+                self.max_steps_per_round
+            ));
+            let progress = self.progress.clone();
+            let execution = retry_with_backoff(
+                || {
+                    execute_subtask(
+                        &**self.provider,
+                        &self.tools,
+                        &self.working_dir,
+                        session_id,
+                        prd,
+                        &scrutiny,
+                        self.max_steps_per_round,
+                        progress.as_ref(),
+                    )
+                },
+                2,
             )
             .await?;
 
             // ---- 3. Melchior: promote ----
-            let promotion = promote(
-                &**self.runtime_provider,
-                prd,
-                &scrutiny,
-                &execution,
+            self.emit_phase(format!("Round {round_num} — evaluating quality…"));
+            let promotion = retry_with_backoff(
+                || async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(PHASE_LLM_TIMEOUT_SECS),
+                        promote(&**self.runtime_provider, prd, &scrutiny, &execution),
+                    )
+                    .await
+                    .map_err(|_| {
+                        MagiError::Parse(format!(
+                            "Melchior timed out after {PHASE_LLM_TIMEOUT_SECS}s (round {round_num})"
+                        ))
+                    })?
+                },
+                2,
             )
             .await?;
 
@@ -198,6 +266,10 @@ impl MagiScheduler {
                 should_stop = promotion.should_stop,
                 "MAGI: round complete"
             );
+            self.emit_phase(format!(
+                "Round {round_num} complete — quality {:.0}/100, stop={} ({})",
+                promotion.quality_score, promotion.should_stop, promotion.stop_reason
+            ));
 
             rounds.push(MagiRound {
                 round_number: round_num,
@@ -223,6 +295,28 @@ impl MagiScheduler {
             "MAGI: max rounds reached without completion"
         );
         Err(MagiError::MaxRounds(self.max_rounds, rounds))
+    }
+}
+
+/// Retry an async operation with exponential backoff for transient errors.
+async fn retry_with_backoff<T, E: std::fmt::Display, Fut: std::future::Future<Output = Result<T, E>>>(
+    mut f: impl FnMut() -> Fut,
+    max_retries: u32,
+) -> Result<T, E> {
+    let mut attempt = 0;
+    loop {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                attempt += 1;
+                if attempt > max_retries {
+                    return Err(e);
+                }
+                let delay = std::time::Duration::from_secs(2u64.pow(attempt - 1));
+                tracing::warn!("Retry {attempt}/{max_retries} after error: {e}. Waiting {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+        }
     }
 }
 
@@ -288,7 +382,9 @@ mod tests {
         > {
             unimplemented!("stub does not support streaming")
         }
-    }
+    
+    fn clone_box(&self) -> Box<dyn LlmProvider> { panic!("clone_box not used in tests") }
+}
 
     // ------------------------------------------------------------------
     // Stub tool
