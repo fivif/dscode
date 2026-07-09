@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.dscode.app",
   "build": {
-    "frontendDist": "../ui/dist",
+    "frontendDist": "ui/dist",
     "devUrl": "http://localhost:27463",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "cd dscode-desktop/ui && npm run dev",
+    "beforeBuildCommand": "cd dscode-desktop/ui && npm run build"
   },
   "app": {
     "windows": [
