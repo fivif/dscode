@@ -22,29 +22,22 @@
 
 ## 架构 Architecture
 
-```mermaid
-graph TB
-    subgraph apps[" 接入层 "]
-        desktop["🖥️ dscode-desktop<br/>Tauri 2 + React"]
-        cli["⬛ dscode-cli<br/>命令行工具"]
-    end
-
-    subgraph engine[" dscode-core 核心引擎 "]
-        forge["⚙️ Forge<br/>ReAct 循环<br/>━━━━━━━<br/>/auto · /plan · /teams"]
-        scribe["🧠 Scribe<br/>三级记忆<br/>━━━━━━━<br/>Raw → Fact → Pattern"]
-        ext["🔌 Extensions<br/>MCP · Skills"]
-    end
-
-    subgraph infra[" 基础设施 "]
-        provider["📡 Provider<br/>DeepSeek OpenAI Anthropic"]
-        session["💾 Session<br/>SQLite 持久化"]
-        tools["🔧 Tools<br/>bash file bg mcp skills"]
-        safety["🛡️ Safety<br/>超时 · 拦截"]
-    end
-
-    desktop --> engine
-    cli --> engine
-    engine --> infra
+```
+dscode-desktop (Tauri 2 + React) ───┐
+dscode-cli ────────────────────────┤
+                                   ▼
+┌──────────────────────────────────────────────────┐
+│                  dscode-core                       │
+│                                                    │
+│  Forge ── ReAct 循环 + /auto /plan /teams         │
+│  Scribe ─ 三级记忆 Raw → Fact → Pattern            │
+│  Extensions ─ MCP · Skills                        │
+│                                                    │
+│  Provider ─ DeepSeek / OpenAI / Anthropic          │
+│  Session ─ SQLite 持久化                            │
+│  Tools ─ bash · file · bg · mcp · skills           │
+│  Safety ─ 超时检测 · 危险拦截                       │
+└──────────────────────────────────────────────────┘
 ```
 
 ## 功能 Features
