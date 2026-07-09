@@ -256,12 +256,7 @@ DS_code/
 | 文档 | 描述 |
 |------|------|
 | [README.md](README.md) | 项目概览与快速开始 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南与开发规范 |
-| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录 |
-| [SECURITY.md](SECURITY.md) | 安全策略与漏洞报告 |
 | [LICENSE](LICENSE) | MIT 许可证 |
-| [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md) | 架构深度审查 — 模块详解、数据流、设计模式 |
-| [TECH_STACK_SUMMARY.md](TECH_STACK_SUMMARY.md) | 技术栈全览 — Rust / React / Tauri / 依赖 |
 | [config/default.toml](config/default.toml) | 配置文件模板 |
 
 ---
