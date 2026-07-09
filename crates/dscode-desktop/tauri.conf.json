@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:27463",
-    "beforeDevCommand": "cd /Users/zay/Desktop/DS_code/crates/dscode-desktop/ui && npm run dev",
-    "beforeBuildCommand": "cd /Users/zay/Desktop/DS_code/crates/dscode-desktop/ui && npm run build"
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
