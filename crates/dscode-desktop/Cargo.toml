@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["ZAY"]
-description = "DS Code — Universal Code Agent Desktop GUI"
+description = "DS Code"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
