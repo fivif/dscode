@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 #[allow(unused_imports)]
 use crate::agent::stream::StreamEvent;
-use crate::magi::scheduler::{MagiError, MagiRound, MagiScheduler, Promotion};
+use crate::magi::scheduler::{MagiError, MagiRound, MagiScheduler};
 use crate::providers::trait_def::{LlmProvider, ProviderError};
 use crate::tools::registry::ToolRegistry;
 

@@ -135,7 +135,7 @@ impl AppState {
         let notify_tx = task_manager.notify_tx();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register_default_tools();
-        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone(), notify_tx));
+        tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone(), task_manager.live_handle(), notify_tx));
         tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle));
         let tool_registry = Arc::new(tool_registry);
 
@@ -499,6 +499,25 @@ impl AppState {
             StreamEvent::TeamComplete { completed, failed } => {
                 self.messages.push(UiMessage::Assistant {
                     content: format!("Team complete — {completed} ok, {failed} failed"),
+                    timestamp: Utc::now().timestamp(),
+                });
+            }
+            StreamEvent::PlanQuestion {
+                phase,
+                question,
+                recommended,
+                options,
+                ..
+            } => {
+                let mut text = format!(
+                    "## Plan: {} — {}\n\n推荐: {}\n",
+                    phase, question, recommended
+                );
+                for (i, opt) in options.iter().enumerate() {
+                    text.push_str(&format!("{}. {}\n", i + 1, opt));
+                }
+                self.messages.push(UiMessage::Assistant {
+                    content: text,
                     timestamp: Utc::now().timestamp(),
                 });
             }

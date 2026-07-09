@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "DS Code \u2014 Universal Code Agent",
+        "title": "DS Code",
         "width": 1200,
         "height": 800,
         "minWidth": 900,

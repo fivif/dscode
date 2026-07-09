@@ -430,7 +430,7 @@ impl Forge {
                         *counts.entry(s).or_insert(0) += 1;
                     }
                     if counts.values().any(|&c| c >= 10) {
-                        let repeated: Vec<String> = current_set.iter().cloned().collect();
+                        let _repeated: Vec<String> = current_set.iter().cloned().collect();
                         let _ = event_tx.send(StreamEvent::Token {
                             content: format!("\n\n⚠️ Tool loop detected ({} iterations). Consider consolidating results and concluding.\n", iteration),
                         });

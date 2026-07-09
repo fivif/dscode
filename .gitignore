@@ -12,7 +12,6 @@ dist/
 # Tauri
 crates/dscode-desktop/ui/dist/
 crates/dscode-desktop/gen/
-crates/dscode-desktop/icons/
 
 # IDE
 .idea/
@@ -46,6 +45,9 @@ Thumbs.db
 
 # External git repos
 llm_wiki/
+
+# Cross-compilation caches
+.xwin-cache/
 
 # Cargo lock (workspace crate, not end-user app)
 # Cargo.lock is committed for deterministic builds in this project

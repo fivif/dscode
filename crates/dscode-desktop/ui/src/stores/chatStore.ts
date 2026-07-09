@@ -461,11 +461,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
           // reasoning_content → thinking block
           if (m.reasoning_content) {
             msgs.push({ ...m, thinking_blocks: [{ step: 0, content: m.reasoning_content }] });
-            prevWithToolCalls = m.tool_calls?.length > 0 ? m : null;
+            prevWithToolCalls = (m.tool_calls && m.tool_calls.length > 0) ? m : null;
             continue;
           }
           // tool_calls → tool card message with proper names
-          if (m.tool_calls?.length > 0) {
+          if (m.tool_calls && m.tool_calls.length > 0) {
             const namedTC = m.tool_calls.map((tc: any) => ({
               id: tc.id, name: tc.function?.name || tc.name || 'tool',
               description: tc.description || '', status: 'success' as const, result: tc.result || ''

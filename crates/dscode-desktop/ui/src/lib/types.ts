@@ -30,16 +30,24 @@ export interface FileAttachment {
 export interface Message {
   id: string;
   session_id?: string;
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'tool' | 'system' | 'fact';
   content: string;
   created_at: number; // Unix seconds
   /** User-visible attachment list (UI); full paths also embedded in content for agent */
   attachments?: FileAttachment[];
+  // Backend-native fields (DB serialization)
+  tool_call_id?: string;
+  reasoning_content?: string;
+  name?: string;
+  /** Fact fields (fact role) */
+  subject?: string;
+  predicate?: string;
+  object?: string;
   // Transient UI state — not stored on backend
   tool_calls?: ToolCallRecord[];
   thinking_blocks?: ThinkingBlock[];
   fact_cards?: FactRecord[];
-  /** Sub-agents attached to this assistant turn (Teams or /auto MAGI) */
+  /** Sub-agents attached to this assistant turn (Teams or /auto) */
   team_agents?: TeamAgent[];
   /** How to label the agent panel — /auto, Teams, or combined */
   agent_panel_kind?: 'teams' | 'auto' | 'auto_teams';
