@@ -8,7 +8,7 @@
 <p align="center">
   <strong>通用 AI 代码助手</strong> · DeepSeek 原生 · 跨模型
   <br/>
-  TUI 终端 + 桌面 GUI。Rust 引擎，React 前端，Tauri 外壳。
+  桌面 GUI 应用。Rust 引擎，React 前端，Tauri 外壳。
 </p>
 
 <p align="center">
@@ -45,11 +45,11 @@
 │  └──────────┘ └───────────┘ └────────────────────────────────┘  │
 ├──────────────────────────────────────────────────────────────────┤
 │                         接入层                                     │
-│  ┌─────────────┐  ┌─────────────────┐  ┌────────────────────┐   │
-│  │ dscode-tui  │  │ dscode-desktop  │  │    dscode-cli      │   │
-│  │ 终端界面    │  │  桌面应用       │  │   命令行工具       │   │
-│  │ ratatui     │  │ Tauri 2 + React │  │   Teams 模式       │   │
-│  └─────────────┘  └─────────────────┘  └────────────────────┘   │
+│  ┌─────────────────┐  ┌────────────────────┐                      │
+│  │ dscode-desktop  │  │    dscode-cli      │                      │
+│  │  桌面应用       │  │   命令行工具       │                      │
+│  │ Tauri 2 + React │  │                    │                      │
+│  └─────────────────┘  └────────────────────┘                      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -104,27 +104,15 @@
 
 ### 环境要求 Prerequisites
 - Rust 1.85+
-- Node.js 18+（桌面应用）
+- Node.js 18+
 - macOS / Linux / Windows
-
-### 终端界面 TUI
-```bash
-# 构建并运行
-cargo run -p dscode-tui
-
-# 或使用 Makefile
-make dev-tui
-```
 
 ### 桌面应用 Desktop GUI
 ```bash
-# 一次性初始化
-make dev-desktop-setup
+# 下载预编译安装包
+# https://github.com/fivif/dscode/releases
 
-# 启动开发模式
-make dev-desktop
-
-# 或手动操作：
+# 或从源码运行
 cd crates/dscode-desktop/ui && npm install
 cd .. && cargo tauri dev
 ```
@@ -242,7 +230,6 @@ DS_code/
 |---|---|
 | 核心引擎 | Rust (tokio, reqwest, rusqlite) |
 | 桌面 GUI | Tauri 2.x + React 18 + TypeScript + Tailwind CSS |
-| 终端界面 | ratatui + crossterm |
 | 状态管理 | Zustand |
 | 会话存储 | SQLite (rusqlite + FTS5) |
 | Markdown | react-markdown + remark-gfm |
