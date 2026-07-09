@@ -5,6 +5,7 @@ import InputBox from '@/components/Chat/InputBox';
 import SettingsPage from '@/components/Settings/SettingsPage';
 import McpPage from '@/components/Settings/McpPage';
 import SkillsPage from '@/components/Settings/SkillsPage';
+import PermissionBanner from '@/components/Chat/PermissionBanner';
 import { useStreamEvents } from '@/hooks/useStreamEvents';
 import { useConfigStore } from '@/stores/configStore';
 import { useChatStore } from '@/stores/chatStore';
@@ -76,6 +77,7 @@ export default function App() {
         {page === 'chat' && (
           <>
             <ChatArea />
+            <PermissionBanner />
             <InputBox />
           </>
         )}

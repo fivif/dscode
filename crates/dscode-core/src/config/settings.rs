@@ -50,6 +50,10 @@ pub struct Config {
     /// Agent behaviour (global system prompt, etc.)
     #[serde(default)]
     pub agent: AgentConfig,
+
+    /// Multi-agent /teams settings (v2 runtime).
+    #[serde(default)]
+    pub teams: crate::teams::config::TeamsConfig,
 }
 
 fn default_model() -> String {
@@ -78,6 +82,7 @@ impl Default for Config {
             extensions: ExtensionConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
+            teams: crate::teams::config::TeamsConfig::default(),
         }
     }
 }
@@ -389,12 +394,19 @@ fn default_30() -> u32 { 30 }
 pub struct SafetyConfig {
     #[serde(default)]
     pub allow_write_outside_project: bool,
-    /// Command patterns to block (regex)
+    /// Command patterns to block (regex) — treated as hard blocks.
     #[serde(default)]
     pub blocked_commands: Vec<String>,
     /// Default timeout for tool execution in seconds
     #[serde(default = "default_timeout")]
     pub tool_timeout_secs: u64,
+    /// When true, Confirm-level dangerous commands run without UI prompt.
+    /// Hard-blocked commands are still always denied. Default false (Safe mode).
+    #[serde(default)]
+    pub absolute_trust: bool,
+    /// Permission prompt timeout in seconds (default 120).
+    #[serde(default = "default_timeout")]
+    pub permission_timeout_secs: u64,
 }
 
 impl Default for SafetyConfig {
@@ -408,6 +420,8 @@ impl Default for SafetyConfig {
                 ":(){ :|:& };:".into(),
             ],
             tool_timeout_secs: default_timeout(),
+            absolute_trust: false,
+            permission_timeout_secs: default_timeout(),
         }
     }
 }
@@ -452,16 +466,21 @@ pub struct ContextConfig {
     /// Fraction of window used before triggering compression (0.0-1.0)
     #[serde(default = "default_compress_threshold")]
     pub compress_threshold: f64,
+    /// Hard cap on ReAct tool/LLM turns per user message (default 120).
+    #[serde(default = "default_max_agent_iterations")]
+    pub max_agent_iterations: u32,
 }
 
 fn default_context_window() -> u64 { 1_000_000 }
 fn default_compress_threshold() -> f64 { 0.8 }
+fn default_max_agent_iterations() -> u32 { 120 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             window_tokens: default_context_window(),
             compress_threshold: default_compress_threshold(),
+            max_agent_iterations: default_max_agent_iterations(),
         }
     }
 }
@@ -486,10 +505,19 @@ pub struct AgentConfig {
     /// User-written global prompt. Empty = use built-in default only.
     #[serde(default)]
     pub global_prompt: String,
+    /// When true, inject Scribe memory recall snippets into the system prompt.
+    #[serde(default)]
+    pub memory_enabled: bool,
     /// When true and `global_prompt` is non-empty, replace the built-in system
     /// prompt entirely. When false, append after the built-in prompt.
     #[serde(default)]
     pub replace_system_prompt: bool,
+    /// Require do_file_read before do_file_edit/write on the same path (session).
+    #[serde(default)]
+    pub read_before_edit: bool,
+    /// After a successful turn, optionally extract a short memory note (opt-in).
+    #[serde(default)]
+    pub memory_auto_ingest: bool,
 }
 
 impl AgentConfig {
@@ -524,6 +552,7 @@ mod agent_config_tests {
         let a = AgentConfig {
             global_prompt: "  speak Chinese  ".into(),
             replace_system_prompt: false,
+            ..Default::default()
         };
         let out = a.resolve_system_prompt("DEFAULT");
         assert!(out.starts_with("DEFAULT"));
@@ -536,6 +565,7 @@ mod agent_config_tests {
         let a = AgentConfig {
             global_prompt: "ONLY CUSTOM".into(),
             replace_system_prompt: true,
+            ..Default::default()
         };
         assert_eq!(a.resolve_system_prompt("DEFAULT"), "ONLY CUSTOM");
     }

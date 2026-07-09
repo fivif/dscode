@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import type { TeamAgent } from '@/lib/types';
+import { useChatStore } from '@/stores/chatStore';
 
 export type AgentPanelKind = 'teams' | 'auto' | 'auto_teams';
 
@@ -74,6 +76,7 @@ export default function TeamPanel({ agents, kind = 'teams', compact = true }: Pr
 
 function AgentRow({ agent }: { agent: TeamAgent }) {
   const [expanded, setExpanded] = useState(false);
+  const sessionId = useChatStore((s) => s.activeSessionId);
 
   useEffect(() => {
     if (agent.status === 'running') setExpanded(true);
@@ -87,6 +90,35 @@ function AgentRow({ agent }: { agent: TeamAgent }) {
         : 'bg-red-400';
 
   const displayId = agent.id.includes('#') ? agent.id.replace('#', ' ·') : agent.id;
+
+  const onStop = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!sessionId) return;
+    try {
+      await invoke('stop_team_agent', { sessionId, agentId: agent.id });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const onNudge = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!sessionId) return;
+    const text =
+      typeof window !== 'undefined'
+        ? window.prompt('Nudge this sub-agent (extra instruction):', '')
+        : null;
+    if (!text?.trim()) return;
+    try {
+      await invoke('nudge_team_agent', {
+        sessionId,
+        agentId: agent.id,
+        message: text.trim(),
+      });
+    } catch {
+      /* ignore */
+    }
+  };
 
   return (
     <div className="group">
@@ -112,6 +144,26 @@ function AgentRow({ agent }: { agent: TeamAgent }) {
             <div className="text-[11px] text-gray-400 mt-0.5 leading-snug">{agent.task}</div>
           )}
         </div>
+        {agent.status === 'running' && (
+          <span className="flex gap-1 shrink-0 mt-0.5">
+            <button
+              type="button"
+              className="text-[10px] text-sky-400/90 hover:text-sky-300 px-1.5 py-0.5 rounded border border-sky-500/30"
+              onClick={onNudge}
+              title="Send mid-run instruction"
+            >
+              nudge
+            </button>
+            <button
+              type="button"
+              className="text-[10px] text-red-400/90 hover:text-red-300 px-1.5 py-0.5 rounded border border-red-500/30"
+              onClick={onStop}
+              title="Stop this sub-agent"
+            >
+              stop
+            </button>
+          </span>
+        )}
         <span className="text-[10px] text-gray-600 shrink-0 mt-0.5 opacity-0 group-hover:opacity-100">
           {expanded ? '收起' : '展开'}
         </span>

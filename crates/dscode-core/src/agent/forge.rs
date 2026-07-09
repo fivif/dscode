@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::context::{build_context, compression_prompt, count_message_tokens, ContextPacket};
@@ -28,6 +30,8 @@ use crate::providers::trait_def::{
 };
 use futures::StreamExt;
 use crate::tools::registry::ToolRegistry;
+use crate::safety::guard::SafetyGuard;
+use crate::safety::permission::PermissionHub;
 use crate::tools::trait_def::{ToolContext, ToolError};
 
 /// The default system prompt injected at the start of every conversation.
@@ -54,11 +58,17 @@ MCP (Model Context Protocol):
 
 Think step by step, use tools when needed, write clean code."#;
 
-/// Maximum number of ReAct iterations before the agent stops.
-const DEFAULT_MAX_ITERATIONS: u32 = u32::MAX;
+/// Maximum number of ReAct iterations before the agent stops (configurable).
+const DEFAULT_MAX_ITERATIONS: u32 = 120;
 
 /// Maximum number of historical messages to include in the context window.
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 100;
+
+/// Cap tool result text injected back into the conversation (chars).
+const MAX_TOOL_RESULT_CHARS: usize = 24_000;
+
+/// Start tool-loop detection after this many ReAct turns.
+const LOOP_DETECT_FROM_ITERATION: u32 = 5;
 
 /// Errors that can occur during the agent loop.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +88,10 @@ pub enum ForgeError {
     /// The model returned no content and no tool calls (empty response).
     #[error("model returned an empty response (no content, no tool calls)")]
     EmptyResponse,
+
+    /// Cancelled by user / team control plane.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// The ReAct agent loop — the central execution engine of DS Code.
@@ -133,6 +147,24 @@ pub struct Forge {
 
     /// Whether /teams multi-agent mode is active.
     teams_mode: AtomicBool,
+
+    /// Safety policy for tools (from config).
+    safety_guard: Arc<SafetyGuard>,
+
+    /// Optional GUI permission hub for Confirm-level commands.
+    permission_hub: Option<Arc<PermissionHub>>,
+
+    /// Permission prompt timeout seconds.
+    permission_timeout_secs: u64,
+
+    /// Teams v2 configuration.
+    teams_config: crate::teams::config::TeamsConfig,
+
+    /// Optional cancel token (checked each ReAct iteration).
+    cancel_token: Option<CancellationToken>,
+
+    /// Optional nudge queue — drained as user messages mid-loop.
+    nudge_queue: Option<Arc<AsyncMutex<Vec<String>>>>,
 }
 
 impl Forge {
@@ -153,7 +185,46 @@ impl Forge {
             context_config: ContextConfig::default(),
             compressed: AtomicBool::new(false),
             teams_mode: AtomicBool::new(false),
+            // Safe defaults: no write-outside, no absolute trust
+            safety_guard: Arc::new(SafetyGuard::new(&[], false)),
+            permission_hub: None,
+            permission_timeout_secs: 120,
+            teams_config: crate::teams::config::TeamsConfig::default(),
+            cancel_token: None,
+            nudge_queue: None,
         }
+    }
+
+    pub fn with_safety_guard(mut self, guard: Arc<SafetyGuard>) -> Self {
+        self.safety_guard = guard;
+        self
+    }
+
+    pub fn with_teams_config(mut self, cfg: crate::teams::config::TeamsConfig) -> Self {
+        self.teams_config = cfg;
+        self
+    }
+
+    /// Cooperative cancel for sub-agents / session abort.
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Mid-run instruction queue (teams nudge).
+    pub fn with_nudge_queue(mut self, q: Arc<AsyncMutex<Vec<String>>>) -> Self {
+        self.nudge_queue = Some(q);
+        self
+    }
+
+    pub fn with_permission_hub(mut self, hub: Arc<PermissionHub>) -> Self {
+        self.permission_hub = Some(hub);
+        self
+    }
+
+    pub fn with_permission_timeout(mut self, secs: u64) -> Self {
+        self.permission_timeout_secs = secs.max(10);
+        self
     }
 
     /// Override the system prompt (default: [`DEFAULT_SYSTEM_PROMPT`]).
@@ -180,8 +251,11 @@ impl Forge {
         self
     }
 
-    /// Override the context window configuration.
+    /// Override the context window configuration (also applies max_agent_iterations).
     pub fn with_context_config(mut self, cfg: ContextConfig) -> Self {
+        if cfg.max_agent_iterations > 0 {
+            self.max_iterations = cfg.max_agent_iterations;
+        }
         self.context_config = cfg;
         self
     }
@@ -400,6 +474,45 @@ impl Forge {
         // ReAct Loop
         // =================================================================
         for iteration in 1..=self.max_iterations {
+            // Cooperative cancel (teams stop / session abort)
+            if self
+                .cancel_token
+                .as_ref()
+                .map(|t| t.is_cancelled())
+                .unwrap_or(false)
+            {
+                info!(session = %session_id, iteration, "Forge: cancelled");
+                let _ = event_tx.send(StreamEvent::Error {
+                    content: "Agent cancelled.".into(),
+                });
+                return Err(ForgeError::Cancelled);
+            }
+
+            // Drain team nudges into the conversation
+            if let Some(ref q) = self.nudge_queue {
+                let mut g = q.lock().await;
+                if !g.is_empty() {
+                    let notes: Vec<String> = g.drain(..).collect();
+                    drop(g);
+                    let joined = notes.join("\n");
+                    let note = format!(
+                        "(Coordinator nudge — follow this additional instruction now):\n{joined}"
+                    );
+                    let _ = event_tx.send(StreamEvent::Token {
+                        content: format!("\n_📩 Nudge:_ {joined}\n"),
+                    });
+                    messages.push(Message {
+                        role: Role::User,
+                        content: MessageContent::Text(note),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        created_at: 0,
+                    });
+                }
+            }
+
             debug!(
                 session = %session_id,
                 iteration,
@@ -407,34 +520,55 @@ impl Forge {
                 "Forge: calling provider"
             );
 
-            // Stall detection — sliding window of tool-call sets.
-            // Check every iteration starting at 60.
-            if iteration >= 60 {
+            // Stall detection — sliding window of tool-call sets (from early on).
+            if iteration >= LOOP_DETECT_FROM_ITERATION {
                 // Only scan messages added during this execute() call (F5).
                 let run_messages = &messages[initial_msg_count..];
+                // Last assistant tool-call set (most recent turn)
                 let current_set: std::collections::BTreeSet<String> = run_messages
                     .iter()
                     .rev()
-                    .filter_map(|m| m.tool_calls.as_ref())
-                    .flat_map(|tc| tc.iter().map(|t| t.function.name.clone()))
-                    .collect();
+                    .find_map(|m| m.tool_calls.as_ref())
+                    .map(|tc| tc.iter().map(|t| t.function.name.clone()).collect())
+                    .unwrap_or_default();
                 if !current_set.is_empty() {
                     if recent_tool_sets.len() >= 5 {
                         recent_tool_sets.pop_front();
                     }
                     recent_tool_sets.push_back(current_set.clone());
-                    // Detect if any set repeats 3+ times in the sliding window
-                    let mut counts: std::collections::HashMap<&std::collections::BTreeSet<String>, usize> =
-                        std::collections::HashMap::new();
+                    let mut counts: std::collections::HashMap<
+                        &std::collections::BTreeSet<String>,
+                        usize,
+                    > = std::collections::HashMap::new();
                     for s in recent_tool_sets.iter() {
                         *counts.entry(s).or_insert(0) += 1;
                     }
-                    if counts.values().any(|&c| c >= 10) {
-                        let _repeated: Vec<String> = current_set.iter().cloned().collect();
+                    // ≥3 appearances of the same tool-set in the last 5 turns
+                    if counts.values().any(|&c| c >= 3) {
+                        let repeated: Vec<String> = current_set.iter().cloned().collect();
                         let _ = event_tx.send(StreamEvent::Token {
-                            content: format!("\n\n⚠️ Tool loop detected ({} iterations). Consider consolidating results and concluding.\n", iteration),
+                            content: format!(
+                                "\n\n**Tool loop detected** (iteration {iteration}): \
+                                 repeated tools `{}`. Stop re-running the same tools; \
+                                 consolidate results and give a final answer now.\n",
+                                repeated.join(", ")
+                            ),
                         });
-                        // Don't stop — let the agent decide to wrap up
+                        messages.push(Message {
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "(System: tool loop detected. Do NOT call the same tools again. \
+                                 Summarize what you have and finish with a concrete answer.)"
+                                    .into(),
+                            ),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                            created_at: 0,
+                        });
+                        // Clear window so we don't re-nudge every turn
+                        recent_tool_sets.clear();
                     }
                 }
             }
@@ -470,7 +604,22 @@ impl Forge {
                         if !summary.is_empty() {
                             let sys = messages.iter().find(|m| m.role == Role::System).and_then(|m| m.content.as_text()).unwrap_or("").to_string();
                             let rest: Vec<_> = messages.iter().filter(|m| m.role != Role::System).skip(compress_count).cloned().collect();
-                            messages = vec![Message { role: Role::System, content: MessageContent::Text(format!("{}\n\n## Conversation Summary\n{}", sys, summary)), ..Default::default() }];
+                            // Re-anchor critical constraints after compression (anti dilution)
+                            let anchors = format!(
+                                "\n\n## Active constraints (re-asserted after compression)\n\
+                                 - Working directory: {}\n\
+                                 - Prefer tools over speculation; do not invent file paths.\n\
+                                 - Follow user global instructions and language preferences from the system prompt.\n\
+                                 - Do not re-run failed tool loops; consolidate and conclude when stuck.\n",
+                                self.working_dir.display()
+                            );
+                            messages = vec![Message {
+                                role: Role::System,
+                                content: MessageContent::Text(format!(
+                                    "{sys}\n\n## Conversation Summary\n{summary}{anchors}"
+                                )),
+                                ..Default::default()
+                            }];
                             messages.extend(rest);
                             self.compressed.store(true, Ordering::Relaxed);
                         }
@@ -572,6 +721,9 @@ impl Forge {
                         session_id,
                         &event_tx,
                         &mut messages,
+                        self.safety_guard.clone(),
+                        self.permission_hub.clone(),
+                        self.permission_timeout_secs,
                     )
                     .await;
                 }
@@ -673,7 +825,7 @@ impl Forge {
         Err(ForgeError::MaxIterations(self.max_iterations))
     }
 
-    /// Execute in /teams mode: plan (main agent) → dispatch sub-agents → merge summary.
+    /// Execute in /teams mode via TeamRuntime (v2 only — v1 path retired).
     async fn run_teams_task(
         &self,
         task: &str,
@@ -681,322 +833,22 @@ impl Forge {
         history: Vec<Message>,
         event_tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), ForgeError> {
-        use crate::teams::dispatcher::SubTask;
-        use futures::stream::{FuturesUnordered, StreamExt};
-
-        /// Soft cap — models tend to over-split; more than this is usually noise.
-        const MAX_TEAM_AGENTS: usize = 8;
-        const MAX_PARALLEL: usize = 6;
-
-        let context_summary = {
-            let mut s = String::new();
-            for msg in history.iter().rev().take(10).rev() {
-                if let Some(t) = msg.content.as_text() {
-                    let trunc: String = t.chars().take(200).collect();
-                    s.push_str(&format!("[{:?}]: {}\n", msg.role, trunc));
-                }
-            }
-            if s.is_empty() {
-                "(no context)".to_string()
-            } else {
-                s
-            }
-        };
-
-        // ── Phase 0: Main agent announces ──
-        let _ = event_tx.send(StreamEvent::Token {
-            content: format!(
-                "## Teams mode — main agent planning\n\n\
-                 **User task:** {task}\n\n\
-                 **Workspace:** `{}`\n\n\
-                 Decomposing into parallel subtasks (max {MAX_TEAM_AGENTS})…\n\n",
-                self.working_dir.display()
-            ),
-        });
-
-        // ── Phase 1: LLM decomposes (bounded) ──
-        let decompose_prompt = format!(
-            "You are the MAIN coordinator of a multi-agent coding team.\n\
-             Decompose the user task into independent parallel subtasks.\n\n\
-             Rules:\n\
-             - Prefer 3–6 subtasks. Absolute maximum {MAX_TEAM_AGENTS}.\n\
-             - Merge related work; do NOT create micro-tasks.\n\
-             - Each subtask must produce a clear deliverable (file or report).\n\
-             - Only create a subtask if it can run in parallel without waiting on others.\n\n\
-             Context:\n{context_summary}\n\
-             Task: {task}\n\
-             Dir: {}\n\n\
-             Output format ONLY (no preamble):\n\
-             PLAN: <1–3 sentences explaining the split strategy for the user>\n\
-             - [ ] <subtask 1>\n\
-             - [ ] <subtask 2>\n\
-             …",
-            self.working_dir.display()
+        if !self.teams_config.v2_enabled {
+            warn!(
+                "teams.v2_enabled=false is ignored; v1 path retired — using TeamRuntime"
+            );
+        }
+        let runtime = crate::teams::runtime::TeamRuntime::new(
+            self.provider.clone_box(),
+            self.tools.clone(),
+            self.working_dir.clone(),
+            self.safety_guard.clone(),
+            self.permission_hub.clone(),
+            self.permission_timeout_secs,
+            self.teams_config.clone(),
+            event_tx,
         );
-
-        let decompose_result = self
-            .provider
-            .chat(
-                vec![Message {
-                    role: Role::User,
-                    content: MessageContent::Text(decompose_prompt),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    created_at: 0,
-                }],
-                vec![],
-            )
-            .await;
-
-        let (plan_text, mut subtask_strings): (String, Vec<String>) = match decompose_result {
-            Ok(ref r) => {
-                let plan = r
-                    .content
-                    .lines()
-                    .find(|l| l.trim().to_uppercase().starts_with("PLAN:"))
-                    .map(|l| {
-                        l.trim()
-                            .trim_start_matches("PLAN:")
-                            .trim_start_matches("plan:")
-                            .trim()
-                            .to_string()
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        "Split work into parallel deliverable-focused subtasks.".into()
-                    });
-
-                let found: Vec<String> = r
-                    .content
-                    .lines()
-                    .filter(|l| {
-                        let t = l.trim();
-                        t.starts_with("- [ ]") || t.starts_with("- ") || t.starts_with("* ")
-                    })
-                    .map(|l| {
-                        l.trim()
-                            .trim_start_matches("- [ ]")
-                            .trim_start_matches("- ")
-                            .trim_start_matches("* ")
-                            .trim()
-                            .to_string()
-                    })
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                (plan, found)
-            }
-            Err(e) => {
-                let _ = event_tx.send(StreamEvent::Token {
-                    content: format!(
-                        "⚠️ Decomposition LLM call failed ({e}); falling back to single agent.\n\n"
-                    ),
-                });
-                ("Run the full task as one unit.".into(), vec![task.to_string()])
-            }
-        };
-
-        if subtask_strings.is_empty() {
-            subtask_strings.push(task.to_string());
-        }
-        // Hard cap — if model over-splits, keep the first N and tell the user
-        let truncated = subtask_strings.len() > MAX_TEAM_AGENTS;
-        if truncated {
-            subtask_strings.truncate(MAX_TEAM_AGENTS);
-        }
-
-        let sub_tasks: Vec<SubTask> = subtask_strings
-            .iter()
-            .enumerate()
-            .map(|(i, s)| SubTask {
-                id: format!("agent-{}", i + 1),
-                prompt: s.clone(),
-                context: format!(
-                    "Dir: {}. You are a focused sub-agent. Produce the deliverable only; \
-                     keep intermediate chatter minimal.",
-                    self.working_dir.display()
-                ),
-            })
-            .collect();
-
-        // ── Main agent explains the plan (this was missing) ──
-        let mut plan_md = String::new();
-        plan_md.push_str("### Plan (main agent)\n\n");
-        plan_md.push_str(&format!("{plan_text}\n\n"));
-        plan_md.push_str(&format!(
-            "Dispatching **{}** sub-agent(s){}:\n\n",
-            sub_tasks.len(),
-            if truncated {
-                format!(" (capped at {MAX_TEAM_AGENTS})")
-            } else {
-                String::new()
-            }
-        ));
-        for st in &sub_tasks {
-            plan_md.push_str(&format!("- **{}**: {}\n", st.id, st.prompt));
-        }
-        plan_md.push_str(&format!(
-            "\n_Parallelism: up to {MAX_PARALLEL} agents run at once; others queue._\n\n---\n\n"
-        ));
-        let _ = event_tx.send(StreamEvent::Token { content: plan_md });
-
-        // Emit agent start events (UI TeamPanel)
-        for st in &sub_tasks {
-            let _ = event_tx.send(StreamEvent::TeamAgentStart {
-                agent_id: st.id.clone(),
-                task: st.prompt.clone(),
-            });
-        }
-
-        // ── Phase 2: parallel sub-agents ──
-        let max_parallel = sub_tasks.len().clamp(1, MAX_PARALLEL);
-        let sem = Arc::new(tokio::sync::Semaphore::new(max_parallel));
-        let mut futures = FuturesUnordered::new();
-        // Collect (id, prompt, success, output) for final merge
-        let results: Arc<tokio::sync::Mutex<Vec<(String, String, bool, String)>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-        for st in &sub_tasks {
-            let st = st.clone();
-            let prov = self.provider.clone_box();
-            let tools = self.tools.clone();
-            let wd = self.working_dir.clone();
-            let sid = session_id.to_string();
-            let tx = event_tx.clone();
-            let sem = sem.clone();
-            let results = results.clone();
-            let sys = st.context.clone();
-
-            futures.push(Box::pin(async move {
-                let _permit = sem.acquire().await;
-                let forge = Forge::new(prov, tools, wd)
-                    .with_system_prompt(format!(
-                        "Sub-agent '{}'. {}\nFocus only on your assigned subtask.",
-                        st.id, sys
-                    ))
-                    // Sub-agents must NOT recurse into teams mode
-                    .with_teams_mode(false)
-                    .with_max_iterations(80);
-                let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel();
-
-                let forge_fut = Box::pin(forge.execute(&st.prompt, &sid, vec![], stx));
-                let drain_fut = Box::pin(async {
-                    let mut out = String::new();
-                    while let Some(ev) = srx.recv().await {
-                        match ev {
-                            StreamEvent::Token { content } => {
-                                out.push_str(&content);
-                                let _ = tx.send(StreamEvent::TeamAgentOutput {
-                                    agent_id: st.id.clone(),
-                                    content,
-                                });
-                            }
-                            StreamEvent::ToolStart { name, .. } => {
-                                let note = format!("\n🔧 tool: {name}\n");
-                                out.push_str(&note);
-                                let _ = tx.send(StreamEvent::TeamAgentOutput {
-                                    agent_id: st.id.clone(),
-                                    content: note,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                    out
-                });
-
-                let (forge_result, out) = tokio::join!(forge_fut, drain_fut);
-                let success = forge_result.is_ok();
-                let summary: String = out.chars().take(400).collect();
-                let _ = tx.send(StreamEvent::TeamAgentEnd {
-                    agent_id: st.id.clone(),
-                    success,
-                    summary: summary.clone(),
-                });
-                results
-                    .lock()
-                    .await
-                    .push((st.id.clone(), st.prompt.clone(), success, out));
-            }));
-        }
-
-        while let Some(()) = futures.next().await {}
-
-        let collected = results.lock().await.clone();
-        let done = collected.iter().filter(|r| r.2).count();
-        let failed = collected.len().saturating_sub(done);
-        let _ = event_tx.send(StreamEvent::TeamComplete {
-            completed: done,
-            failed,
-        });
-
-        // ── Phase 3: Main agent merge / explain results ──
-        let _ = event_tx.send(StreamEvent::Token {
-            content: format!(
-                "\n---\n\n### Main agent summary\n\n\
-                 Sub-agents finished: **{done}** ok, **{failed}** failed.\n\n\
-                 Synthesizing final report…\n\n"
-            ),
-        });
-
-        let mut results_block = String::new();
-        for (id, prompt, success, out) in &collected {
-            let status = if *success { "OK" } else { "FAIL" };
-            let excerpt: String = out.chars().take(1200).collect();
-            results_block.push_str(&format!(
-                "### {id} [{status}]\n**Task:** {prompt}\n\n{excerpt}\n\n"
-            ));
-        }
-
-        let merge_prompt = format!(
-            "You are the MAIN agent of a multi-agent team. Sub-agents have finished.\n\
-             Original user task:\n{task}\n\n\
-             Your plan was:\n{plan_text}\n\n\
-             Sub-agent results:\n{results_block}\n\
-             Write a clear final report for the user in markdown:\n\
-             1. What was accomplished overall\n\
-             2. Per-agent outcomes (brief)\n\
-             3. Key files produced / changes\n\
-             4. Remaining risks or follow-ups\n\
-             Be concrete. Do not invent files that were not mentioned."
-        );
-
-        match self
-            .provider
-            .chat(
-                vec![Message {
-                    role: Role::User,
-                    content: MessageContent::Text(merge_prompt),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    created_at: 0,
-                }],
-                vec![],
-            )
-            .await
-        {
-            Ok(r) => {
-                if !r.content.is_empty() {
-                    let _ = event_tx.send(StreamEvent::Token {
-                        content: r.content,
-                    });
-                }
-            }
-            Err(e) => {
-                // Fallback: concatenate without LLM merge
-                let _ = event_tx.send(StreamEvent::Token {
-                    content: format!(
-                        "_(Merge LLM failed: {e}. Raw sub-agent outputs below.)_\n\n{results_block}"
-                    ),
-                });
-            }
-        }
-
-        let _ = event_tx.send(StreamEvent::Complete { usage: None });
-        Ok(())
+        runtime.run(task, session_id, history).await
     }
 
     /// Start a multi-turn /plan interview (grill-me style).
@@ -1094,6 +946,9 @@ impl Forge {
             self.tools.clone(),
             self.working_dir.clone(),
         )
+        .with_safety_guard(self.safety_guard.clone())
+        .with_permission_hub(self.permission_hub.clone())
+        .with_permission_timeout(self.permission_timeout_secs)
         .with_magi_max_rounds(3)
         .with_magi_max_steps(12)
         .with_teams_parallel(teams_on)
@@ -1530,6 +1385,9 @@ async fn execute_one_tool(
     session_id: &str,
     event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     messages: &mut Vec<Message>,
+    safety_guard: Arc<SafetyGuard>,
+    permission_hub: Option<Arc<PermissionHub>>,
+    permission_timeout_secs: u64,
 ) {
     let tool_name = &tc.function.name;
     let tool_call_id = &tc.id;
@@ -1573,13 +1431,21 @@ async fn execute_one_tool(
         }
     };
 
-    // --- Build tool context ---
+    // --- Build tool context (real safety policy — never empty+allow_outside) ---
     let ctx = ToolContext {
         working_dir: working_dir.clone(),
         session_id: session_id.to_string(),
         tool_call_id: tool_call_id.clone(),
         sender: event_tx.clone(),
-        safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        safety_guard,
+        permission_hub,
+        permission_timeout_secs,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
     };
 
     // --- Execute the tool ---
@@ -1590,7 +1456,7 @@ async fn execute_one_tool(
             } else {
                 ToolStatus::Error
             };
-            let output = if result.success {
+            let raw = if result.success {
                 result.output.clone()
             } else {
                 result
@@ -1599,6 +1465,7 @@ async fn execute_one_tool(
                     .unwrap_or(&result.output)
                     .to_string()
             };
+            let output = truncate_tool_result(&raw, MAX_TOOL_RESULT_CHARS);
 
             debug!(
                 tool = %tool_name,
@@ -1646,4 +1513,15 @@ async fn execute_one_tool(
                 reasoning_content: None, created_at: 0 });
         }
     }
+}
+
+/// Truncate tool output before injecting into LLM context (anti context bloat).
+fn truncate_tool_result(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars.saturating_sub(80)).collect();
+    format!(
+        "{head}\n\n…[tool output truncated at {max_chars} chars; re-read file/path if more is needed]…"
+    )
 }

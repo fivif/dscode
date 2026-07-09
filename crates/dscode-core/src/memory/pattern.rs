@@ -15,9 +15,20 @@ pub struct Pattern {
 
 impl Pattern {
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        let name = name.into();
+        // Stable id from name so upserts collide instead of duplicating rows
+        let id = format!(
+            "pat_{:x}",
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                name.hash(&mut h);
+                h.finish()
+            }
+        );
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.into(),
+            id,
+            name,
             description: description.into(),
             occurrence_count: 1,
             last_seen_at: chrono::Utc::now().timestamp(),

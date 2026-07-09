@@ -46,7 +46,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             dscode_desktop::commands::chat::send_message,
             dscode_desktop::commands::chat::stage_upload,
+            dscode_desktop::commands::chat::approve_permission,
+            dscode_desktop::commands::chat::deny_permission,
             dscode_desktop::commands::chat::abort,
+            dscode_desktop::commands::chat::stop_team_agent,
+            dscode_desktop::commands::chat::nudge_team_agent,
             dscode_desktop::commands::chat::list_tools,
             dscode_desktop::commands::mcp::list_mcp_servers,
             dscode_desktop::commands::mcp::add_mcp_server,

@@ -58,6 +58,7 @@ function defaultAppConfig(): AppConfig {
     proxy: { url: '', global: false },
     mcp_use_proxy: false,
     skills_use_proxy: false,
+    absolute_trust: false,
   };
 }
 
@@ -315,6 +316,7 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
         },
         mcp_use_proxy: !!(r as any).extensions?.mcp_use_proxy,
         skills_use_proxy: !!(r as any).extensions?.skills_use_proxy,
+        absolute_trust: !!(r as any).safety?.absolute_trust,
       };
       draft = normalizeProxyFlags(draft);
 
@@ -375,12 +377,14 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
           model: p?.model || '',
           model_list: Array.isArray(p?.model_list) ? p!.model_list : [],
         });
-        // Preserve mcp_servers / skills_dirs / agent prompt already on disk
+        // Preserve mcp_servers / skills_dirs / agent / safety extras already on disk
         let existingExt: any = {};
         let existingAgent: any = { global_prompt: '', replace_system_prompt: false };
+        let existingSafety: any = {};
         try {
           const cur = await tauri.getConfig();
           existingExt = (cur as any).extensions || {};
+          existingSafety = (cur as any).safety || {};
           if ((cur as any).agent) {
             existingAgent = {
               global_prompt: (cur as any).agent.global_prompt || '',
@@ -402,9 +406,11 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
           },
           session: { retention_days: synced.retention_days },
           safety: {
-            allow_write_outside_project: false,
-            blocked_commands: [],
-            tool_timeout_secs: 120,
+            allow_write_outside_project: !!existingSafety.allow_write_outside_project,
+            blocked_commands: existingSafety.blocked_commands || [],
+            tool_timeout_secs: existingSafety.tool_timeout_secs || 120,
+            absolute_trust: !!synced.absolute_trust,
+            permission_timeout_secs: existingSafety.permission_timeout_secs || 120,
           },
           generation: {
             reasoning_effort: synced.reasoning_effort,

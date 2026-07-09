@@ -127,7 +127,24 @@ export type StreamEvent =
       options: string[];
       remaining: number;
       auto_notes: string[];
+    }
+  | {
+      type: 'permission_request';
+      id: string;
+      tool_call_id: string;
+      command: string;
+      reason: string;
+      timeout_secs: number;
     };
+
+export interface PermissionRequest {
+  id: string;
+  tool_call_id: string;
+  command: string;
+  reason: string;
+  timeout_secs: number;
+  session_id: string;
+}
 
 // ── Config (matches Rust Config struct) ──
 export interface RustProviderConfig {
@@ -155,7 +172,13 @@ export interface Config {
     ollama: RustProviderConfig;
   };
   session: { retention_days: number };
-  safety: { allow_write_outside_project: boolean; blocked_commands: string[]; tool_timeout_secs: number };
+  safety: {
+    allow_write_outside_project: boolean;
+    blocked_commands: string[];
+    tool_timeout_secs: number;
+    absolute_trust?: boolean;
+    permission_timeout_secs?: number;
+  };
   generation: { reasoning_effort: string; max_tokens: number; temperature: number; proxy_url?: string };
   context?: { window_tokens: number; compress_threshold: number };
   extensions?: {
@@ -196,6 +219,8 @@ export interface AppConfig {
   proxy: ProxyConfig;
   mcp_use_proxy: boolean;
   skills_use_proxy: boolean;
+  /** Absolute trust: skip confirm for dangerous commands (hard blocks still apply) */
+  absolute_trust: boolean;
 }
 
 /** Valid non-empty proxy URL with supported scheme */

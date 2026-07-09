@@ -390,7 +390,7 @@ async fn plan_llm_json_parse_unit_path() {
     .expect("llm turn");
 
     match action {
-        LlmInterviewAction::Ask { question, recommended, auto_notes } => {
+        LlmInterviewAction::Ask { question, recommended, auto_notes, .. } => {
             assert!(question.to_lowercase().contains("user"));
             assert!(!recommended.is_empty());
             assert!(!auto_notes.is_empty());

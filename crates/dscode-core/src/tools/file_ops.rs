@@ -21,73 +21,88 @@ use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 /// checking each ancestor path component with `canonicalize()`, then joining
 /// with the non-existent filename.
 fn resolve_path(path: &str, working_dir: &Path) -> Result<PathBuf, ToolError> {
-    // Resolve relative to the working directory
-    let candidate = working_dir.join(path);
-
-    // Canonicalize to resolve symlinks and `..` components.
-    let canonical = match candidate.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // T6: Path doesn't exist — resolve symlinks in parent directories first.
-            // Walk up from the candidate path finding the nearest existing ancestor,
-            // canonicalize it, then join the remaining non-existent components.
-            let mut existing_ancestor: Option<PathBuf> = None;
-            let mut remaining: Vec<std::path::Component<'_>> = Vec::new();
-
-            for ancestor in candidate.ancestors() {
-                if let Ok(canon) = ancestor.canonicalize() {
-                    existing_ancestor = Some(canon);
-                    break;
-                }
-                // Prepend components as we walk up
-                let comp = ancestor
-                    .file_name()
-                    .map(|_| ancestor.components().last())
-                    .flatten();
-                if let Some(c) = comp {
-                    remaining.insert(0, c);
-                }
-            }
-
-            let resolved = if let Some(ancestor) = existing_ancestor {
-                let mut result = ancestor;
-                for comp in remaining {
-                    result.push(comp.as_os_str());
-                }
-                result
-            } else {
-                // No existing ancestor found — fall back to manual normalization
-                normalize_path(&candidate)
-            };
-
-            // Verify the resolved path stays within the working directory
-            let wd_canonical = working_dir.canonicalize().unwrap_or_else(|_| working_dir.to_path_buf());
-            if !resolved.starts_with(&wd_canonical) {
-                return Err(ToolError::PathEscape(format!(
-                    "Path '{}' resolves outside working directory '{}'",
-                    path,
-                    working_dir.display()
-                )));
-            }
-            return Ok(resolved);
-        }
-    };
-
-    // Existing path — make sure it's within working_dir
-    let wd_canonical = working_dir.canonicalize().unwrap_or_else(|_| working_dir.to_path_buf());
-    if !canonical.starts_with(&wd_canonical) {
-        return Err(ToolError::PathEscape(format!(
-            "Path '{}' resolves outside working directory '{}'",
-            path,
-            working_dir.display()
-        )));
+    // Reject absolute paths that clearly leave workspace intent
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(ToolError::InvalidParameter {
+            name: "path".into(),
+            reason: "empty path".into(),
+        });
     }
 
-    Ok(canonical)
+    // Use SafetyGuard path logic for consistent containment (incl. non-existent files)
+    let guard = crate::safety::guard::SafetyGuard::new(&[], false);
+    match guard.resolve_safe_path(path, working_dir) {
+        Ok(p) => {
+            // Extra: if path exists and is symlink, ensure target still under root
+            if p.exists() {
+                if let Ok(canon) = p.canonicalize() {
+                    let wd = working_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| working_dir.to_path_buf());
+                    if !canon.starts_with(&wd) {
+                        return Err(ToolError::PathEscape(format!(
+                            "Path '{}' resolves outside working directory '{}'",
+                            path,
+                            working_dir.display()
+                        )));
+                    }
+                    return Ok(canon);
+                }
+            }
+            Ok(p)
+        }
+        Err(e) => Err(ToolError::PathEscape(e)),
+    }
 }
 
-/// Normalize a path by resolving `.` and `..` components without touching the
-/// filesystem.
+async fn check_write_allowed(ctx: &ToolContext, path_str: &str) -> Result<(), ToolError> {
+    let (Some(agent_id), Some(fo)) = (&ctx.team_agent_id, &ctx.file_ownership) else {
+        return Ok(());
+    };
+    let guard = fo.lock().await;
+    match guard.check_write(agent_id, path_str, ctx.ownership_enforced) {
+        crate::teams::ownership::PathAccess::Allowed => Ok(()),
+        crate::teams::ownership::PathAccess::Denied {
+            holder,
+            path,
+            reason,
+        } => {
+            let msg = format!(
+                "path ownership denied for '{}': {reason} (holder={holder:?})",
+                path.display()
+            );
+            if ctx.ownership_soft_log_only {
+                tracing::warn!(%msg, "ownership soft deny");
+                Ok(())
+            } else {
+                Err(ToolError::Internal(msg))
+            }
+        }
+    }
+}
+
+async fn check_read_before_edit(ctx: &ToolContext, path_str: &str) -> Result<(), ToolError> {
+    if !ctx.read_before_edit {
+        return Ok(());
+    }
+    let Some(ref set) = ctx.read_paths else {
+        return Ok(());
+    };
+    let g = set.lock().await;
+    let ok = g.contains(path_str)
+        || g.iter().any(|p| p.ends_with(path_str) || path_str.ends_with(p));
+    if ok {
+        Ok(())
+    } else {
+        Err(ToolError::EditError(format!(
+            "read-before-edit: call do_file_read on '{path_str}' before writing/editing"
+        )))
+    }
+}
+
+/// Normalize a path by resolving `.` and `..` without filesystem access (tests + helpers).
+#[cfg(test)]
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
@@ -179,6 +194,13 @@ impl Tool for DoFileRead {
             ));
         }
 
+        // Track read for read-before-edit
+        if let Some(ref set) = ctx.read_paths {
+            let mut g = set.lock().await;
+            g.insert(path_str.to_string());
+            g.insert(file_path.to_string_lossy().to_string());
+        }
+
         let content = std::fs::read_to_string(&file_path).map_err(|e| {
             ToolError::Io(e)
         })?;
@@ -266,6 +288,9 @@ impl Tool for DoFileWrite {
 
         // Resolve the path (will normalize without requiring file to exist)
         let file_path = resolve_path(path_str, &ctx.working_dir)?;
+
+        check_write_allowed(ctx, path_str).await?;
+        check_read_before_edit(ctx, path_str).await?;
 
         // Create parent directories
         if let Some(parent) = file_path.parent() {
@@ -365,6 +390,9 @@ impl Tool for DoFileEdit {
             .as_str()
             .ok_or_else(|| ToolError::MissingParameter("new_string".into()))?;
 
+        check_write_allowed(ctx, path_str).await?;
+        check_read_before_edit(ctx, path_str).await?;
+
         if old_string == new_string {
             return Ok(ToolResult::err(
                 "",
@@ -440,17 +468,15 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    async fn make_ctx(
-        dir: &std::path::Path,
-    ) -> ToolContext {
+    async fn make_ctx(dir: &std::path::Path) -> ToolContext {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        ToolContext {
-            working_dir: dir.to_path_buf(),
-            session_id: "test".into(),
-            tool_call_id: "call_fops".into(),
-            sender: tx,
-            safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
-        }
+        ToolContext::simple(
+            dir.to_path_buf(),
+            "test",
+            "call_fops",
+            tx,
+            Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        )
     }
 
     // -- do_file_read --

@@ -89,6 +89,16 @@ pub enum StreamEvent {
         #[serde(default)]
         auto_notes: Vec<String>,
     },
+    /// Dangerous command needs user approval (Safe mode).
+    PermissionRequest {
+        /// Unique id for approve/deny IPC.
+        id: String,
+        tool_call_id: String,
+        command: String,
+        reason: String,
+        #[serde(default)]
+        timeout_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

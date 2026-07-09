@@ -15,8 +15,11 @@ use crate::providers::trait_def::{
 };
 use crate::tools::registry::ToolRegistry;
 #[allow(unused_imports)]
-use crate::tools::trait_def::{ToolContext, ToolError};
 use crate::safety::guard::SafetyGuard;
+use crate::safety::permission::PermissionHub;
+use crate::tools::trait_def::{ToolContext, ToolError};
+
+const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 
 use crate::agent::stream::{StreamEvent, ToolStatus};
 use super::scheduler::MagiError;
@@ -88,6 +91,9 @@ pub async fn execute_subtask(
     scrutiny: &str,
     max_steps: u32,
     progress: Option<&MagiProgress>,
+    safety_guard: Arc<SafetyGuard>,
+    permission_hub: Option<Arc<PermissionHub>>,
+    permission_timeout_secs: u64,
 ) -> Result<String, MagiError> {
     let tool_defs = tools.to_openai_tools();
 
@@ -219,6 +225,9 @@ pub async fn execute_subtask(
                     tc,
                     working_dir,
                     session_id,
+                    safety_guard.clone(),
+                    permission_hub.clone(),
+                    permission_timeout_secs,
                 )
                 .await;
 
@@ -300,6 +309,9 @@ async fn execute_balthasar_tool(
     tc: &ToolCall,
     working_dir: &PathBuf,
     session_id: &str,
+    safety_guard: Arc<SafetyGuard>,
+    permission_hub: Option<Arc<PermissionHub>>,
+    permission_timeout_secs: u64,
 ) -> String {
     let tool_name = &tc.function.name;
 
@@ -314,12 +326,21 @@ async fn execute_balthasar_tool(
         }
     };
 
-    // Drain tool-internal events (avoid "dropped receiver" warnings).
+    // Forward permission events to progress channel if present via ctx.sender.
+    // Drain other tool-internal events (avoid "dropped receiver" warnings).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sid = session_id.to_string();
     let tname = tool_name.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
+            // Permission requests need a live UI — log if dropped
+            if matches!(event, StreamEvent::PermissionRequest { .. }) {
+                warn!(
+                    session = %sid,
+                    tool = %tname,
+                    "Balthasar: permission request in auto path (no interactive UI) — may deny"
+                );
+            }
             debug!(
                 session = %sid,
                 tool = %tname,
@@ -329,21 +350,29 @@ async fn execute_balthasar_tool(
         }
     });
 
-    let ctx = ToolContext {
-        working_dir: working_dir.clone(),
-        session_id: session_id.to_string(),
-        tool_call_id: tc.id.clone(),
-        sender: tx,
-        safety_guard: Arc::new(SafetyGuard::new(&[], true)),
-    };
+    let mut ctx = ToolContext::simple(
+        working_dir.clone(),
+        session_id,
+        tc.id.clone(),
+        tx,
+        safety_guard,
+    );
+    ctx.permission_hub = permission_hub;
+    ctx.permission_timeout_secs = permission_timeout_secs;
 
     let fut = tools.execute(tool_name, args, &ctx);
     match tokio::time::timeout(std::time::Duration::from_secs(TOOL_TIMEOUT_SECS), fut).await {
         Ok(Ok(result)) => {
-            if result.success {
+            let raw = if result.success {
                 result.output
             } else {
                 result.error.as_deref().unwrap_or(&result.output).to_string()
+            };
+            if raw.chars().count() > MAX_TOOL_RESULT_CHARS {
+                let head: String = raw.chars().take(MAX_TOOL_RESULT_CHARS - 60).collect();
+                format!("{head}\n…[truncated]…")
+            } else {
+                raw
             }
         }
         Ok(Err(e)) => e.to_string(),
@@ -525,6 +554,9 @@ mod tests {
             "Scrutiny: Looks fine",
             10,
             None,
+            Arc::new(SafetyGuard::new(&[], true)),
+            None,
+            120,
         )
         .await;
 
@@ -570,6 +602,9 @@ mod tests {
             "Scrutiny: Verify echo works",
             10,
             None,
+            Arc::new(SafetyGuard::new(&[], true)),
+            None,
+            120,
         )
         .await;
 
@@ -611,6 +646,9 @@ mod tests {
             "Scrutiny: needs work",
             3,
             None,
+            Arc::new(SafetyGuard::new(&[], true)),
+            None,
+            120,
         )
         .await;
 

@@ -62,6 +62,9 @@ pub async fn set_global_prompt(
     config.agent = AgentConfig {
         global_prompt: global_prompt.clone(),
         replace_system_prompt,
+        memory_enabled: config.agent.memory_enabled,
+        read_before_edit: config.agent.read_before_edit,
+        memory_auto_ingest: config.agent.memory_auto_ingest,
     };
     config
         .save()

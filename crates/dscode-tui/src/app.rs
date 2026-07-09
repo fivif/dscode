@@ -521,6 +521,20 @@ impl AppState {
                     timestamp: Utc::now().timestamp(),
                 });
             }
+            StreamEvent::PermissionRequest {
+                command,
+                reason,
+                timeout_secs,
+                ..
+            } => {
+                self.messages.push(UiMessage::Assistant {
+                    content: format!(
+                        "⚠️ Permission required ({timeout_secs}s):\n`{command}`\n{reason}\n\
+                         (Use desktop GUI to approve, or enable absolute_trust in config.)"
+                    ),
+                    timestamp: Utc::now().timestamp(),
+                });
+            }
             StreamEvent::Error { content } => {
                 self.messages.push(UiMessage::Error { content });
             }

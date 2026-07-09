@@ -42,16 +42,55 @@ pub async fn send_message(
     let _session_guard = state.acquire_session_lock(&session_id).await;
 
     // 1. Read config and create the correct provider (OpenAI-compat / Anthropic).
-    let (provider, context_cfg, system_prompt) = {
+    let (
+        provider,
+        context_cfg,
+        system_prompt,
+        safety_guard,
+        perm_timeout,
+        teams_cfg,
+        memory_auto_ingest,
+        memory_enabled,
+        read_before_edit,
+    ) = {
         let config = state.config.lock().await;
         let model = config.default_model.clone();
         let provider = create_provider(&model, &config)
             .map_err(|e| format!("Failed to create provider for '{model}': {e}"))?;
-        let system_prompt = config
+        let mut system_prompt = config
             .agent
             .resolve_system_prompt(dscode_core::agent::forge::DEFAULT_SYSTEM_PROMPT);
-        (provider, config.context.clone(), system_prompt)
+        // Optional memory recall into system prompt
+        if config.agent.memory_enabled {
+            if let Ok(scribe) = dscode_core::memory::scribe::Scribe::new() {
+                let hits = scribe.recall(&message, 6);
+                if !hits.is_empty() {
+                    system_prompt.push_str("\n\n## Memory recall (optional context)\n");
+                    for h in hits {
+                        system_prompt.push_str("- ");
+                        system_prompt.push_str(&h);
+                        system_prompt.push('\n');
+                    }
+                }
+            }
+        }
+        let safety_guard = std::sync::Arc::new(
+            dscode_core::safety::guard::SafetyGuard::from_config(&config),
+        );
+        let perm_timeout = config.safety.permission_timeout_secs.max(10);
+        (
+            provider,
+            config.context.clone(),
+            system_prompt,
+            safety_guard,
+            perm_timeout,
+            config.teams.clone(),
+            config.agent.memory_auto_ingest,
+            config.agent.memory_enabled,
+            config.agent.read_before_edit,
+        )
     };
+    let _ = read_before_edit; // reserved: wire into ToolContext when main-agent RBE enabled
 
     // DB4: Hold session_manager lock once for all session DB operations.
     state.ensure_session_manager().await?;
@@ -128,7 +167,11 @@ pub async fn send_message(
     )
     .with_system_prompt(system_prompt)
     .with_context_config(context_cfg)
-    .with_teams_mode(teams_mode);
+    .with_teams_mode(teams_mode)
+    .with_teams_config(teams_cfg)
+    .with_safety_guard(safety_guard)
+    .with_permission_hub(state.permission_hub.clone())
+    .with_permission_timeout(perm_timeout);
 
     // 5. Spawn the agent loop in a background task with cancellation support.
     let app_handle_clone = app_handle.clone();
@@ -140,6 +183,7 @@ pub async fn send_message(
     let event_loop_cancel = cancel.clone();
     let forge_cancel = cancel.clone();
 
+    let user_for_memory = full_message.clone();
     let handle = tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
@@ -286,11 +330,20 @@ pub async fn send_message(
         }
 
         // If the loop ended normally (channel closed), check forge result.
-        match forge_task.await {
-            Ok(Ok(())) => info!(session = %persist_sid, "forge completed"),
-            Ok(Err(e)) => error!(session = %persist_sid, %e, "forge failed"),
-            Err(e) => error!(session = %persist_sid, ?e, "forge panicked"),
-        }
+        let forge_ok = match forge_task.await {
+            Ok(Ok(())) => {
+                info!(session = %persist_sid, "forge completed");
+                true
+            }
+            Ok(Err(e)) => {
+                error!(session = %persist_sid, %e, "forge failed");
+                false
+            }
+            Err(e) => {
+                error!(session = %persist_sid, ?e, "forge panicked");
+                false
+            }
+        };
 
         // DB2: Persist final accumulated content after normal completion.
         let app_state = app_handle_clone.state::<AppState>();
@@ -310,13 +363,26 @@ pub async fn send_message(
             if !assistant_content.is_empty() {
                 sm.add_message(&persist_sid, &Message {
                     role: Role::Assistant,
-                    content: MessageContent::Text(assistant_content),
+                    content: MessageContent::Text(assistant_content.clone()),
                     name: None, tool_calls: None, tool_call_id: None,
                     reasoning_content: None, created_at: now,
                 }).ok();
             }
         }
         drop(sm_guard);
+
+        // Memory closed-loop: ingest user + assistant when auto_ingest on
+        if forge_ok && memory_auto_ingest {
+            if let Ok(scribe) = dscode_core::memory::scribe::Scribe::new() {
+                let _ = scribe.ingest_turn(&persist_sid, "user", &user_for_memory);
+                if !assistant_content.is_empty() {
+                    let excerpt: String = assistant_content.chars().take(8000).collect();
+                    let _ = scribe.ingest_turn(&persist_sid, "assistant", &excerpt);
+                }
+                info!(session = %persist_sid, "memory auto-ingest complete");
+            }
+        }
+        let _ = memory_enabled; // recall already applied at turn start
     });
 
     // Per-session forge — does NOT cancel other sessions' runs.
@@ -337,6 +403,13 @@ pub async fn abort(
     session_id: String,
 ) -> Result<(), String> {
     info!(%session_id, "chat: abort requested");
+    // Stop all teams sub-agents for this session (control plane)
+    if let Some(cp) = dscode_core::teams::global_control_planes()
+        .get(&session_id)
+        .await
+    {
+        cp.stop_all().await;
+    }
     if state.abort_forge(&session_id).await {
         // Brief yield so cancel handlers can persist partial content.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -508,6 +581,26 @@ pub async fn install_skill_package(package: String) -> Result<String, String> {
     Ok(report.message)
 }
 
+/// Approve a pending dangerous-command permission request (Safe mode).
+#[tauri::command]
+pub async fn approve_permission(
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    info!(%request_id, "permission: approve");
+    state.permission_hub.resolve(&request_id, true).await
+}
+
+/// Deny a pending dangerous-command permission request.
+#[tauri::command]
+pub async fn deny_permission(
+    state: tauri::State<'_, AppState>,
+    request_id: String,
+) -> Result<(), String> {
+    info!(%request_id, "permission: deny");
+    state.permission_hub.resolve(&request_id, false).await
+}
+
 /// Stage raw file bytes (paste / drag from webview) into session uploads.
 /// Returns absolute path for use in `send_message` attachments.
 #[tauri::command]
@@ -596,4 +689,34 @@ pub async fn subscribe_task_events(
     });
 
     Ok(())
+}
+
+/// Stop a running teams sub-agent by id (Teams v2 control plane).
+#[tauri::command]
+pub async fn stop_team_agent(session_id: String, agent_id: String) -> Result<bool, String> {
+    if let Some(cp) = dscode_core::teams::global_control_planes()
+        .get(&session_id)
+        .await
+    {
+        Ok(cp.stop_agent(&agent_id).await)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Nudge a running teams sub-agent with extra instruction text.
+#[tauri::command]
+pub async fn nudge_team_agent(
+    session_id: String,
+    agent_id: String,
+    message: String,
+) -> Result<bool, String> {
+    if let Some(cp) = dscode_core::teams::global_control_planes()
+        .get(&session_id)
+        .await
+    {
+        Ok(cp.nudge_agent(&agent_id, message).await)
+    } else {
+        Ok(false)
+    }
 }

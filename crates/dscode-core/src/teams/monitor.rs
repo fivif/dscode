@@ -184,8 +184,9 @@ impl Monitor {
             | StreamEvent::TeamAgentOutput { .. }
             | StreamEvent::TeamAgentEnd { .. }
             | StreamEvent::TeamComplete { .. }
-            | StreamEvent::PlanQuestion { .. } => {
-                // Team / plan UI events are handled at a higher level.
+            | StreamEvent::PlanQuestion { .. }
+            | StreamEvent::PermissionRequest { .. } => {
+                // Team / plan / permission UI events are handled at a higher level.
             }
         }
     }

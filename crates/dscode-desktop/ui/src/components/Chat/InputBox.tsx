@@ -139,8 +139,10 @@ export default function InputBox() {
   const workspace = activeSession?.workspace || '';
 
   const config = useConfigStore((s) => s.config);
+  const updateConfig = useConfigStore((s) => s.updateConfig);
   const setDefaultModel = useConfigStore((s) => s.setDefaultModel);
   const fetchedModels = useConfigStore((s) => s.fetchedModels);
+  const absoluteTrust = !!config.absolute_trust;
   const activeProvider = config.active_provider;
   const activeModel = config.default_model;
   const modelOptions = useMemo(
@@ -907,6 +909,57 @@ export default function InputBox() {
                 </svg>
                 <span className="absolute text-[6px] text-gray-400 font-mono leading-none">{ctxLabel}</span>
               </div>
+
+              <button
+                type="button"
+                className={`text-xs px-1.5 py-0.5 rounded transition-colors flex items-center gap-1 ${
+                  absoluteTrust
+                    ? 'text-amber-400 bg-amber-400/10'
+                    : 'text-gray-500 hover:text-gray-300'
+                }`}
+                title={
+                  absoluteTrust
+                    ? '绝对信任：危险命令不再确认（硬拦截仍生效）。点击切回需确认'
+                    : '安全模式：危险命令需确认。点击开启绝对信任（会持久化）'
+                }
+                onClick={() => {
+                  if (!absoluteTrust) {
+                    if (
+                      !confirm(
+                        '开启「绝对信任」后，危险命令将不再弹出确认（rm -rf / 等硬拦截仍生效）。是否继续？',
+                      )
+                    ) {
+                      return;
+                    }
+                  }
+                  void updateConfig({ absolute_trust: !absoluteTrust });
+                }}
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden
+                >
+                  {absoluteTrust ? (
+                    <>
+                      <rect x="3" y="11" width="18" height="11" rx="2" />
+                      <path d="M7 11V7a5 5 0 0 1 9.9-1" />
+                    </>
+                  ) : (
+                    <>
+                      <rect x="3" y="11" width="18" height="11" rx="2" />
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                    </>
+                  )}
+                </svg>
+                <span>{absoluteTrust ? '信任' : '安全'}</span>
+              </button>
 
               <button
                 className={`text-xs px-1.5 py-0.5 rounded transition-colors flex items-center gap-0.5 ${

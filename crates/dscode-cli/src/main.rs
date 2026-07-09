@@ -43,8 +43,11 @@ async fn main() -> Result<()> {
     let registry = Arc::new(registry);
 
     // Setup forge
+    let safety = std::sync::Arc::new(dscode_core::safety::guard::SafetyGuard::from_config(&config));
     let forge = Forge::new(provider, registry.clone(), working_dir.clone())
-        .with_teams_mode(teams_mode);
+        .with_teams_mode(teams_mode)
+        .with_teams_config(config.teams.clone())
+        .with_safety_guard(safety);
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
 
     // Create initial session

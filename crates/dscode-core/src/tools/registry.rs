@@ -114,6 +114,36 @@ impl ToolRegistry {
     pub fn is_empty(&self) -> bool {
         self.tools.read().expect("tool registry lock").is_empty()
     }
+
+    /// Snapshot registry keeping only named tools (shares Arc entries).
+    pub fn with_allowlist(&self, names: &[&str]) -> Arc<ToolRegistry> {
+        let allow: std::collections::HashSet<&str> = names.iter().copied().collect();
+        let map = self.tools.read().expect("tool registry lock");
+        let mut filtered = HashMap::new();
+        for (name, tool) in map.iter() {
+            if allow.contains(name.as_str()) {
+                filtered.insert(name.clone(), tool.clone());
+            }
+        }
+        Arc::new(ToolRegistry {
+            tools: RwLock::new(filtered),
+        })
+    }
+
+    /// Snapshot registry excluding named tools.
+    pub fn with_denylist(&self, names: &[&str]) -> Arc<ToolRegistry> {
+        let deny: std::collections::HashSet<&str> = names.iter().copied().collect();
+        let map = self.tools.read().expect("tool registry lock");
+        let mut filtered = HashMap::new();
+        for (name, tool) in map.iter() {
+            if !deny.contains(name.as_str()) {
+                filtered.insert(name.clone(), tool.clone());
+            }
+        }
+        Arc::new(ToolRegistry {
+            tools: RwLock::new(filtered),
+        })
+    }
 }
 
 impl Default for ToolRegistry {
@@ -188,6 +218,14 @@ mod tests {
             tool_call_id: "call_1".into(),
             sender: tx,
             safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let result = reg.execute("do_stub", serde_json::json!({}), &ctx).await;
@@ -195,6 +233,18 @@ mod tests {
         let result = result.unwrap();
         assert!(result.success);
         assert_eq!(result.output, "stub result");
+    }
+
+    #[test]
+    fn test_allowlist_denylist_snapshot() {
+        let mut reg = ToolRegistry::new();
+        reg.register_default_tools();
+        let allow = reg.with_allowlist(&["do_file_read", "do_skill_list"]);
+        assert!(allow.get("do_file_read").is_some());
+        assert!(allow.get("do_bash").is_none());
+        let deny = reg.with_denylist(&["do_skill_install"]);
+        assert!(deny.get("do_bash").is_some());
+        assert!(deny.get("do_skill_install").is_none());
     }
 
     #[tokio::test]
@@ -207,6 +257,14 @@ mod tests {
             tool_call_id: "call_1".into(),
             sender: tx,
             safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let result = reg.execute("nonexistent", serde_json::json!({}), &ctx).await;

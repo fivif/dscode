@@ -26,6 +26,14 @@ export async function stageUpload(
   return invoke('stage_upload', { sessionId, name, base64Data });
 }
 
+export async function approvePermission(requestId: string): Promise<void> {
+  await invoke('approve_permission', { requestId });
+}
+
+export async function denyPermission(requestId: string): Promise<void> {
+  await invoke('deny_permission', { requestId });
+}
+
 export async function abort(sessionId: string): Promise<void> {
   await invoke('abort', { sessionId });
 }

@@ -153,22 +153,58 @@ impl Tool for DoBash {
             return Ok(ToolResult::err("", "command must not be empty"));
         }
 
+        // Legacy substring hard list (defense in depth)
         if let Some(pattern) = is_dangerous(command) {
             return Ok(ToolResult::err(
                 "",
                 format!(
-                    "Command blocked by safety policy: detected dangerous pattern '{}'. \
-                     If you believe this is a false positive, adjust the safety config.",
+                    "Command blocked by safety policy: detected dangerous pattern '{}'.",
                     pattern
                 ),
             ));
         }
 
-        if let Err(reason) = ctx.safety_guard.check_command(command) {
-            return Ok(ToolResult::err(
-                "",
-                format!("Blocked command: {reason}"),
-            ));
+        // Risk classification: hard block / confirm / allow
+        use crate::safety::guard::CommandRisk;
+        match ctx.safety_guard.classify_command(command) {
+            CommandRisk::HardBlock { reason } => {
+                return Ok(ToolResult::err(
+                    "",
+                    format!(
+                        "Blocked (hard): {reason}. Never allowed, even in absolute trust mode."
+                    ),
+                ));
+            }
+            CommandRisk::Confirm { reason } if !ctx.safety_guard.absolute_trust => {
+                if let Some(hub) = ctx.permission_hub.as_ref() {
+                    let allowed = hub
+                        .request_confirm(
+                            &ctx.sender,
+                            &ctx.tool_call_id,
+                            command,
+                            &reason,
+                            ctx.permission_timeout_secs,
+                        )
+                        .await;
+                    if !allowed {
+                        return Ok(ToolResult::err(
+                            "",
+                            format!(
+                                "User denied or timed out confirming dangerous command ({reason}): {command}"
+                            ),
+                        ));
+                    }
+                } else {
+                    return Ok(ToolResult::err(
+                        "",
+                        format!(
+                            "Dangerous command requires confirmation ({reason}) but no UI permission hub is available. \
+                             Enable absolute trust or run from the desktop app. Command: {command}"
+                        ),
+                    ));
+                }
+            }
+            CommandRisk::Confirm { .. } | CommandRisk::Allow => {}
         }
 
         let timeout_secs = args["timeout"]
@@ -383,6 +419,14 @@ mod tests {
             tool_call_id: "call_echo".into(),
             sender: tx,
             safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let result = tool
@@ -411,6 +455,14 @@ mod tests {
             tool_call_id: "call_bg".into(),
             sender: tx,
             safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let started = std::time::Instant::now();
@@ -448,6 +500,14 @@ mod tests {
             tool_call_id: "call_fail".into(),
             sender: tx,
             safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let result = tool
@@ -475,6 +535,14 @@ mod tests {
             tool_call_id: "call_empty".into(),
             sender: tx,
             safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let result = tool
@@ -501,6 +569,14 @@ mod tests {
             tool_call_id: "call_timeout".into(),
             sender: tx,
             safety_guard: std::sync::Arc::new(crate::safety::guard::SafetyGuard::new(&[], true)),
+        permission_hub: None,
+        permission_timeout_secs: 120,
+        team_agent_id: None,
+        file_ownership: None,
+        ownership_enforced: false,
+        ownership_soft_log_only: true,
+        read_paths: None,
+        read_before_edit: false,
         };
 
         let result = tool

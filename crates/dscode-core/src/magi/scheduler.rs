@@ -6,6 +6,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::safety::guard::SafetyGuard;
+use crate::safety::permission::PermissionHub;
+
 use tracing::{info, warn};
 
 use crate::providers::trait_def::{LlmProvider, ProviderError};
@@ -92,6 +95,11 @@ pub struct MagiScheduler {
     max_steps_per_round: u32,
     /// Optional UI progress (Token + TeamAgentOutput + tools).
     progress: Option<MagiProgress>,
+    /// Safety policy for Balthasar tools.
+    safety_guard: Arc<SafetyGuard>,
+    /// Optional permission hub (usually None in headless /auto — confirm → deny).
+    permission_hub: Option<Arc<PermissionHub>>,
+    permission_timeout_secs: u64,
 }
 
 impl MagiScheduler {
@@ -112,6 +120,9 @@ impl MagiScheduler {
             max_rounds: DEFAULT_MAX_ROUNDS,
             max_steps_per_round: DEFAULT_MAX_STEPS_PER_ROUND,
             progress: None,
+            safety_guard: Arc::new(SafetyGuard::new(&[], false)),
+            permission_hub: None,
+            permission_timeout_secs: 120,
         }
     }
 
@@ -131,7 +142,25 @@ impl MagiScheduler {
             max_rounds: DEFAULT_MAX_ROUNDS,
             max_steps_per_round: DEFAULT_MAX_STEPS_PER_ROUND,
             progress: None,
+            safety_guard: Arc::new(SafetyGuard::new(&[], false)),
+            permission_hub: None,
+            permission_timeout_secs: 120,
         }
+    }
+
+    pub fn with_safety_guard(mut self, guard: Arc<SafetyGuard>) -> Self {
+        self.safety_guard = guard;
+        self
+    }
+
+    pub fn with_permission_hub(mut self, hub: Option<Arc<PermissionHub>>) -> Self {
+        self.permission_hub = hub;
+        self
+    }
+
+    pub fn with_permission_timeout(mut self, secs: u64) -> Self {
+        self.permission_timeout_secs = secs.max(10);
+        self
     }
 
     /// Override the maximum number of spiral rounds.
@@ -223,6 +252,9 @@ impl MagiScheduler {
                 self.max_steps_per_round
             ));
             let progress = self.progress.clone();
+            let safety = self.safety_guard.clone();
+            let hub = self.permission_hub.clone();
+            let pto = self.permission_timeout_secs;
             let execution = retry_with_backoff(
                 || {
                     execute_subtask(
@@ -234,6 +266,9 @@ impl MagiScheduler {
                         &scrutiny,
                         self.max_steps_per_round,
                         progress.as_ref(),
+                        safety.clone(),
+                        hub.clone(),
+                        pto,
                     )
                 },
                 2,

@@ -100,6 +100,14 @@ impl CompressionPipeline {
         let total_tok = sys_tok + hist_tok;
         let ratio = total_tok as f64 / window;
 
+        // ── L0: Zero-cost snip of stale tool results (always when >60%) ──
+        if ratio > 0.60 {
+            let snipped = Self::snip_stale_tool_results(messages, 3);
+            if snipped > 0 {
+                info!(snipped, "Compression L0: snipped stale tool results");
+            }
+        }
+
         // ── L1: Truncate (>80%) ─────────────────────────────────────────
         if ratio > 0.80 && ratio <= 0.85 {
             let action = Self::truncate_oldest(messages);
@@ -143,6 +151,33 @@ impl CompressionPipeline {
         }
 
         CompressionAction::None
+    }
+
+    // ── L0 helpers ───────────────────────────────────────────────────────
+
+    /// Replace older Tool role message bodies with a re-read placeholder,
+    /// keeping the most recent `keep_recent` tool results intact.
+    fn snip_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> usize {
+        const PLACEHOLDER: &str = "[Content snipped — re-read if needed]";
+        let tool_idxs: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == Role::Tool)
+            .map(|(i, _)| i)
+            .collect();
+        if tool_idxs.len() <= keep_recent {
+            return 0;
+        }
+        let snip_end = tool_idxs.len() - keep_recent;
+        let mut n = 0;
+        for &idx in &tool_idxs[..snip_end] {
+            let text = messages[idx].content.as_text().unwrap_or("");
+            if text.len() > 120 && text != PLACEHOLDER {
+                messages[idx].content = MessageContent::Text(PLACEHOLDER.into());
+                n += 1;
+            }
+        }
+        n
     }
 
     // ── L1 helpers ───────────────────────────────────────────────────────

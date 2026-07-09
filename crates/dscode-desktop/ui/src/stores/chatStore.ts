@@ -267,6 +267,9 @@ export interface ChatStore {
   isSessionStreaming: (id: string) => boolean;
   /** Mark /plan choice card as answered after user picks option/custom */
   markPlanAnswered: (messageId: string, selected: string) => void;
+  /** Pending Safe-mode permission prompts */
+  pendingPermissions: import('@/lib/types').PermissionRequest[];
+  removePermission: (id: string) => void;
 }
 
 let _streamTimeouts: Record<string, ReturnType<typeof setTimeout>> = {};
@@ -313,6 +316,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
     teamsMode: false,
     teamsModeBySession,
     teamAgents: [],
+    pendingPermissions: [],
+    removePermission(id) {
+      set((s) => ({
+        pendingPermissions: s.pendingPermissions.filter((p) => p.id !== id),
+      }));
+    },
     isSessionStreaming(id) {
       const s = get();
       if (s.activeSessionId === id) return s.isStreaming;
@@ -808,6 +817,28 @@ export const useChatStore = create<ChatStore>((set, get) => {
               },
             };
           });
+          break;
+        }
+
+        case 'permission_request': {
+          const req = {
+            id: event.id,
+            tool_call_id: event.tool_call_id,
+            command: event.command,
+            reason: event.reason,
+            timeout_secs: event.timeout_secs || 120,
+            session_id: sessionId,
+          };
+          set((s) => ({
+            pendingPermissions: [
+              ...s.pendingPermissions.filter((p) => p.id !== req.id),
+              req,
+            ],
+          }));
+          // Auto-remove UI card after timeout (backend already denies)
+          setTimeout(() => {
+            get().removePermission(req.id);
+          }, (req.timeout_secs + 2) * 1000);
           break;
         }
 

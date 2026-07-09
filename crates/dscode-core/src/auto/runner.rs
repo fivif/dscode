@@ -124,6 +124,9 @@ pub struct AutoRunner {
     teams_parallel: bool,
     /// Cap on concurrent MAGI spirals in teams_parallel mode.
     max_parallel: usize,
+    safety_guard: Arc<crate::safety::guard::SafetyGuard>,
+    permission_hub: Option<Arc<crate::safety::permission::PermissionHub>>,
+    permission_timeout_secs: u64,
 }
 
 impl AutoRunner {
@@ -146,7 +149,28 @@ impl AutoRunner {
             progress: None,
             teams_parallel: false,
             max_parallel: DEFAULT_MAX_PARALLEL,
+            safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], false)),
+            permission_hub: None,
+            permission_timeout_secs: 120,
         }
+    }
+
+    pub fn with_safety_guard(mut self, guard: Arc<crate::safety::guard::SafetyGuard>) -> Self {
+        self.safety_guard = guard;
+        self
+    }
+
+    pub fn with_permission_hub(
+        mut self,
+        hub: Option<Arc<crate::safety::permission::PermissionHub>>,
+    ) -> Self {
+        self.permission_hub = hub;
+        self
+    }
+
+    pub fn with_permission_timeout(mut self, secs: u64) -> Self {
+        self.permission_timeout_secs = secs.max(10);
+        self
     }
 
     /// Attach a progress event channel for UI streaming.
@@ -504,6 +528,9 @@ impl AutoRunner {
             let max_rounds = self.magi_max_rounds;
             let max_steps = self.magi_max_steps;
             let progress = self.progress.clone();
+            let safety = Arc::clone(&self.safety_guard);
+            let hub = self.permission_hub.clone();
+            let pto = self.permission_timeout_secs;
             let prd = prd.to_string();
             let session_id = session_id.to_string();
             let task_idx = *task_idx;
@@ -516,7 +543,10 @@ impl AutoRunner {
                     provider, runtime, tools, wd,
                 )
                 .with_max_rounds(max_rounds)
-                .with_max_steps_per_round(max_steps);
+                .with_max_steps_per_round(max_steps)
+                .with_safety_guard(safety)
+                .with_permission_hub(hub)
+                .with_permission_timeout(pto);
                 if let Some(tx) = progress {
                     scheduler = scheduler.with_progress(crate::magi::execute::MagiProgress {
                         tx,
@@ -552,7 +582,10 @@ impl AutoRunner {
             self.working_dir.clone(),
         )
         .with_max_rounds(self.magi_max_rounds)
-        .with_max_steps_per_round(self.magi_max_steps);
+        .with_max_steps_per_round(self.magi_max_steps)
+        .with_safety_guard(Arc::clone(&self.safety_guard))
+        .with_permission_hub(self.permission_hub.clone())
+        .with_permission_timeout(self.permission_timeout_secs);
 
         if let Some(ref tx) = self.progress {
             scheduler = scheduler.with_progress(crate::magi::execute::MagiProgress {
@@ -740,6 +773,7 @@ fn find_next_ready(subtasks: &[Subtask]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::magi::scheduler::Promotion;
 
     #[test]
     fn test_find_next_ready_no_dependencies() {

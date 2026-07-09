@@ -8,10 +8,11 @@ use std::sync::Arc;
 use crate::agent::stream::StreamEvent;
 use crate::providers::trait_def::ToolDef;
 use crate::safety::guard::SafetyGuard;
+use crate::safety::permission::PermissionHub;
 
 /// Context passed to every tool invocation, providing the session environment
 /// and a channel to emit streaming events back to the agent loop.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     /// The working directory for resolving relative paths.
     pub working_dir: PathBuf,
@@ -23,6 +24,64 @@ pub struct ToolContext {
     pub sender: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     /// Safety guard for command and path validation during tool execution.
     pub safety_guard: Arc<SafetyGuard>,
+    /// Optional interactive permission hub (desktop GUI). Absent in CLI/tests.
+    pub permission_hub: Option<Arc<PermissionHub>>,
+    /// Seconds to wait for user permission (Safe mode).
+    pub permission_timeout_secs: u64,
+    /// Teams v2: sub-agent id for path ownership (optional).
+    pub team_agent_id: Option<String>,
+    /// Shared file ownership map (optional).
+    pub file_ownership: Option<Arc<tokio::sync::Mutex<crate::teams::ownership::FileOwnership>>>,
+    /// When true, enforce owned_paths (Denied on violation unless soft).
+    pub ownership_enforced: bool,
+    /// When true with enforced, only warn (do not block write).
+    pub ownership_soft_log_only: bool,
+    /// Paths already read this agent turn (read-before-edit).
+    pub read_paths: Option<Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Enforce read-before-edit for write/edit tools.
+    pub read_before_edit: bool,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("working_dir", &self.working_dir)
+            .field("session_id", &self.session_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("absolute_trust", &self.safety_guard.absolute_trust)
+            .field("has_permission_hub", &self.permission_hub.is_some())
+            .field("team_agent_id", &self.team_agent_id)
+            .field("ownership_enforced", &self.ownership_enforced)
+            .field("read_before_edit", &self.read_before_edit)
+            .finish()
+    }
+}
+
+impl ToolContext {
+    /// Minimal context for tests / simple callers.
+    pub fn simple(
+        working_dir: PathBuf,
+        session_id: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        sender: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        safety_guard: Arc<SafetyGuard>,
+    ) -> Self {
+        Self {
+            working_dir,
+            session_id: session_id.into(),
+            tool_call_id: tool_call_id.into(),
+            sender,
+            safety_guard,
+            permission_hub: None,
+            permission_timeout_secs: 120,
+            team_agent_id: None,
+            file_ownership: None,
+            ownership_enforced: false,
+            ownership_soft_log_only: true,
+            read_paths: None,
+            read_before_edit: false,
+        }
+    }
 }
 
 /// The result of a single tool invocation.

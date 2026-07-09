@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use dscode_core::config::settings::Config;
+use dscode_core::safety::permission::PermissionHub;
 use dscode_core::session::manager::SessionManager;
 use dscode_core::tools::registry::ToolRegistry;
 use dscode_core::tools::background::TaskManager;
@@ -44,6 +45,9 @@ pub struct AppState {
     /// Background task manager for non-blocking command execution.
     pub task_manager: TaskManager,
 
+    /// Interactive permission hub (Safe mode confirmations).
+    pub permission_hub: Arc<PermissionHub>,
+
     /// Whether /teams multi-agent mode is active.
     pub teams_mode: AtomicBool,
 }
@@ -57,6 +61,7 @@ impl AppState {
         let task_manager = TaskManager::new();
         let handle = task_manager.handle();
         let notify_tx = task_manager.notify_tx();
+        let permission_hub = PermissionHub::shared();
 
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register_default_tools();
@@ -80,6 +85,7 @@ impl AppState {
             active_forges: Mutex::new(HashMap::new()),
             per_session_locks: Mutex::new(HashMap::new()),
             task_manager,
+            permission_hub,
             teams_mode: AtomicBool::new(false),
         }
     }

@@ -407,6 +407,50 @@ impl Tool for DoBackground {
             .as_str()
             .ok_or_else(|| ToolError::MissingParameter("command".into()))?;
         let description = args["description"].as_str().unwrap_or("background task");
+
+        // Same safety policy as do_bash
+        use crate::safety::guard::CommandRisk;
+        match ctx.safety_guard.classify_command(command) {
+            CommandRisk::HardBlock { reason } => {
+                return Ok(ToolResult::err(
+                    "",
+                    format!(
+                        "Blocked (hard): {reason}. Never allowed, even in absolute trust mode."
+                    ),
+                ));
+            }
+            CommandRisk::Confirm { reason } if !ctx.safety_guard.absolute_trust => {
+                if let Some(hub) = ctx.permission_hub.as_ref() {
+                    let allowed = hub
+                        .request_confirm(
+                            &ctx.sender,
+                            &ctx.tool_call_id,
+                            command,
+                            &format!("background: {reason}"),
+                            ctx.permission_timeout_secs,
+                        )
+                        .await;
+                    if !allowed {
+                        return Ok(ToolResult::err(
+                            "",
+                            format!(
+                                "User denied or timed out confirming background command ({reason}): {command}"
+                            ),
+                        ));
+                    }
+                } else {
+                    return Ok(ToolResult::err(
+                        "",
+                        format!(
+                            "Dangerous background command requires confirmation ({reason}). \
+                             Enable absolute trust or use the desktop app. Command: {command}"
+                        ),
+                    ));
+                }
+            }
+            CommandRisk::Confirm { .. } | CommandRisk::Allow => {}
+        }
+
         let task_id = format!(
             "bg_{}",
             uuid::Uuid::new_v4()
