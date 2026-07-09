@@ -22,31 +22,29 @@
 
 ## 架构 Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   dscode-core（核心引擎）                      │
-│                                                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
-│  │   Forge     │  │   Scribe    │  │ Extensions  │          │
-│  │ ReAct 循环  │  │  三级记忆   │  │ MCP+Skills  │          │
-│  │             │  │             │  │             │          │
-│  │ /auto 自动  │  │ Raw→Fact→   │  │             │          │
-│  │ /plan 评审  │  │ Pattern     │  │             │          │
-│  │ /teams 协作 │  │             │  │             │          │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
-│         │                │                │                  │
-│  ┌──────┴────────────────┴────────────────┴──────┐          │
-│  │               Shared Infrastructure            │          │
-│  │    Provider  ·  Session  ·  Tools  ·  Safety   │          │
-│  │  DeepSeek/OpenAI/Anthropic  ·  SQLite 持久化   │          │
-│  └────────────────────────────────────────────────┘          │
-├──────────────────────────────────────────────────────────────┤
-│                          接入层                                │
-│  ┌───────────────────┐  ┌──────────────────┐                 │
-│  │  dscode-desktop   │  │   dscode-cli     │                 │
-│  │  Tauri2 + React   │  │   命令行工具     │                 │
-│  └───────────────────┘  └──────────────────┘                 │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph apps[" 接入层 "]
+        desktop["🖥️ dscode-desktop<br/>Tauri 2 + React"]
+        cli["⬛ dscode-cli<br/>命令行工具"]
+    end
+
+    subgraph engine[" dscode-core 核心引擎 "]
+        forge["⚙️ Forge<br/>ReAct 循环<br/>━━━━━━━<br/>/auto · /plan · /teams"]
+        scribe["🧠 Scribe<br/>三级记忆<br/>━━━━━━━<br/>Raw → Fact → Pattern"]
+        ext["🔌 Extensions<br/>MCP · Skills"]
+    end
+
+    subgraph infra[" 基础设施 "]
+        provider["📡 Provider<br/>DeepSeek OpenAI Anthropic"]
+        session["💾 Session<br/>SQLite 持久化"]
+        tools["🔧 Tools<br/>bash file bg mcp skills"]
+        safety["🛡️ Safety<br/>超时 · 拦截"]
+    end
+
+    desktop --> engine
+    cli --> engine
+    engine --> infra
 ```
 
 ## 功能 Features
