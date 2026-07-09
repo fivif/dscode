@@ -26,7 +26,23 @@ pub struct AnthropicProvider {
     client: Client,
 }
 
+/// Beta features we opt into on every Messages request.
+/// - `context-1m-2025-08-07`: unlock 1M context on Sonnet/Opus 4.x (and many
+///   Claude-compatible gateways that mirror Anthropic). Without this, proxies
+///   often reject with "请启用 1m 上下文" even when local `window_tokens` is 1M.
+/// - `max-tokens-3-5-sonnet-2024-07-15`: larger max_tokens on older sonnet paths.
+const ANTHROPIC_BETA_HEADER: &str =
+    "context-1m-2025-08-07,max-tokens-3-5-sonnet-2024-07-15";
+
 impl AnthropicProvider {
+    /// Shared request headers for Messages API.
+    fn apply_auth_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
+            .header("Content-Type", "application/json")
+    }
+
     /// Create a provider with default settings.
     pub fn new(api_key: String, model: String) -> Self {
         let base_url = "https://api.anthropic.com".to_string();
@@ -93,12 +109,10 @@ impl LlmProvider for AnthropicProvider {
 
         let request_body = self.build_request_body(&messages, &tools, false);
         let resp = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "max-tokens-3-5-sonnet-2024-07-15")
-            .header("Content-Type", "application/json")
+            .apply_auth_headers(
+                self.client
+                    .post(format!("{}/v1/messages", self.base_url)),
+            )
             .json(&request_body)
             .send()
             .await?;
@@ -143,12 +157,10 @@ impl LlmProvider for AnthropicProvider {
 
         let request_body = self.build_request_body(&messages, &tools, true);
         let resp = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "max-tokens-3-5-sonnet-2024-07-15")
-            .header("Content-Type", "application/json")
+            .apply_auth_headers(
+                self.client
+                    .post(format!("{}/v1/messages", self.base_url)),
+            )
             .json(&request_body)
             .send()
             .await?;
