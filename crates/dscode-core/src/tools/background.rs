@@ -190,66 +190,100 @@ impl TaskManager {
                 pipe_to_log(stderr, true, &t2, &n2, &id2).await;
             });
 
-            let wait_res = {
+            // CRITICAL: never hold `live` mutex across `.wait()` — kill() needs that lock.
+            let mut child_opt = {
                 let mut g = live.lock().await;
-                if let Some(lc) = g.get_mut(&tid) {
-                    lc.child.wait().await
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "task already removed",
-                    ))
-                }
+                g.remove(&tid).map(|lc| lc.child)
             };
 
-            let _ = out_h.await;
-            let _ = err_h.await;
-            live.lock().await.remove(&tid);
+            let wait_res = if let Some(ref mut child) = child_opt {
+                child.wait().await
+            } else {
+                // Already removed by kill() — process is being reaped there.
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "task already removed (killed)",
+                ))
+            };
+
+            // Bound reader join — pipes should EOF after process exit/kill.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let _ = out_h.await;
+                let _ = err_h.await;
+            })
+            .await;
+
+            // Drop child handle if still present
+            drop(child_opt);
 
             let mut guard = tasks.lock().await;
             let Some(task) = guard.get_mut(&tid) else {
                 return;
             };
+            // If kill already set Killed, keep that terminal state.
             if task.status == TaskStatus::Killed {
+                let out = task.output.clone();
+                drop(guard);
                 let _ = notify.send(TaskNotification {
                     task_id: tid.clone(),
                     status: TaskNotificationStatus::Killed,
-                    output: task.output.clone(),
+                    output: out,
                 });
                 return;
             }
             match wait_res {
                 Ok(st) if st.success() => {
                     task.status = TaskStatus::Success;
+                    let out = task.output.clone();
+                    drop(guard);
                     let _ = notify.send(TaskNotification {
                         task_id: tid.clone(),
                         status: TaskNotificationStatus::Completed,
-                        output: task.output.clone(),
+                        output: out,
                     });
                 }
                 Ok(st) => {
                     let err = format!("exit code {}", st.code().unwrap_or(-1));
                     task.status = TaskStatus::Failed(err.clone());
+                    let out = task.output.clone();
+                    drop(guard);
                     let _ = notify.send(TaskNotification {
                         task_id: tid.clone(),
                         status: TaskNotificationStatus::Failed(err),
-                        output: task.output.clone(),
+                        output: out,
                     });
                 }
                 Err(e) => {
-                    task.status = TaskStatus::Failed(e.to_string());
-                    let _ = notify.send(TaskNotification {
-                        task_id: tid.clone(),
-                        status: TaskNotificationStatus::Failed(e.to_string()),
-                        output: task.output.clone(),
-                    });
+                    // "already removed" after kill → treat as killed
+                    if e.kind() == std::io::ErrorKind::Other
+                        && e.to_string().contains("killed")
+                    {
+                        task.status = TaskStatus::Killed;
+                        let out = task.output.clone();
+                        drop(guard);
+                        let _ = notify.send(TaskNotification {
+                            task_id: tid.clone(),
+                            status: TaskNotificationStatus::Killed,
+                            output: out,
+                        });
+                    } else {
+                        task.status = TaskStatus::Failed(e.to_string());
+                        let out = task.output.clone();
+                        drop(guard);
+                        let _ = notify.send(TaskNotification {
+                            task_id: tid.clone(),
+                            status: TaskNotificationStatus::Failed(e.to_string()),
+                            output: out,
+                        });
+                    }
                 }
             }
         });
     }
 
+    /// Stop a running background task. Always returns promptly (never deadlocks).
     pub async fn kill(&self, task_id: &str) -> Result<String, String> {
-        let pid = {
+        let (was_running, pid, desc) = {
             let mut tasks = self.tasks.lock().await;
             let task = tasks
                 .get_mut(task_id)
@@ -260,29 +294,86 @@ impl TaskManager {
                     task.status
                 ));
             }
+            // Mark killed immediately so UI/status stop showing Running.
             task.status = TaskStatus::Killed;
-            task.pid
+            (
+                true,
+                task.pid,
+                task.description.clone(),
+            )
+        };
+        let _ = was_running;
+
+        // Take the LiveChild out without awaiting wait under the lock.
+        let mut taken = {
+            let mut live = self.live.lock().await;
+            live.remove(task_id)
         };
 
-        {
-            let mut live = self.live.lock().await;
-            if let Some(mut lc) = live.remove(task_id) {
-                let _ = lc.child.start_kill();
+        if let Some(ref mut lc) = taken {
+            let _ = lc.child.start_kill();
+            #[cfg(unix)]
+            {
+                let pg = if lc.pgid > 1 {
+                    lc.pgid
+                } else {
+                    pid.unwrap_or(0)
+                };
+                if pg > 1 {
+                    kill_pg(pg);
+                }
+            }
+            // Brief wait so process actually dies; never hang the tool.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(800),
+                lc.child.wait(),
+            )
+            .await;
+            // If still not reaped, SIGKILL group again and drop (kill_on_drop).
+            #[cfg(unix)]
+            if let Some(p) = pid.filter(|&p| p > 1) {
+                kill_pg(p);
+            }
+            let _ = lc.child.start_kill();
+        } else {
+            // Child not yet registered or already reaped — still signal by pid/pgid.
+            #[cfg(unix)]
+            if let Some(p) = pid.filter(|&p| p > 1) {
+                kill_pg(p);
             }
         }
+        drop(taken);
 
-        #[cfg(unix)]
-        if let Some(pid) = pid.filter(|&p| p > 1) {
-            kill_pg(pid);
-        }
+        let output = {
+            let g = self.tasks.lock().await;
+            g.get(task_id)
+                .map(|t| t.output.clone())
+                .unwrap_or_default()
+        };
 
         let _ = self.notify_tx.send(TaskNotification {
             task_id: task_id.to_string(),
             status: TaskNotificationStatus::Killed,
-            output: String::new(),
+            output: output.clone(),
         });
 
-        Ok(format!("Killed background task {task_id}"))
+        Ok(format!(
+            "Killed background task {task_id} ({desc}).\n\
+             Process group signaled (SIGTERM then SIGKILL).\n\
+             Last log (tail):\n{}",
+            if output.is_empty() {
+                "(no output)".to_string()
+            } else {
+                output
+                    .chars()
+                    .rev()
+                    .take(1500)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect()
+            }
+        ))
     }
 }
 
@@ -313,28 +404,49 @@ async fn pipe_to_log(
 ) {
     let Some(pipe) = pipe else { return };
     let mut reader = BufReader::new(pipe).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
-        let chunk = if is_stderr {
-            format!("[stderr] {line}\n")
-        } else {
-            format!("{line}\n")
-        };
-        {
-            let mut guard = tasks.lock().await;
-            if let Some(task) = guard.get_mut(tid) {
-                task.output.push_str(&chunk);
-                if task.output.len() > MAX_LOG_BYTES {
-                    let drain = task.output.len() - MAX_LOG_BYTES;
-                    task.output.drain(..drain);
-                    task.output.insert_str(0, "…[log truncated]…\n");
+    loop {
+        // Timed read so kill can end the task without readers blocking forever on a stuck pipe.
+        let line_res =
+            tokio::time::timeout(std::time::Duration::from_secs(1), reader.next_line()).await;
+        match line_res {
+            Ok(Ok(Some(line))) => {
+                let chunk = if is_stderr {
+                    format!("[stderr] {line}\n")
+                } else {
+                    format!("{line}\n")
+                };
+                {
+                    let mut guard = tasks.lock().await;
+                    if let Some(task) = guard.get_mut(tid) {
+                        task.output.push_str(&chunk);
+                        if task.output.len() > MAX_LOG_BYTES {
+                            let drain = task.output.len() - MAX_LOG_BYTES;
+                            task.output.drain(..drain);
+                            task.output.insert_str(0, "…[log truncated]…\n");
+                        }
+                    }
+                }
+                let _ = notify.send(TaskNotification {
+                    task_id: tid.to_string(),
+                    status: TaskNotificationStatus::Progress,
+                    output: chunk,
+                });
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => {
+                // Timeout: if task is no longer Running, stop reading.
+                let done = {
+                    let g = tasks.lock().await;
+                    match g.get(tid) {
+                        Some(t) => t.status != TaskStatus::Running,
+                        None => true,
+                    }
+                };
+                if done {
+                    break;
                 }
             }
         }
-        let _ = notify.send(TaskNotification {
-            task_id: tid.to_string(),
-            status: TaskNotificationStatus::Progress,
-            output: chunk,
-        });
     }
 }
 
@@ -621,8 +733,10 @@ impl Tool for DoTaskKill {
     }
 
     fn description(&self) -> &str {
-        "Stop a background task (SIGTERM/SIGKILL process group). \
-         Use to shut down vite/dev servers started with do_background."
+        "Stop a background task immediately (returns in under ~1s). \
+         Sends SIGTERM/SIGKILL to the process group. \
+         Use to shut down vite/dev servers started with do_background. \
+         After kill, status becomes Killed — do not wait for Running forever."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -652,5 +766,42 @@ impl Tool for DoTaskKill {
             Ok(msg) => Ok(ToolResult::ok(msg)),
             Err(e) => Ok(ToolResult::err("", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn kill_returns_promptly_while_process_running() {
+        let mgr = TaskManager::new();
+        let id = "bg_testkill".to_string();
+        mgr.spawn(
+            id.clone(),
+            "sleep forever".into(),
+            "sleep 120".into(),
+            std::env::temp_dir(),
+        )
+        .await;
+
+        // Let process start and register live child
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let t0 = Instant::now();
+        let msg = tokio::time::timeout(Duration::from_secs(3), mgr.kill(&id))
+            .await
+            .expect("kill must not hang")
+            .expect("kill ok");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "kill took too long: {:?}",
+            t0.elapsed()
+        );
+        assert!(msg.contains("Killed"), "{msg}");
+
+        let g = mgr.tasks.lock().await;
+        assert_eq!(g.get(&id).unwrap().status, TaskStatus::Killed);
     }
 }
