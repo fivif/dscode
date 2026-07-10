@@ -239,6 +239,12 @@ DS_code/
 
 ---
 
+## 致谢
+
+感谢 [Linux DO](https://linux.do/) 社区的支持。
+
+---
+
 ## 许可证 License
 
 MIT — 详见 [LICENSE](LICENSE)
