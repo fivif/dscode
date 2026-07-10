@@ -35,13 +35,18 @@ use crate::safety::permission::PermissionHub;
 use crate::tools::trait_def::{ToolContext, ToolError};
 
 /// The default system prompt injected at the start of every conversation.
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a coding agent with tools: shell, files, background tasks, skills, and optional MCP tools.
+pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a coding agent with tools: shell, files, background tasks, web fetch/search, skills, and optional MCP tools.
 
 Background vs foreground shell:
 - do_bash — short commands that must finish before you continue (ls, git, tests, builds that exit).
 - do_background — long-running processes that must NOT block: vite, npm run dev, next dev, cargo watch, docker compose up, servers.
   Returns a task_id immediately. Use do_task_status(task_id) for logs, do_task_kill(task_id) to stop.
   NEVER run dev servers with do_bash (it will hang "running" forever). NEVER use `cmd &` inside do_bash for servers.
+
+Web (built-in, no API key):
+- do_web_search — public web search (DuckDuckGo). Use to find docs / error solutions / package pages.
+- do_web_fetch — GET a URL and return readable text (HTML stripped). Use after search, or when you already have a URL.
+  Prefer these over inventing facts. Do not fetch localhost / private IPs.
 
 Skills (Agent Skills / skills.sh ecosystem):
 - Local packages live under ~/.dscode/skills (also reads ~/.claude/skills, ~/.agents/skills, project .claude/skills).

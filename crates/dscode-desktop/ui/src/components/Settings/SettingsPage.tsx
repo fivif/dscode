@@ -149,20 +149,28 @@ export default function SettingsPage({ onBack }: Props) {
 
               {/* 推理深度 */}
               <Row label="推理深度">
-                <div className="flex gap-1.5">
-                  {REASONING_LEVELS.map((l) => (
-                    <button
-                      key={l.value}
-                      className={`px-4 py-2 rounded-md text-xs font-mono transition-colors ${
-                        config.reasoning_effort === l.value
-                          ? 'bg-gray-500/30 text-gray-100 ring-1 ring-gray-500/50'
-                          : 'bg-card text-gray-500 hover:text-gray-300 border border-border'
-                      }`}
-                      onClick={() => updateConfig({ reasoning_effort: l.value })}
-                    >
-                      {l.label}
-                    </button>
-                  ))}
+                <div className="flex flex-col gap-1.5 items-end">
+                  <div className="flex gap-1.5">
+                    {REASONING_LEVELS.map((l) => (
+                      <button
+                        key={l.value}
+                        type="button"
+                        title="DeepSeek/OpenAI: reasoning_effort；Claude: extended thinking budget_tokens"
+                        className={`px-4 py-2 rounded-md text-xs font-mono transition-colors ${
+                          config.reasoning_effort === l.value
+                            ? 'bg-gray-500/30 text-gray-100 ring-1 ring-gray-500/50'
+                            : 'bg-card text-gray-500 hover:text-gray-300 border border-border'
+                        }`}
+                        onClick={() => updateConfig({ reasoning_effort: l.value })}
+                      >
+                        {l.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-gray-600 max-w-xs text-right leading-snug">
+                    DeepSeek/OpenAI 兼容：发 reasoning_effort（max→high）。Claude 原生：extended thinking
+                    budget（low≈4k … max≈32k tokens）。调高更慢更贵，可能出现「思考过程」块。
+                  </p>
                 </div>
               </Row>
 

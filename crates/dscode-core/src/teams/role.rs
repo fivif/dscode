@@ -61,7 +61,12 @@ impl AgentRole {
 pub fn tool_names_for_role(role: AgentRole, explore_bash: bool) -> RoleToolPolicy {
     match role {
         AgentRole::Explore => {
-            let mut allow = vec!["do_file_read".to_string(), "do_skill_list".to_string()];
+            let mut allow = vec![
+                "do_file_read".to_string(),
+                "do_skill_list".to_string(),
+                "do_web_fetch".to_string(),
+                "do_web_search".to_string(),
+            ];
             if explore_bash {
                 allow.push("do_bash".to_string());
             }
@@ -76,6 +81,7 @@ pub fn tool_names_for_role(role: AgentRole, explore_bash: bool) -> RoleToolPolic
             "do_bash".to_string(),
             "do_skill_list".to_string(),
             "do_task_status".to_string(),
+            "do_web_fetch".to_string(),
         ]),
     }
 }

@@ -103,6 +103,8 @@ impl ToolRegistry {
         self.register(crate::tools::file_ops::DoFileEdit::new());
         self.register(crate::tools::skill_ops::DoSkillList::new());
         self.register(crate::tools::skill_ops::DoSkillInstall::new());
+        self.register(crate::tools::web::DoWebFetch::new());
+        self.register(crate::tools::web::DoWebSearch::new());
     }
 
     /// Return the number of registered tools.

@@ -5,3 +5,4 @@ pub mod file_ops;
 pub mod background;
 pub mod skill_ops;
 pub mod mcp_ops;
+pub mod web;

@@ -26,36 +26,115 @@ function emptyBuffer(): SessionBuffer {
   };
 }
 
-// Token batching: throttle React re-renders to ~60fps (active session only).
+// Batch high-frequency stream updates (~30–60fps) to avoid main-thread jank.
+// Without this, every bash line / team token does a full messages[] map + React tree walk.
 let _flushScheduled = false;
 let _pendingText = '';
+/** tool_call_id → pending progress chunks */
+const _pendingToolChunks: Record<string, string> = {};
+/** agent_id → pending output chunks */
+const _pendingTeamChunks: Record<string, string> = {};
+let _rafId: number | null = null;
 
-function flushTokens(set: (fn: (s: ChatStore) => Partial<ChatStore>) => void, get: () => ChatStore) {
+function patchMessageById(messages: Message[], msgId: string, patch: Partial<Message>): Message[] {
+  // Single-pass update; avoid cloning unchanged messages when possible.
+  let found = false;
+  const next = messages.map((m) => {
+    if (m.id !== msgId) return m;
+    found = true;
+    return { ...m, ...patch };
+  });
+  return found ? next : messages;
+}
+
+function flushStreamBatch(set: (fn: (s: ChatStore) => Partial<ChatStore>) => void, get: () => ChatStore) {
   _flushScheduled = false;
+  _rafId = null;
   const text = _pendingText;
   _pendingText = '';
-  if (!text) return;
+  const toolKeys = Object.keys(_pendingToolChunks);
+  const teamKeys = Object.keys(_pendingTeamChunks);
+  const toolChunks: Record<string, string> = {};
+  for (const k of toolKeys) {
+    toolChunks[k] = _pendingToolChunks[k];
+    delete _pendingToolChunks[k];
+  }
+  const teamChunks: Record<string, string> = {};
+  for (const k of teamKeys) {
+    teamChunks[k] = _pendingTeamChunks[k];
+    delete _pendingTeamChunks[k];
+  }
+  if (!text && toolKeys.length === 0 && teamKeys.length === 0) return;
+
   set((s) => {
     const st = s._stream;
-    if (!st) return {};
-    const newText = st.text + text;
-    const messages = s.messages.map((m) =>
-      m.id === st.msgId
-        ? { ...m, content: newText, thinking_blocks: st.thinking, tool_calls: st.toolCalls, fact_cards: st.facts, stream_state: { text: newText, thinking: st.thinking, tool_calls: st.toolCalls, fact_cards: st.facts } }
-        : m
-    );
-    const sid = st.sessionId;
+    let messages = s.messages;
+    let stream = st;
+    let teamHostId = s._teamHostMsgId;
+
+    if (text && st) {
+      const newText = st.text + text;
+      const toolCalls = st.toolCalls;
+      messages = patchMessageById(messages, st.msgId, {
+        content: newText,
+        thinking_blocks: st.thinking,
+        tool_calls: toolCalls,
+        fact_cards: st.facts,
+        stream_state: {
+          text: newText,
+          thinking: st.thinking,
+          tool_calls: toolCalls,
+          fact_cards: st.facts,
+        },
+      });
+      stream = { ...st, text: newText };
+    }
+
+    if (toolKeys.length > 0 && stream) {
+      let toolCalls = stream.toolCalls;
+      for (const id of toolKeys) {
+        const chunk = toolChunks[id] || '';
+        toolCalls = toolCalls.map((t) =>
+          t.id === id
+            ? { ...t, result: ((t.result || '') + chunk).slice(-80_000) }
+            : t,
+        );
+      }
+      messages = patchMessageById(messages, stream.msgId, { tool_calls: toolCalls });
+      stream = { ...stream, toolCalls };
+    }
+
+    if (teamKeys.length > 0) {
+      const hostId = stream?.msgId || teamHostId;
+      if (hostId) {
+        let agents: TeamAgent[] = [];
+        const host = messages.find((m) => m.id === hostId);
+        agents = [...(host?.team_agents || [])];
+        for (const aid of teamKeys) {
+          const chunk = teamChunks[aid] || '';
+          agents = upsertTeamAgent(agents, aid, { output: chunk }, 'output');
+        }
+        messages = patchMessageById(messages, hostId, { team_agents: agents });
+        teamHostId = hostId;
+      }
+    }
+
+    const sid = stream?.sessionId || s.activeSessionId;
+    if (!sid) {
+      return { messages, _stream: stream, _teamHostMsgId: teamHostId };
+    }
     return {
-      _stream: { ...st, text: newText },
       messages,
+      _stream: stream,
+      _teamHostMsgId: teamHostId,
       sessionBuffers: {
         ...s.sessionBuffers,
         [sid]: {
           ...(s.sessionBuffers[sid] || emptyBuffer()),
           messages,
           isStreaming: true,
-          _stream: { ...st, text: newText },
-          _teamHostMsgId: s._teamHostMsgId,
+          _stream: stream,
+          _teamHostMsgId: teamHostId,
           teamAgents: s.teamAgents,
           streamError: s.streamError,
         },
@@ -65,15 +144,25 @@ function flushTokens(set: (fn: (s: ChatStore) => Partial<ChatStore>) => void, ge
 }
 
 function scheduleFlush(set: any, get: any) {
-  if (!_flushScheduled) {
-    _flushScheduled = true;
-    setTimeout(() => flushTokens(set, get), 0);
+  if (_flushScheduled) return;
+  _flushScheduled = true;
+  // rAF ≈ 1 frame; fall back to 32ms if rAF unavailable (tests / SSR)
+  if (typeof requestAnimationFrame === 'function') {
+    _rafId = requestAnimationFrame(() => flushStreamBatch(set, get));
+  } else {
+    setTimeout(() => flushStreamBatch(set, get), 32);
   }
 }
 
 function drainPending() {
   _flushScheduled = false;
+  if (_rafId != null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(_rafId);
+    _rafId = null;
+  }
   _pendingText = '';
+  for (const k of Object.keys(_pendingToolChunks)) delete _pendingToolChunks[k];
+  for (const k of Object.keys(_pendingTeamChunks)) delete _pendingTeamChunks[k];
 }
 
 function snapshotActive(s: {
@@ -663,7 +752,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
 
         case 'tool_start': {
-          flushTokens(set, get);
+          flushStreamBatch(set, get);
           const stream = get()._stream;
           if (stream && stream.text.trim()) {
             get()._flushAndNewStreamMsg(stream.text);
@@ -673,7 +762,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
             const st = s._stream;
             if (!st) return s;
             const toolCalls = [...st.toolCalls, tc];
-            const messages = s.messages.map((m) => m.id === st.msgId ? { ...m, tool_calls: [...(m.tool_calls || []), tc] } : m);
+            const messages = patchMessageById(s.messages, st.msgId, {
+              tool_calls: [...(s.messages.find((m) => m.id === st.msgId)?.tool_calls || []), tc],
+            });
             return {
               _stream: { ...st, toolCalls },
               messages,
@@ -683,16 +774,22 @@ export const useChatStore = create<ChatStore>((set, get) => {
           break;
         }
 
-        case 'tool_progress':
+        case 'tool_progress': {
+          _pendingToolChunks[event.id] = (_pendingToolChunks[event.id] || '') + (event.chunk || '');
+          scheduleFlush(set, get);
+          break;
+        }
+
         case 'tool_end': {
-          const updates: any = event.type === 'tool_end' ? { status: event.status, result: event.result } : {};
+          flushStreamBatch(set, get);
+          const updates = { status: event.status as ToolCallRecord['status'], result: event.result || '' };
           set((s) => {
             const st = s._stream;
             if (!st) return s;
             const updatedToolCalls = st.toolCalls.map((t) =>
-              t.id === event.id ? { ...t, ...(event.type === 'tool_progress' ? { result: (t.result || '') + (event as any).chunk } : {}), ...updates } : t
+              t.id === event.id ? { ...t, ...updates } : t
             );
-            const messages = s.messages.map((m) => m.id === st.msgId ? { ...m, tool_calls: updatedToolCalls } : m);
+            const messages = patchMessageById(s.messages, st.msgId, { tool_calls: updatedToolCalls });
             return {
               _stream: { ...st, toolCalls: updatedToolCalls },
               messages,
@@ -703,6 +800,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
 
         case 'team_agent_start': {
+          flushStreamBatch(set, get);
           set((s) => {
             const hostId = s._stream?.msgId || s._teamHostMsgId;
             const kind = panelKindFromAgentId(event.agent_id);
@@ -727,27 +825,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
           break;
         }
         case 'team_agent_output': {
-          set((s) => {
-            const hostId = s._stream?.msgId || s._teamHostMsgId;
-            const kind = panelKindFromAgentId(event.agent_id);
-            const patch = withTeamAgentsOnHost(
-              s.messages,
-              hostId,
-              (agents) =>
-                upsertTeamAgent(agents, event.agent_id, { output: event.content }, 'output'),
-              kind,
-            );
-            return {
-              ...patch,
-              sessionBuffers: {
-                ...s.sessionBuffers,
-                [sessionId]: { ...snapshotActive({ ...s, ...patch }), isStreaming: s.isStreaming },
-              },
-            };
-          });
+          _pendingTeamChunks[event.agent_id] =
+            (_pendingTeamChunks[event.agent_id] || '') + (event.content || '');
+          scheduleFlush(set, get);
           break;
         }
         case 'team_agent_end': {
+          flushStreamBatch(set, get);
           set((s) => {
             const hostId = s._stream?.msgId || s._teamHostMsgId;
             const kind = panelKindFromAgentId(event.agent_id);
@@ -881,7 +965,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
 
         case 'complete': {
-          flushTokens(set, get);
+          flushStreamBatch(set, get);
           clearStreamIdleTimeout(sessionId);
           set((s) => {
             const st = s._stream;

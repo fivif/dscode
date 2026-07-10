@@ -234,13 +234,32 @@ pub async fn send_message(
                 event = rx.recv() => {
                     match event {
                         Some(ref ev) => {
-                            let app_state = app_handle_clone.state::<AppState>();
-                            let sm_guard = app_state.session_manager.lock().await;
-                            if let Some(ref sm) = *sm_guard {
-                                let now = chrono::Utc::now().timestamp();
-                                match ev {
-                                    StreamEvent::Token { content: ref t_content } => {
-                                        // DB6: Flush accumulated thinking before text.
+                            // High-frequency events: never hold session_manager lock (SQLite).
+                            // UI gets them immediately; DB only on ToolStart/ToolEnd/boundaries.
+                            match ev {
+                                StreamEvent::Token { content: t_content } => {
+                                    assistant_content.push_str(t_content);
+                                }
+                                StreamEvent::Thinking { content: t_content, .. } => {
+                                    thinking_buffer.push_str(t_content);
+                                }
+                                StreamEvent::ToolProgress { .. }
+                                | StreamEvent::TeamAgentOutput { .. }
+                                | StreamEvent::TeamAgentStart { .. }
+                                | StreamEvent::TeamAgentEnd { .. }
+                                | StreamEvent::TeamComplete { .. }
+                                | StreamEvent::Fact { .. }
+                                | StreamEvent::Error { .. }
+                                | StreamEvent::Complete { .. }
+                                | StreamEvent::PlanQuestion { .. }
+                                | StreamEvent::PermissionRequest { .. } => {
+                                    // UI-only or end-of-turn; no per-chunk SQLite.
+                                }
+                                StreamEvent::ToolStart { id, name, arguments, .. } => {
+                                    let app_state = app_handle_clone.state::<AppState>();
+                                    let sm_guard = app_state.session_manager.lock().await;
+                                    if let Some(ref sm) = *sm_guard {
+                                        let now = chrono::Utc::now().timestamp();
                                         if !thinking_buffer.is_empty() {
                                             sm.add_message(&persist_sid, &Message {
                                                 role: Role::Assistant,
@@ -250,30 +269,14 @@ pub async fn send_message(
                                                 created_at: now,
                                             }).ok();
                                         }
-                                        assistant_content.push_str(t_content);
-                                    }
-                                    StreamEvent::ToolStart { id, name, arguments, .. } => {
-                                        // DB6: Flush accumulated thinking before tool.
-                                        if !thinking_buffer.is_empty() {
-                                            sm.add_message(&persist_sid, &Message {
-                                                role: Role::Assistant,
-                                                content: MessageContent::Text(String::new()),
-                                                name: None, tool_calls: None, tool_call_id: None,
-                                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
-                                                created_at: now,
-                                            }).ok();
-                                        }
-                                        // Save accumulated text as a message before the tool.
                                         if !assistant_content.is_empty() {
                                             sm.add_message(&persist_sid, &Message {
                                                 role: Role::Assistant,
-                                                content: MessageContent::Text(assistant_content.clone()),
+                                                content: MessageContent::Text(std::mem::take(&mut assistant_content)),
                                                 name: None, tool_calls: None, tool_call_id: None,
                                                 reasoning_content: None, created_at: now,
                                             }).ok();
-                                            assistant_content.clear();
                                         }
-                                        // DB1: Persist tool call WITH arguments from StreamEvent.
                                         let tool_msg = Message {
                                             role: Role::Assistant,
                                             content: MessageContent::Text(String::new()),
@@ -292,8 +295,12 @@ pub async fn send_message(
                                         };
                                         sm.add_message(&persist_sid, &tool_msg).ok();
                                     }
-                                    StreamEvent::ToolEnd { id, result, .. } => {
-                                        // DB6: Flush accumulated thinking before tool result.
+                                }
+                                StreamEvent::ToolEnd { id, result, .. } => {
+                                    let app_state = app_handle_clone.state::<AppState>();
+                                    let sm_guard = app_state.session_manager.lock().await;
+                                    if let Some(ref sm) = *sm_guard {
+                                        let now = chrono::Utc::now().timestamp();
                                         if !thinking_buffer.is_empty() {
                                             sm.add_message(&persist_sid, &Message {
                                                 role: Role::Assistant,
@@ -303,24 +310,24 @@ pub async fn send_message(
                                                 created_at: now,
                                             }).ok();
                                         }
+                                        // Truncate huge tool results for SQLite (UI still gets full event)
+                                        let store_result = if result.len() > 48_000 {
+                                            let head: String = result.chars().take(40_000).collect();
+                                            format!("{head}\n…[truncated for storage]…")
+                                        } else {
+                                            result.clone()
+                                        };
                                         let tool_end = Message {
                                             role: Role::Tool,
-                                            content: MessageContent::Text(result.clone()),
+                                            content: MessageContent::Text(store_result),
                                             name: None, tool_calls: None,
                                             tool_call_id: Some(id.clone()),
                                             reasoning_content: None, created_at: now,
                                         };
                                         sm.add_message(&persist_sid, &tool_end).ok();
                                     }
-                                    StreamEvent::Thinking { content: ref t_content, .. } => {
-                                        // DB6: Accumulate thinking instead of persisting each event.
-                                        thinking_buffer.push_str(t_content);
-                                    }
-                                    _ => {}
                                 }
                             }
-                            // Release sm_guard before emitting event.
-                            drop(sm_guard);
                             events::emit_event(&app_handle_clone, ev, &persist_sid);
                         }
                         None => break, // Channel closed, forge finished.

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useMemo, memo } from 'react';
 import MessageBubble from './MessageBubble';
 import ThinkingBlockView from './ThinkingBlock';
 import ToolCallCard from './ToolCallCard';
@@ -6,6 +6,42 @@ import FactCard from './FactCard';
 import TeamPanel from './TeamPanel';
 import PlanChoiceCard from './PlanChoiceCard';
 import { useChatStore } from '@/stores/chatStore';
+import type { Message } from '@/lib/types';
+
+/** Only re-render a message row when that message reference changes. */
+const MessageRow = memo(function MessageRow({
+  msg,
+  isLast,
+  isStreaming,
+}: {
+  msg: Message;
+  isLast: boolean;
+  isStreaming: boolean;
+}) {
+  const thinking = msg.thinking_blocks || [];
+  const toolCalls = msg.tool_calls || [];
+  const teamAgentsOnMsg = msg.team_agents || [];
+  return (
+    <div className="mb-4">
+      {thinking.length > 0 && (
+        <ThinkingBlockView blocks={thinking} streaming={isStreaming && isLast} />
+      )}
+      {msg.content && <MessageBubble message={msg} />}
+      {toolCalls.map((tc) => (
+        <ToolCallCard key={tc.id} tool={tc} />
+      ))}
+      {msg.fact_cards && msg.fact_cards.length > 0 && <FactCard facts={msg.fact_cards} />}
+      {msg.plan_choice && <PlanChoiceCard messageId={msg.id} choice={msg.plan_choice} />}
+      {teamAgentsOnMsg.length > 0 && (
+        <TeamPanel
+          agents={teamAgentsOnMsg}
+          kind={msg.agent_panel_kind || 'teams'}
+          compact
+        />
+      )}
+    </div>
+  );
+});
 
 export default function ChatArea() {
   const messages = useChatStore((s) => s.messages);
@@ -15,18 +51,24 @@ export default function ChatArea() {
   const scrollRaf = useRef<number>(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Scroll key: only last message length + count — not full messages identity thrash
+  const scrollKey = useMemo(() => {
+    const last = messages[messages.length - 1];
+    const len = last?.content?.length ?? 0;
+    const tools = last?.tool_calls?.length ?? 0;
+    const tOut = last?.team_agents?.reduce((n, a) => n + (a.output?.length ?? 0), 0) ?? 0;
+    return `${messages.length}:${len}:${tools}:${tOut}:${isStreaming}`;
+  }, [messages, isStreaming]);
+
   useEffect(() => {
     if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current);
     scrollRaf.current = requestAnimationFrame(() => {
-      if (!containerRef.current) return;
-      if (isStreaming) {
-        bottomRef.current?.scrollIntoView({ behavior: 'auto' });
-      } else {
-        bottomRef.current?.scrollIntoView({ behavior: 'auto' });
-      }
+      bottomRef.current?.scrollIntoView({ behavior: 'auto' });
     });
-    return () => { if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current); };
-  }, [messages, isStreaming]);
+    return () => {
+      if (scrollRaf.current) cancelAnimationFrame(scrollRaf.current);
+    };
+  }, [scrollKey]);
 
   if (messages.length === 0) {
     return (
@@ -39,36 +81,18 @@ export default function ChatArea() {
     );
   }
 
+  const lastId = messages[messages.length - 1]?.id;
+
   return (
     <div ref={containerRef} className="flex-1 overflow-y-auto px-4 py-4">
-      {messages.map((msg) => {
-        const thinking = msg.thinking_blocks || [];
-        const toolCalls = msg.tool_calls || [];
-        const teamAgentsOnMsg = msg.team_agents || [];
-        return (
-          <div key={msg.id} className="mb-4">
-            {thinking.length > 0 && (
-              <ThinkingBlockView
-                blocks={thinking}
-                streaming={isStreaming && msg === messages[messages.length - 1]}
-              />
-            )}
-            {msg.content && <MessageBubble message={msg} />}
-            {toolCalls.map((tc: any) => <ToolCallCard key={tc.id} tool={tc} />)}
-            {msg.fact_cards && msg.fact_cards.length > 0 && <FactCard facts={msg.fact_cards} />}
-            {msg.plan_choice && (
-              <PlanChoiceCard messageId={msg.id} choice={msg.plan_choice} />
-            )}
-            {teamAgentsOnMsg.length > 0 && (
-              <TeamPanel
-                agents={teamAgentsOnMsg}
-                kind={msg.agent_panel_kind || 'teams'}
-                compact
-              />
-            )}
-          </div>
-        );
-      })}
+      {messages.map((msg) => (
+        <MessageRow
+          key={msg.id}
+          msg={msg}
+          isLast={msg.id === lastId}
+          isStreaming={isStreaming}
+        />
+      ))}
 
       {isStreaming && (
         <div className="flex items-center gap-2 pl-3 text-gray-500 text-xs animate-pulse py-1">

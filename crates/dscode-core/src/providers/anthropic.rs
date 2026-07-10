@@ -23,23 +23,54 @@ pub struct AnthropicProvider {
     pub model: String,
     pub max_tokens: u32,
     pub temperature: f64,
+    /// UI `generation.reasoning_effort` → Claude extended thinking budget.
+    pub reasoning_effort: Option<String>,
     client: Client,
 }
 
 /// Beta features we opt into on every Messages request.
-/// - `context-1m-2025-08-07`: unlock 1M context on Sonnet/Opus 4.x (and many
-///   Claude-compatible gateways that mirror Anthropic). Without this, proxies
-///   often reject with "请启用 1m 上下文" even when local `window_tokens` is 1M.
-/// - `max-tokens-3-5-sonnet-2024-07-15`: larger max_tokens on older sonnet paths.
-const ANTHROPIC_BETA_HEADER: &str =
-    "context-1m-2025-08-07,max-tokens-3-5-sonnet-2024-07-15";
+/// - `context-1m-2025-08-07`: 1M context
+/// - `interleaved-thinking-2025-05-14`: thinking + tool use in one turn
+/// - `max-tokens-3-5-sonnet-2024-07-15`: larger max_tokens on older paths
+fn anthropic_beta_header(with_thinking: bool) -> &'static str {
+    if with_thinking {
+        "context-1m-2025-08-07,interleaved-thinking-2025-05-14,max-tokens-3-5-sonnet-2024-07-15"
+    } else {
+        "context-1m-2025-08-07,max-tokens-3-5-sonnet-2024-07-15"
+    }
+}
+
+/// Map UI effort → thinking budget_tokens (Claude extended thinking).
+fn effort_to_budget(effort: &str) -> Option<u32> {
+    let e = effort.trim().to_ascii_lowercase();
+    if e.is_empty() || e == "off" || e == "none" {
+        return None;
+    }
+    Some(match e.as_str() {
+        "low" | "minimal" => 4_096,
+        "medium" | "med" => 10_000,
+        "high" => 16_000,
+        "max" | "ultra" | "maximum" => 32_000,
+        _ => 10_000,
+    })
+}
 
 impl AnthropicProvider {
+    fn thinking_enabled(&self) -> bool {
+        self.reasoning_effort
+            .as_ref()
+            .and_then(|e| effort_to_budget(e))
+            .is_some()
+    }
+
     /// Shared request headers for Messages API.
     fn apply_auth_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         req.header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
+            .header(
+                "anthropic-beta",
+                anthropic_beta_header(self.thinking_enabled()),
+            )
             .header("Content-Type", "application/json")
     }
 
@@ -54,6 +85,7 @@ impl AnthropicProvider {
             model,
             max_tokens: 8192,
             temperature: 0.0,
+            reasoning_effort: Some("max".into()),
             client,
         }
     }
@@ -87,6 +119,7 @@ impl AnthropicProvider {
             model: actual_model,
             max_tokens: conf.generation.max_tokens,
             temperature: conf.generation.temperature,
+            reasoning_effort: Some(conf.generation.reasoning_effort.clone()),
             client,
         }
     }
@@ -265,6 +298,7 @@ impl LlmProvider for AnthropicProvider {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            reasoning_effort: self.reasoning_effort.clone(),
             client: self.client.clone(),
         })
     }
@@ -283,9 +317,27 @@ impl AnthropicProvider {
     ) -> serde_json::Value {
         let (system, anthropic_messages) = build_anthropic_messages(messages);
 
+        let budget = self
+            .reasoning_effort
+            .as_deref()
+            .and_then(effort_to_budget);
+
+        // Claude requires max_tokens > budget_tokens when thinking is on.
+        let mut max_tokens = if self.max_tokens > 0 {
+            self.max_tokens
+        } else {
+            16_384
+        };
+        if let Some(b) = budget {
+            let need = b.saturating_add(4_096);
+            if max_tokens <= b {
+                max_tokens = need;
+            }
+        }
+
         let mut body = serde_json::json!({
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens,
             "messages": anthropic_messages,
             "stream": stream,
         });
@@ -298,8 +350,24 @@ impl AnthropicProvider {
             body["tools"] = serde_json::json!(build_anthropic_tools(tools));
         }
 
-        // Add temperature if set (default 0.0 matches config)
-        if self.temperature > 0.0 {
+        // Extended thinking (Claude 3.7 / 4.x). Same UI knob as DeepSeek effort.
+        if let Some(b) = budget {
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": b,
+            });
+            // Anthropic docs: temperature must be 1 when thinking is enabled
+            // (or omit). Force 1 so gateways don't reject.
+            body["temperature"] = serde_json::json!(1.0);
+            // Newer models also accept effort on output_config — harmless if ignored
+            let effort_str = match b {
+                0..=5_000 => "low",
+                5_001..=12_000 => "medium",
+                12_001..=20_000 => "high",
+                _ => "max",
+            };
+            body["output_config"] = serde_json::json!({ "effort": effort_str });
+        } else if self.temperature > 0.0 {
             body["temperature"] = serde_json::json!(self.temperature);
         }
 
@@ -507,6 +575,7 @@ fn parse_anthropic_response(body: &serde_json::Value) -> Result<ChatResponse, Pr
         .ok_or_else(|| ProviderError::Parse("No 'content' array in response".into()))?;
 
     let mut text_content = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
 
     for block in content_blocks {
@@ -515,6 +584,15 @@ fn parse_anthropic_response(body: &serde_json::Value) -> Result<ChatResponse, Pr
                 if let Some(t) = block["text"].as_str() {
                     text_content.push_str(t);
                 }
+            }
+            Some("thinking") => {
+                // Extended thinking block
+                if let Some(t) = block["thinking"].as_str() {
+                    reasoning.push_str(t);
+                }
+            }
+            Some("redacted_thinking") => {
+                reasoning.push_str("[redacted thinking]\n");
             }
             Some("tool_use") => {
                 let id = block["id"].as_str().unwrap_or("").to_string();
@@ -546,7 +624,11 @@ fn parse_anthropic_response(body: &serde_json::Value) -> Result<ChatResponse, Pr
         content: text_content,
         tool_calls,
         usage,
-        reasoning_content: None,
+        reasoning_content: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
     })
 }
 
@@ -662,6 +744,19 @@ fn parse_anthropic_sse_frame(frame: &SseFrame) -> Result<StreamChunk, ProviderEr
                         usage: None,
                     })
                 }
+                "thinking_delta" => {
+                    let t = delta["thinking"]
+                        .as_str()
+                        .or_else(|| delta["text"].as_str())
+                        .map(|s| s.to_string());
+                    Ok(StreamChunk {
+                        content: None,
+                        tool_calls: None,
+                        reasoning_content: t,
+                        finish_reason: None,
+                        usage: None,
+                    })
+                }
                 _ => {
                     // Unknown delta type — ignore
                     Ok(StreamChunk {
@@ -717,5 +812,61 @@ fn parse_anthropic_sse_frame(frame: &SseFrame) -> Result<StreamChunk, ProviderEr
                 usage: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod thinking_effort_tests {
+    use super::*;
+
+    fn provider(effort: &str, max_tokens: u32) -> AnthropicProvider {
+        AnthropicProvider {
+            api_key: "k".into(),
+            base_url: "https://api.anthropic.com".into(),
+            model: "claude-sonnet-4".into(),
+            max_tokens,
+            temperature: 0.0,
+            reasoning_effort: Some(effort.into()),
+            client: Client::new(),
+        }
+    }
+
+    #[test]
+    fn effort_maps_to_thinking_budget() {
+        let p = provider("max", 8192);
+        let body = p.build_request_body(&[], &[], false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 32000);
+        // max_tokens must exceed budget
+        assert!(body["max_tokens"].as_u64().unwrap() > 32000);
+        assert_eq!(body["temperature"], 1.0);
+    }
+
+    #[test]
+    fn medium_budget() {
+        let p = provider("medium", 20000);
+        let body = p.build_request_body(&[], &[], false);
+        assert_eq!(body["thinking"]["budget_tokens"], 10000);
+    }
+
+    #[test]
+    fn off_no_thinking() {
+        let p = provider("off", 8192);
+        let body = p.build_request_body(&[], &[], false);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn parse_thinking_block() {
+        let body = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "step by step"},
+                {"type": "text", "text": "answer"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let r = parse_anthropic_response(&body).unwrap();
+        assert_eq!(r.content, "answer");
+        assert_eq!(r.reasoning_content.as_deref(), Some("step by step"));
     }
 }

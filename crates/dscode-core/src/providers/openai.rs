@@ -253,19 +253,58 @@ impl OpenAiProvider {
             body["tools"] = serde_json::to_value(&tools).unwrap();
         }
 
-        // P8: DeepSeek-specific reasoning_effort — only include for DeepSeek
-        // to avoid 400 errors on OpenAI/Groq endpoints.
-        let is_deepseek = self.base_url.contains("deepseek");
-        if is_deepseek {
-            if let Some(ref effort) = self.reasoning_effort {
-                if !effort.is_empty() {
-                    body["reasoning_effort"] = serde_json::Value::String(effort.clone());
-                }
-            }
+        // Always attach reasoning_effort for OpenAI-compatible channels when set.
+        // No model-name filter — channel policy + user setting only.
+        // Mapping differs by channel (DeepSeek allows `max`; others map max→high).
+        if let Some(effort) = self.effective_reasoning_effort() {
+            body["reasoning_effort"] = serde_json::Value::String(effort);
         }
 
         body
     }
+
+    /// Channel style for thinking intensity (not model-name gated).
+    fn reasoning_channel(&self) -> ReasoningChannel {
+        let base = self.base_url.to_ascii_lowercase();
+        if base.contains("deepseek") {
+            ReasoningChannel::DeepSeek
+        } else {
+            // openai / ollama / custom OpenAI-compatible gateways
+            ReasoningChannel::OpenAiCompat
+        }
+    }
+
+    /// Map UI setting → API value. `None` only when user disabled effort.
+    fn effective_reasoning_effort(&self) -> Option<String> {
+        let raw = self.reasoning_effort.as_ref()?.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let r = raw.to_ascii_lowercase();
+        Some(match self.reasoning_channel() {
+            ReasoningChannel::DeepSeek => match r.as_str() {
+                "low" | "minimal" => "low".into(),
+                "medium" | "med" => "medium".into(),
+                "high" => "high".into(),
+                "max" | "ultra" | "maximum" => "max".into(),
+                other => other.to_string(),
+            },
+            ReasoningChannel::OpenAiCompat => match r.as_str() {
+                // OpenAI-compatible: low | medium | high (no official `max`)
+                "low" | "minimal" => "low".into(),
+                "medium" | "med" => "medium".into(),
+                "high" | "max" | "ultra" | "maximum" => "high".into(),
+                _ => "medium".into(),
+            },
+        })
+    }
+}
+
+/// How to map `generation.reasoning_effort` for this OpenAI-compatible endpoint.
+#[derive(Debug, Clone, Copy)]
+enum ReasoningChannel {
+    DeepSeek,
+    OpenAiCompat,
 }
 
 fn serialize_messages(msgs: &[Message]) -> Vec<serde_json::Value> {
@@ -416,4 +455,42 @@ fn parse_sse_chunk(text: &str) -> Result<StreamChunk, ProviderError> {
     // are Optional and the forge consumer gates every access on is_some().
     // This is normal SSE protocol behavior, not an error.
     Ok(result)
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+
+    fn provider(base: &str, effort: &str) -> OpenAiProvider {
+        OpenAiProvider {
+            api_key: "k".into(),
+            base_url: base.into(),
+            model: "whatever-model".into(),
+            max_tokens: 1024,
+            temperature: 0.0,
+            reasoning_effort: Some(effort.into()),
+            client: Client::new(),
+        }
+    }
+
+    #[test]
+    fn deepseek_channel_sends_max_without_model_filter() {
+        let p = provider("https://api.deepseek.com/v1", "max");
+        let body = p.build_request_body(vec![], vec![], false);
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn openai_compat_maps_max_to_high_any_model() {
+        let p = provider("https://api.openai.com/v1", "max");
+        let body = p.build_request_body(vec![], vec![], false);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn off_disables_effort() {
+        let p = provider("https://api.deepseek.com/v1", "off");
+        let body = p.build_request_body(vec![], vec![], false);
+        assert!(body.get("reasoning_effort").is_none());
+    }
 }

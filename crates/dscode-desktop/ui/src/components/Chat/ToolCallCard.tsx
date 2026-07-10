@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, memo, useMemo } from 'react';
 import type { ToolCallRecord } from '@/lib/types';
 import { IconCheck, IconDot, IconX } from '@/components/icons';
 
@@ -23,17 +23,14 @@ function StatusIcon({ status }: { status: ToolCallRecord['status'] }) {
   return <IconX className={cls} size={12} />;
 }
 
-export default function ToolCallCard({ tool }: Props) {
+function ToolCallCardInner({ tool }: Props) {
+  // Default collapsed while running — expanding huge streaming logs freezes the UI.
   const [expanded, setExpanded] = useState(false);
   const userToggledRef = useRef(false);
 
   useEffect(() => {
-    if (tool.status === 'running') {
-      setExpanded(true);
-      userToggledRef.current = false;
-    } else if (!userToggledRef.current) {
-      const t = setTimeout(() => setExpanded(false), 4000);
-      return () => clearTimeout(t);
+    if (tool.status !== 'running' && !userToggledRef.current) {
+      // Keep collapsed after finish unless user opened it
     }
   }, [tool.status]);
 
@@ -41,6 +38,18 @@ export default function ToolCallCard({ tool }: Props) {
     userToggledRef.current = true;
     setExpanded(!expanded);
   };
+
+  // Cap DOM text while streaming (still keep full string in store for tool_end).
+  const displayResult = useMemo(() => {
+    if (!tool.result) return '';
+    if (tool.status === 'running' && tool.result.length > 4000) {
+      return '…\n' + tool.result.slice(-4000);
+    }
+    if (tool.result.length > 30_000) {
+      return tool.result.slice(0, 12_000) + '\n…[truncated for display]…\n' + tool.result.slice(-8_000);
+    }
+    return tool.result;
+  }, [tool.result, tool.status]);
 
   return (
     <div className={`mb-1.5 ml-1 border ${COLORS[tool.status]} bg-card/60 rounded-md overflow-hidden transition-colors`}>
@@ -60,9 +69,9 @@ export default function ToolCallCard({ tool }: Props) {
       </button>
       {expanded && (
         <div className="px-2.5 pb-2 pt-0.5 border-t border-border/30">
-          {tool.result && (
+          {displayResult && (
             <pre className="text-[11px] text-gray-400 bg-black/20 rounded p-2 max-h-44 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed">
-              {tool.result}
+              {displayResult}
             </pre>
           )}
         </div>
@@ -70,3 +79,5 @@ export default function ToolCallCard({ tool }: Props) {
     </div>
   );
 }
+
+export default memo(ToolCallCardInner);
