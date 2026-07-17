@@ -7,6 +7,7 @@ import type { FileAttachment } from '@/lib/types';
 import {
   availableModels,
   modelDisplayName,
+  resolveProviderForModel,
   type ModelOption,
 } from '@/lib/models';
 import { AttachmentKindIcon, IconPaperclip, IconX } from '@/components/icons';
@@ -135,16 +136,21 @@ export default function InputBox() {
   const abortStream = useChatStore((s) => s.abortStream);
   const sessions = useSessionStore((s) => s.sessions);
   const updateWorkspace = useSessionStore((s) => s.updateWorkspace);
+  const updateSessionModel = useSessionStore((s) => s.updateModel);
   const activeSession = sessions.find((s) => s.id === activeSessionId);
   const workspace = activeSession?.workspace || '';
 
   const config = useConfigStore((s) => s.config);
   const updateConfig = useConfigStore((s) => s.updateConfig);
-  const setDefaultModel = useConfigStore((s) => s.setDefaultModel);
   const fetchedModels = useConfigStore((s) => s.fetchedModels);
   const absoluteTrust = !!config.absolute_trust;
-  const activeProvider = config.active_provider;
-  const activeModel = config.default_model;
+  // Per-session model; legacy empty → global default
+  const activeModel =
+    (activeSession?.model || '').trim() || config.default_model;
+  const activeProvider = useMemo(
+    () => resolveProviderForModel(config, activeModel, fetchedModels),
+    [config, activeModel, fetchedModels],
+  );
   const modelOptions = useMemo(
     () => availableModels(config, fetchedModels),
     [config, fetchedModels],
@@ -633,11 +639,13 @@ export default function InputBox() {
 
   const handleSelectModel = useCallback(
     (model: ModelOption) => {
-      // Always pass the channel the option was scanned under (not name-prefix guess)
-      setDefaultModel(model.id, model.provider);
+      // Bind model to the current session only (does not change global default for new chats).
+      if (activeSessionId) {
+        void updateSessionModel(activeSessionId, model.id);
+      }
       setShowModelPicker(false);
     },
-    [setDefaultModel],
+    [activeSessionId, updateSessionModel],
   );
 
   if (!activeSessionId) {

@@ -5,6 +5,8 @@ export interface Session {
   id: string;
   title: string;
   workspace: string;
+  /** Model bound to this session (snapshot of default at create; updated on picker change). Empty = use global default. */
+  model?: string;
   created_at: number;
   updated_at: number;
   messages: Message[];
@@ -159,6 +161,8 @@ export interface ProxyConfig {
   url: string;
   /** Force proxy app-wide when url is valid */
   global: boolean;
+  /** Built-in web tools (search/fetch) use proxy; forced when global */
+  web_use_proxy?: boolean;
 }
 
 export interface Config {
@@ -204,6 +208,13 @@ export interface ProviderConfig {
   use_proxy: boolean;
   /** Last successful /models scan (persisted). Empty = not scanned yet. */
   model_list?: string[];
+  /**
+   * Models listed in the global picker (default + input box).
+   * - `undefined` / missing: not curated → treat as all of `model_list` (legacy).
+   * - `[]`: user cleared → contribute nothing.
+   * - `[...]`: explicit whitelist.
+   */
+  enabled_models?: string[] | null;
 }
 
 export interface AppConfig {

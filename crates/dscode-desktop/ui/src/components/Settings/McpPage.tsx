@@ -21,6 +21,8 @@ export default function McpPage({ onBack }: Props) {
   const [error, setError] = useState('');
   const [builtinOpen, setBuiltinOpen] = useState(false);
   const [extOpen, setExtOpen] = useState(true);
+  /** Full MCP tool name dump — collapsed by default (noise; Agent already has tools). */
+  const [mcpToolsOpen, setMcpToolsOpen] = useState(false);
 
   const [formMode, setFormMode] = useState<FormMode>('closed');
   /** Original name when editing (for rename) */
@@ -157,9 +159,8 @@ export default function McpPage({ onBack }: Props) {
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-xl mx-auto px-8 py-6 space-y-4">
           <p className="text-[11px] text-gray-600 leading-relaxed">
-            MCP 工具会注册为 <code className="text-gray-500">mcp_服务器_工具名</code> 并出现在 Agent
-            的可用工具列表中。配置保存在{' '}
-            <code className="text-gray-500">~/.dscode/mcp_servers.json</code> 与 config.toml。
+            管理 MCP 服务器连接即可。工具会自动注册给 Agent，无需在此浏览完整清单。配置：{' '}
+            <code className="text-gray-500">~/.dscode/mcp_servers.json</code>
           </p>
 
           {error && (
@@ -337,19 +338,45 @@ export default function McpPage({ onBack }: Props) {
                   </div>
                 )}
 
+                {/* Compact summary only — full catalog is Agent-side, not a settings task */}
                 {mcpTools.length > 0 && (
-                  <div className="pt-2 border-t border-border/40 space-y-1">
-                    <div className="text-[10px] text-gray-600 uppercase tracking-wide">
-                      已注册 MCP 工具（Agent 可见）
-                    </div>
-                    {mcpTools.map((t) => (
-                      <div key={t.name} className="flex items-start gap-2 py-1">
-                        <span className="text-[11px] font-mono text-emerald-400/90 shrink-0 max-w-[45%] truncate">
-                          {t.name}
-                        </span>
-                        <span className="text-[11px] text-gray-500 truncate">{t.description}</span>
+                  <div className="pt-2 border-t border-border/40">
+                    <button
+                      type="button"
+                      className="w-full flex items-center gap-2 py-1 text-left"
+                      onClick={() => setMcpToolsOpen((v) => !v)}
+                    >
+                      <svg
+                        className={`w-2.5 h-2.5 text-gray-600 transition-transform shrink-0 ${
+                          mcpToolsOpen ? 'rotate-90' : ''
+                        }`}
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                      >
+                        <polyline points="9 18 15 12 9 6" />
+                      </svg>
+                      <span className="text-[11px] text-gray-500">
+                        已注册 {mcpTools.length} 个工具（Agent 可调用）
+                      </span>
+                      <span className="text-[10px] text-gray-600 ml-auto">
+                        {mcpToolsOpen ? '收起' : '展开名称'}
+                      </span>
+                    </button>
+                    {mcpToolsOpen && (
+                      <div className="mt-1 max-h-36 overflow-y-auto rounded bg-main/40 px-2 py-1.5 space-y-0.5">
+                        {mcpTools.map((t) => (
+                          <div
+                            key={t.name}
+                            className="text-[10px] font-mono text-gray-500 truncate"
+                            title={t.description}
+                          >
+                            {t.name}
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
                   </div>
                 )}
 

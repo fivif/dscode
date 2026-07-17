@@ -19,6 +19,11 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub workspace: String,
+    /// Model id bound to this session.
+    /// Snapshot of global default at create time; updated when the user picks a model in chat.
+    /// Empty string = fall back to config `default_model` (legacy sessions).
+    #[serde(default)]
+    pub model: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub messages: Vec<Message>,
@@ -92,6 +97,10 @@ impl SessionManager {
         // Migration: add workspace column if missing (non-fatal if already exists)
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT ''").ok();
 
+        // Migration: per-session model binding (empty = use global default)
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+            .ok();
+
         // Migration: add name column to messages if missing (non-fatal if already exists)
         conn.execute_batch("ALTER TABLE messages ADD COLUMN name TEXT").ok();
 
@@ -114,14 +123,21 @@ impl SessionManager {
     // ── CRUD ──────────────────────────────────────────────────────────────
 
     /// Create a new session and return it (with empty messages).
-    pub fn create_session(&self, title: &str, workspace: &str) -> Result<Session, String> {
+    /// `model` is usually the current global default; empty means fall back at send time.
+    pub fn create_session(
+        &self,
+        title: &str,
+        workspace: &str,
+        model: &str,
+    ) -> Result<Session, String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp();
+        let model = model.trim().to_string();
 
         self.conn
             .execute(
-                "INSERT INTO sessions (id, title, workspace, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, title, workspace, now, now],
+                "INSERT INTO sessions (id, title, workspace, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, title, workspace, model, now, now],
             )
             .map_err(|e| format!("Failed to create session: {}", e))?;
 
@@ -129,6 +145,7 @@ impl SessionManager {
             id,
             title: title.to_string(),
             workspace: workspace.to_string(),
+            model,
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
@@ -160,6 +177,26 @@ impl SessionManager {
                 params![workspace, Utc::now().timestamp(), session_id],
             )
             .map_err(|e| format!("Failed to update workspace: {}", e))?;
+        if affected == 0 {
+            Err("Session not found".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Bind a model id to this session (user changed model in the chat picker).
+    pub fn update_model(&self, session_id: &str, model: &str) -> Result<(), String> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("Model must not be empty".into());
+        }
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+                params![model, Utc::now().timestamp(), session_id],
+            )
+            .map_err(|e| format!("Failed to update model: {}", e))?;
         if affected == 0 {
             Err("Session not found".into())
         } else {
@@ -362,7 +399,9 @@ impl SessionManager {
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, workspace, created_at, updated_at FROM sessions WHERE id = ?1")
+            .prepare(
+                "SELECT id, title, workspace, COALESCE(model, ''), created_at, updated_at FROM sessions WHERE id = ?1",
+            )
             .map_err(|e| format!("Prepare error: {}", e))?;
 
         let session_row = stmt
@@ -371,8 +410,9 @@ impl SessionManager {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .optional()
@@ -380,12 +420,13 @@ impl SessionManager {
 
         match session_row {
             None => Ok(None),
-            Some((id, title, workspace, created_at, updated_at)) => {
+            Some((id, title, workspace, model, created_at, updated_at)) => {
                 let messages = self.load_messages(&id)?;
                 Ok(Some(Session {
                     id,
                     title,
                     workspace,
+                    model,
                     created_at,
                     updated_at,
                     messages,
@@ -398,7 +439,9 @@ impl SessionManager {
     pub fn list_sessions(&self) -> Result<Vec<Session>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, workspace, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
+            .prepare(
+                "SELECT id, title, workspace, COALESCE(model, ''), created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+            )
             .map_err(|e| format!("Prepare error: {}", e))?;
 
         let rows = stmt
@@ -407,19 +450,22 @@ impl SessionManager {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(|e| format!("Query error: {}", e))?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, title, workspace, created_at, updated_at) = row.map_err(|e| format!("Row error: {}", e))?;
+            let (id, title, workspace, model, created_at, updated_at) =
+                row.map_err(|e| format!("Row error: {}", e))?;
             sessions.push(Session {
                 id,
                 title,
                 workspace,
+                model,
                 created_at,
                 updated_at,
                 messages: Vec::new(),
@@ -593,8 +639,10 @@ impl SessionManager {
         let mut stmt = self
             .conn
             .prepare(
+                // id (AUTOINCREMENT) breaks ties when many rows share the same
+                // second-resolution created_at — critical for tool-chain order.
                 "SELECT role, content, tool_calls, tool_call_id, reasoning_content, name, created_at
-                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
+                 FROM messages WHERE session_id = ?1 ORDER BY created_at ASC, id ASC",
             )
             .map_err(|e| format!("Prepare messages query: {}", e))?;
 
@@ -696,6 +744,11 @@ impl SessionManager {
     }
 
     /// Strip orphaned tool_calls and their tool messages.
+    ///
+    /// Also merges consecutive assistant messages that each carry tool_calls into
+    /// a single assistant message. Legacy persistence wrote one assistant per
+    /// ToolStart, which OpenAI-compat APIs reject on the next turn:
+    /// "assistant message with tool_calls must be followed by tool messages…"
     fn validate_tool_chain(messages: &mut Vec<Message>) {
         // Remove consecutive duplicate messages (same role, same content, same tool metadata).
         // Ignores created_at since duplicates are persisted within the same second.
@@ -723,6 +776,8 @@ impl SessionManager {
         if deduped > 0 {
             eprintln!("[SessionManager] Dedup summary: removed {} of {} messages", deduped, before_count);
         }
+
+        Self::merge_consecutive_tool_call_assistants(messages);
 
         let responded: std::collections::HashSet<String> = messages
             .iter()
@@ -758,6 +813,65 @@ impl SessionManager {
                 .as_ref()
                 .map_or(false, |id| valid_ids.contains(id))
         });
+    }
+
+    /// Collapse `assistant([A]) assistant([B]) tool(A) tool(B)` →
+    /// `assistant([A,B]) tool(A) tool(B)`.
+    fn merge_consecutive_tool_call_assistants(messages: &mut Vec<Message>) {
+        let mut i = 0;
+        while i < messages.len() {
+            let has_tc = messages[i].role == Role::Assistant
+                && messages[i]
+                    .tool_calls
+                    .as_ref()
+                    .map(|tc| !tc.is_empty())
+                    .unwrap_or(false);
+            if !has_tc {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < messages.len()
+                && messages[j].role == Role::Assistant
+                && messages[j]
+                    .tool_calls
+                    .as_ref()
+                    .map(|tc| !tc.is_empty())
+                    .unwrap_or(false)
+            {
+                j += 1;
+            }
+            if j > i + 1 {
+                let mut combined = messages[i].tool_calls.take().unwrap_or_default();
+                for k in (i + 1)..j {
+                    if let Some(tcs) = messages[k].tool_calls.take() {
+                        for tc in tcs {
+                            if !combined.iter().any(|x| x.id == tc.id) {
+                                combined.push(tc);
+                            }
+                        }
+                    }
+                    // Fold non-empty content / reasoning into the head message.
+                    if messages[i].content.is_empty() && !messages[k].content.is_empty() {
+                        messages[i].content = messages[k].content.clone();
+                    }
+                    if messages[i].reasoning_content.as_ref().map_or(true, |r| r.is_empty()) {
+                        if let Some(ref rc) = messages[k].reasoning_content {
+                            if !rc.is_empty() {
+                                messages[i].reasoning_content = Some(rc.clone());
+                            }
+                        }
+                    }
+                }
+                messages[i].tool_calls = Some(combined);
+                messages.drain((i + 1)..j);
+                eprintln!(
+                    "[SessionManager] Merged {} consecutive tool-call assistant messages",
+                    j - i
+                );
+            }
+            i += 1;
+        }
     }
 }
 
@@ -796,6 +910,102 @@ impl<T> Optional<T> for Result<T, rusqlite::Error> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_chain_tests {
+    use super::SessionManager;
+    use crate::providers::trait_def::{
+        FunctionCall, Message, MessageContent, Role, ToolCall,
+    };
+
+    fn tc(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "do_web_search".into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    fn assistant_one(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            name: None,
+            tool_calls: Some(vec![tc(id)]),
+            tool_call_id: None,
+            reasoning_content: None,
+            created_at: 0,
+        }
+    }
+
+    fn tool(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: MessageContent::Text("ok".into()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            reasoning_content: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn merge_split_parallel_tool_starts() {
+        let mut msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("search".into()),
+                ..Default::default()
+            },
+            assistant_one("call_1"),
+            assistant_one("call_2"),
+            tool("call_1"),
+            tool("call_2"),
+        ];
+        SessionManager::merge_consecutive_tool_call_assistants(&mut msgs);
+        assert_eq!(msgs.len(), 4);
+        let ids: Vec<_> = msgs[1]
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["call_1", "call_2"]);
+    }
+
+    #[test]
+    fn validate_tool_chain_repairs_legacy_history() {
+        let mut msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("q".into()),
+                ..Default::default()
+            },
+            assistant_one("a"),
+            assistant_one("b"),
+            tool("a"),
+            tool("b"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("answer".into()),
+                ..Default::default()
+            },
+        ];
+        SessionManager::validate_tool_chain(&mut msgs);
+        let tc_assts: Vec<_> = msgs
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert_eq!(tc_assts.len(), 1);
+        assert_eq!(tc_assts[0].tool_calls.as_ref().unwrap().len(), 2);
+        assert_eq!(msgs.iter().filter(|m| m.role == Role::Tool).count(), 2);
     }
 }
 

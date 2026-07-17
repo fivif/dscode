@@ -3,12 +3,12 @@
  * per-channel model dropdowns, and InputBox picker in sync.
  *
  * Rules:
- * - Global pickers → **enabled channels only**
- * - After API fetch (or persisted model_list) → show **only** real scanned ids
+ * - Global pickers → **enabled channels only** + **enabled_models** whitelist
+ * - Scan catalog (model_list) is for settings multi-select only
  * - Never inject hardcoded KNOWN_MODELS into pickers (labels only)
  * - Model → channel binding prefers the channel it was scanned under (not name prefix)
  */
-import type { AppConfig, ModelDef } from './types';
+import type { AppConfig, ModelDef, ProviderConfig } from './types';
 import { KNOWN_MODELS } from './types';
 
 export type ModelOption = { id: string; label: string; provider: string };
@@ -65,16 +65,61 @@ export function scannedModelsFor(
 }
 
 /**
- * Models for one channel (Settings channel tab + global picker slice).
- * - With scan results: **only** those ids (no hardcoded catalog).
- * - Without scan: only the currently saved channel model (if any), so we never
- *   show ghost gpt-4o / o3-mini entries for custom OpenAI-compatible endpoints.
+ * Whitelist that appears in global pickers.
+ * - `enabled_models == null/undefined` → legacy: all of model_list (or scanned)
+ * - `enabled_models == []` → nothing (user cleared)
+ * - otherwise explicit list
+ */
+export function effectiveEnabledModels(
+  prov: ProviderConfig | undefined,
+  scannedFallback: string[] = [],
+): string[] {
+  if (!prov) return [];
+  const catalog =
+    scannedFallback.length > 0
+      ? scannedFallback
+      : (prov.model_list || []).map((s) => s.trim()).filter(Boolean);
+
+  if (prov.enabled_models === undefined || prov.enabled_models === null) {
+    return catalog;
+  }
+  return prov.enabled_models.map((s) => String(s).trim()).filter(Boolean);
+}
+
+/**
+ * Full scan catalog options (settings multi-select). Not filtered by whitelist.
+ */
+export function catalogModelOptionsForProvider(
+  provider: string,
+  fetched: string[] = [],
+  persistedList?: string[],
+): ModelOption[] {
+  const known = knownModelsFor(provider);
+  const out: ModelOption[] = [];
+  const seen = new Set<string>();
+  const push = (id: string) => {
+    const tid = (id || '').trim();
+    if (!tid || seen.has(tid)) return;
+    seen.add(tid);
+    out.push({ id: tid, label: labelFor(tid, known), provider });
+  };
+  const scanned =
+    fetched.length > 0 ? fetched : (persistedList || []).filter(Boolean);
+  for (const id of scanned) push(id);
+  return out;
+}
+
+/**
+ * Models for one channel that appear in **global** pickers (curated whitelist).
+ * - With curated/scan: only enabled_models (or full catalog if not curated).
+ * - Without scan: only the currently saved channel model (if any).
  */
 export function modelOptionsForProvider(
   provider: string,
   fetched: string[] = [],
   savedModel?: string,
   persistedList?: string[],
+  enabledModels?: string[] | null,
 ): ModelOption[] {
   const known = knownModelsFor(provider);
   const out: ModelOption[] = [];
@@ -96,8 +141,27 @@ export function modelOptionsForProvider(
       ? fetched
       : (persistedList || []).filter(Boolean);
 
-  if (scanned.length > 0) {
-    for (const id of scanned) push(id);
+  if (
+    scanned.length > 0 ||
+    (enabledModels !== undefined && enabledModels !== null)
+  ) {
+    const curated = effectiveEnabledModels(
+      {
+        api_key: '',
+        base_url: '',
+        enabled: true,
+        model: '',
+        use_proxy: false,
+        model_list: scanned,
+        enabled_models: enabledModels,
+      },
+      scanned,
+    );
+    for (const id of curated) {
+      // If we have a catalog, only show curated ids that still exist there
+      if (scanned.length > 0 && !scanned.includes(id)) continue;
+      push(id);
+    }
     return out;
   }
 
@@ -107,7 +171,7 @@ export function modelOptionsForProvider(
 }
 
 /**
- * Global selectable models: enabled providers only, real lists only.
+ * Global selectable models: enabled channels × curated whitelist only.
  */
 export function availableModels(
   config: AppConfig,
@@ -120,11 +184,11 @@ export function availableModels(
     modelOptionsForProvider(
       p,
       fetchedByProvider[p] || [],
-      // Prefer default when this channel owns it; else channel saved model
       config.active_provider === p
         ? config.default_model || config.providers[p]?.model
         : config.providers[p]?.model,
       config.providers[p]?.model_list,
+      config.providers[p]?.enabled_models,
     ),
   );
 
@@ -136,6 +200,23 @@ export function availableModels(
     seen.add(key);
     return true;
   });
+}
+
+/**
+ * Merge scan results into enabled_models whitelist.
+ * - First curation (null/undefined): select all scanned.
+ * - Re-scan: keep previous ∩ scanned; new ids stay unchecked.
+ */
+export function mergeEnabledAfterScan(
+  previous: string[] | null | undefined,
+  scanned: string[],
+): string[] {
+  const clean = scanned.map((s) => s.trim()).filter(Boolean);
+  if (previous === undefined || previous === null) {
+    return [...clean];
+  }
+  const set = new Set(clean);
+  return previous.map((s) => s.trim()).filter((s) => s && set.has(s));
 }
 
 /**

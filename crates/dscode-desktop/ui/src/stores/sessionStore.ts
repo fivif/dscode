@@ -12,6 +12,7 @@ export interface SessionStore {
   getLastSession: () => Promise<Session | null>;
   updateWorkspace: (sessionId: string, workspace: string) => Promise<void>;
   updateTitle: (sessionId: string, title: string) => Promise<void>;
+  updateModel: (sessionId: string, model: string) => Promise<void>;
   applyTitleLocal: (sessionId: string, title: string) => void;
 }
 
@@ -64,6 +65,21 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     try {
       await tauri.updateSessionTitle(sessionId, trimmed);
       get().applyTitleLocal(sessionId, trimmed);
+    } catch (err: unknown) {
+      set({ error: String(err) });
+    }
+  },
+
+  updateModel: async (sessionId, model) => {
+    const mid = (model || '').trim();
+    if (!mid) return;
+    try {
+      await tauri.updateSessionModel(sessionId, mid);
+      set((s) => ({
+        sessions: s.sessions.map((ss) =>
+          ss.id === sessionId ? { ...ss, model: mid } : ss
+        ),
+      }));
     } catch (err: unknown) {
       set({ error: String(err) });
     }

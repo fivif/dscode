@@ -49,5 +49,61 @@ llm_wiki/
 # Cross-compilation caches
 .xwin-cache/
 
+# Analysis artifacts (temporary reports in project root)
+/ARCHITECTURE_REVIEW.md
+/CODE_QUALITY_REPORT.md
+/DATA_EXPLORATION_REPORT.md
+/DEPENDENCY_GRAPH.md
+/DEPENDENCY_REPORT.md
+/DESIGN_TEAMS_V2.md
+/MODEL_EVALUATION_REPORT.md
+/PROJECT_ANALYSIS_SLIDES.md
+/PROJECT_ANALYSIS_SUMMARY.md
+/PROJECT_USAGE_GUIDE.md
+/TECH_STACK_SUMMARY.md
+/analyze_complexity.py
+/api_docs.html
+/api_structure.json
+/architecture_diagram.dot
+/cicd_report.md
+/code_distribution.png
+/compile_inventory.py
+/complexity_report.json
+/config_analysis.md
+/core-timer.js
+/count_rs.py
+/count_rs.sh
+/crates_directory_tree.txt
+/crates_file_list.txt
+/crates_file_types.md
+/crates_summary.csv
+/data_quality_summary.json
+/dependency_graph.dot
+/dependency_script_analysis.md
+/dimension_scores.png
+/docs_assets_analysis.md
+/extract_project_name.py
+/feature_heatmap.png
+/generate_eval_charts.py
+/git_stats.json
+/implementation_comparison.png
+/maturity_timeline.png
+/module_complexity.png
+/notifications.js
+/parse_project_name.py
+/project_file_list.md
+/project_structure.md
+/project_structure_tree.txt
+/questions_code.txt
+/questions_md.txt
+/radar_scores.png
+/rs_count.txt
+/scan_questions.py
+/security_report.json
+/source_analysis.md
+/structure_report.md
+/style.css
+/依赖关系与外部集成分析报告.md
+
 # Cargo lock (workspace crate, not end-user app)
 # Cargo.lock is committed for deterministic builds in this project

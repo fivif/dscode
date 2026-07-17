@@ -53,7 +53,11 @@ async fn main() -> Result<()> {
     // Create initial session
     let session_manager = SessionManager::new(config.session.retention_days)
         .map_err(|e| anyhow::anyhow!("Session: {}", e))?;
-    let session = session_manager.create_session("New Chat", "/Users/zay/Desktop/DS_code")
+    let session = session_manager.create_session(
+        "New Chat",
+        "/Users/zay/Desktop/DS_code",
+        &config.default_model,
+    )
         .map_err(|e| anyhow::anyhow!("Create session: {}", e))?;
 
     // Persist user message

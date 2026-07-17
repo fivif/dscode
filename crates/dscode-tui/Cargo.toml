@@ -1,9 +1,9 @@
 [package]
 name = "dscode-tui"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-authors = ["ZAY"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 description = "Claude Code-style terminal UI for DS Code"
 
 [[bin]]

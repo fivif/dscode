@@ -60,6 +60,7 @@ pub async fn get_session(
 }
 
 /// Create a new session with the given title.
+/// Snapshots the current global `default_model` onto the session.
 /// Returns the session with an empty message list.
 #[tauri::command]
 pub async fn create_session(
@@ -71,12 +72,17 @@ pub async fn create_session(
 
     state.ensure_session_manager().await?;
 
+    let model = {
+        let config = state.config.lock().await;
+        config.default_model.clone()
+    };
+
     let sm_guard = state.session_manager.lock().await;
     let sm = sm_guard
         .as_ref()
         .ok_or_else(|| "Session manager not initialized".to_string())?;
 
-    sm.create_session(&title, &workspace)
+    sm.create_session(&title, &workspace, &model)
 }
 
 /// Get the most recently used session.
@@ -117,6 +123,22 @@ pub async fn update_session_title(
         .as_ref()
         .ok_or_else(|| "Session manager not initialized".to_string())?;
     sm.update_title(&session_id, &title)
+}
+
+/// Bind a model to a session (chat model picker). Does not change global default.
+#[tauri::command]
+pub async fn update_session_model(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    model: String,
+) -> Result<(), String> {
+    info!(%session_id, %model, "session: set model");
+    state.ensure_session_manager().await?;
+    let sm_guard = state.session_manager.lock().await;
+    let sm = sm_guard
+        .as_ref()
+        .ok_or_else(|| "Session manager not initialized".to_string())?;
+    sm.update_model(&session_id, &model)
 }
 
 /// Delete a session and all its messages.

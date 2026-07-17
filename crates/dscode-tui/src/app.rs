@@ -259,7 +259,7 @@ impl AppState {
     pub fn create_session(&mut self, title: &str) {
         let title = if title.is_empty() { "New Chat" } else { title };
         let ws = self.working_dir.to_string_lossy().to_string();
-        match self.session_manager.create_session(title, &ws) {
+        match self.session_manager.create_session(title, &ws, &self.config.default_model) {
             Ok(session) => {
                 let id = session.id.clone();
                 self.active_session = Some(session);

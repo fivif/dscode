@@ -63,6 +63,11 @@ export async function updateSessionTitle(sessionId: string, title: string): Prom
   return invoke('update_session_title', { sessionId, title });
 }
 
+/** Bind a model to a session (does not change global default_model). */
+export async function updateSessionModel(sessionId: string, model: string): Promise<void> {
+  return invoke('update_session_model', { sessionId, model });
+}
+
 export async function deleteSession(id: string): Promise<void> {
   await invoke('delete_session', { id });
 }

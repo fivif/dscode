@@ -3,6 +3,8 @@ import * as tauri from '@/lib/tauri';
 import type { AppConfig, ProviderConfig } from '@/lib/types';
 import { isProxyConfigured } from '@/lib/types';
 import {
+  effectiveEnabledModels,
+  mergeEnabledAfterScan,
   resolveProviderForModel,
   resolveValidDefaultModel,
 } from '@/lib/models';
@@ -23,6 +25,7 @@ function defaultAppConfig(): AppConfig {
         model: '',
         use_proxy: false,
         model_list: [],
+        enabled_models: null,
       },
       openai: {
         api_key: '',
@@ -31,6 +34,7 @@ function defaultAppConfig(): AppConfig {
         model: '',
         use_proxy: false,
         model_list: [],
+        enabled_models: null,
       },
       anthropic: {
         api_key: '',
@@ -39,6 +43,7 @@ function defaultAppConfig(): AppConfig {
         model: '',
         use_proxy: false,
         model_list: [],
+        enabled_models: null,
       },
       ollama: {
         api_key: '',
@@ -47,6 +52,7 @@ function defaultAppConfig(): AppConfig {
         model: '',
         use_proxy: false,
         model_list: [],
+        enabled_models: null,
       },
     },
     reasoning_effort: 'max',
@@ -55,11 +61,18 @@ function defaultAppConfig(): AppConfig {
     retention_days: 30,
     context_window_tokens: 1_000_000,
     context_compress_threshold: 0.8,
-    proxy: { url: '', global: false },
+    proxy: { url: '', global: false, web_use_proxy: false },
     mcp_use_proxy: false,
     skills_use_proxy: false,
     absolute_trust: false,
   };
+}
+
+function parseEnabledModels(raw: any): string[] | null {
+  // Field missing → null (legacy: treat as all model_list)
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) return null;
+  return (raw as string[]).map((s) => String(s).trim()).filter(Boolean);
 }
 
 function ensureProvider(
@@ -69,6 +82,12 @@ function ensureProvider(
   const list = Array.isArray(raw?.model_list)
     ? (raw.model_list as string[]).map((s) => String(s).trim()).filter(Boolean)
     : fallback.model_list || [];
+  // Only treat as curated when the key is present on the raw provider object
+  const hasKey =
+    raw != null && Object.prototype.hasOwnProperty.call(raw, 'enabled_models');
+  const enabled_models = hasKey
+    ? parseEnabledModels(raw.enabled_models)
+    : fallback.enabled_models ?? null;
   return {
     api_key: raw?.api_key ?? fallback.api_key,
     base_url: raw?.base_url ?? fallback.base_url,
@@ -76,6 +95,12 @@ function ensureProvider(
     model: (raw?.model || '').trim() || fallback.model || '',
     use_proxy: !!raw?.use_proxy,
     model_list: list,
+    // hasKey + null array field → empty list Some([]); missing key → null
+    enabled_models: hasKey
+      ? Array.isArray(raw.enabled_models)
+        ? (raw.enabled_models as string[]).map((s) => String(s).trim()).filter(Boolean)
+        : []
+      : enabled_models,
   };
 }
 
@@ -89,7 +114,7 @@ function normalizeProxyFlags(cfg: AppConfig): AppConfig {
     }
     return {
       ...cfg,
-      proxy: { url: (cfg.proxy?.url || '').trim(), global: false },
+      proxy: { url: (cfg.proxy?.url || '').trim(), global: false, web_use_proxy: false },
       providers,
       mcp_use_proxy: false,
       skills_use_proxy: false,
@@ -100,6 +125,7 @@ function normalizeProxyFlags(cfg: AppConfig): AppConfig {
     proxy: {
       url: cfg.proxy.url.trim(),
       global: !!cfg.proxy.global,
+      web_use_proxy: !!cfg.proxy.global || !!cfg.proxy.web_use_proxy,
     },
   };
 }
@@ -143,7 +169,7 @@ function withSyncedModel(
   };
 }
 
-/** After a real /models scan: persist list, clamp channel + default model. */
+/** After a real /models scan: persist catalog + merge whitelist, clamp default. */
 function applyScanToConfig(
   cfg: AppConfig,
   provider: string,
@@ -154,43 +180,90 @@ function applyScanToConfig(
   const prev = providers[provider];
   if (!prev) return cfg;
 
+  const enabled_models = mergeEnabledAfterScan(prev.enabled_models, clean);
   let channelModel = (prev.model || '').trim();
-  if (clean.length > 0 && !clean.includes(channelModel)) {
-    channelModel = clean[0];
+  if (enabled_models.length > 0) {
+    if (!enabled_models.includes(channelModel)) {
+      channelModel = enabled_models[0];
+    }
+  } else {
+    channelModel = '';
   }
   providers[provider] = {
     ...prev,
     model_list: clean,
+    enabled_models,
     model: channelModel,
   };
 
   let next: AppConfig = { ...cfg, providers };
   const fetched = { [provider]: clean };
 
-  // If this channel is active (or owns default), keep default inside real list
+  // Keep default inside curated whitelist when this channel owns it
   const ownsDefault =
     next.active_provider === provider ||
     resolveProviderForModel(next, next.default_model, fetched) === provider;
 
   if (ownsDefault && prev.enabled) {
-    if (clean.length === 0) {
-      // scanned empty — clear default if it pointed here
+    if (enabled_models.length === 0) {
       if (next.active_provider === provider) {
         next = { ...next, default_model: '' };
       }
-    } else if (!clean.includes(next.default_model)) {
-      next = withSyncedModel(next, channelModel || clean[0], provider, fetched);
+    } else if (!enabled_models.includes(next.default_model)) {
+      next = withSyncedModel(next, channelModel || enabled_models[0], provider, fetched);
     } else {
       next = withSyncedModel(next, next.default_model, provider, fetched);
     }
   }
 
-  // Global clamp across all enabled
   const allFetched: Record<string, string[]> = {};
   for (const [k, p] of Object.entries(next.providers)) {
     if (p.model_list?.length) allFetched[k] = p.model_list;
   }
   allFetched[provider] = clean;
+  const clamped = resolveValidDefaultModel(next, allFetched);
+  if (clamped && clamped !== next.default_model) {
+    next = withSyncedModel(next, clamped, undefined, allFetched);
+  }
+  return next;
+}
+
+/** Apply explicit whitelist for a channel and clamp default if needed. */
+function applyEnabledModelsToConfig(
+  cfg: AppConfig,
+  provider: string,
+  enabledModels: string[],
+): AppConfig {
+  const providers = { ...cfg.providers };
+  const prev = providers[provider];
+  if (!prev) return cfg;
+  const clean = enabledModels.map((s) => s.trim()).filter(Boolean);
+  let channelModel = (prev.model || '').trim();
+  if (clean.length > 0) {
+    if (!clean.includes(channelModel)) channelModel = clean[0];
+  } else {
+    channelModel = '';
+  }
+  providers[provider] = {
+    ...prev,
+    enabled_models: clean,
+    model: channelModel,
+  };
+  let next: AppConfig = { ...cfg, providers };
+  const allFetched: Record<string, string[]> = {};
+  for (const [k, p] of Object.entries(next.providers)) {
+    if (p.model_list?.length) allFetched[k] = p.model_list;
+  }
+  const ownsDefault =
+    next.active_provider === provider ||
+    resolveProviderForModel(next, next.default_model, allFetched) === provider;
+  if (ownsDefault && prev.enabled) {
+    if (clean.length === 0) {
+      next = { ...next, default_model: '' };
+    } else if (!clean.includes(next.default_model)) {
+      next = withSyncedModel(next, channelModel || clean[0], provider, allFetched);
+    }
+  }
   const clamped = resolveValidDefaultModel(next, allFetched);
   if (clamped && clamped !== next.default_model) {
     next = withSyncedModel(next, clamped, undefined, allFetched);
@@ -216,6 +289,8 @@ export interface ConfigStore {
   updateProvider: (provider: string, p: Partial<ProviderConfig>) => Promise<void>;
   /** Select chat model everywhere (settings default + input picker) */
   setDefaultModel: (modelId: string, providerHint?: string) => Promise<void>;
+  /** Set which scanned models appear in the global list for a channel */
+  setEnabledModels: (provider: string, models: string[]) => Promise<void>;
 }
 
 export const useConfigStore = create<ConfigStore>((set, get) => ({
@@ -238,7 +313,11 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
     const cfg = get().config;
     const providers = { ...cfg.providers };
     if (providers[provider]) {
-      providers[provider] = { ...providers[provider], model_list: [] };
+      providers[provider] = {
+        ...providers[provider],
+        model_list: [],
+        enabled_models: null,
+      };
     }
     const next = { ...cfg, providers };
     set((s) => {
@@ -247,6 +326,12 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
       return { config: next, fetchedModels: fetched };
     });
     await get().saveConfig(next);
+  },
+
+  setEnabledModels: async (provider, models) => {
+    const nextCfg = applyEnabledModelsToConfig(get().config, provider, models);
+    set({ config: nextCfg });
+    await get().saveConfig(nextCfg);
   },
 
   refreshEnabledModels: async () => {
@@ -313,6 +398,8 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
         proxy: {
           url: proxyUrl,
           global: !!(r as any).proxy?.global && isProxyConfigured(proxyUrl),
+          web_use_proxy:
+            !!(r as any).proxy?.global || !!(r as any).proxy?.web_use_proxy,
         },
         mcp_use_proxy: !!(r as any).extensions?.mcp_use_proxy,
         skills_use_proxy: !!(r as any).extensions?.skills_use_proxy,
@@ -369,14 +456,25 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
             })
           : cfg;
         synced = normalizeProxyFlags(synced);
-        const packProv = (p?: ProviderConfig) => ({
-          api_key: p?.api_key || '',
-          base_url: p?.base_url || '',
-          enabled: !!p?.enabled,
-          use_proxy: !!p?.use_proxy && isProxyConfigured(synced.proxy.url),
-          model: p?.model || '',
-          model_list: Array.isArray(p?.model_list) ? p!.model_list : [],
-        });
+        const packProv = (p?: ProviderConfig) => {
+          const base: Record<string, unknown> = {
+            api_key: p?.api_key || '',
+            base_url: p?.base_url || '',
+            enabled: !!p?.enabled,
+            use_proxy: !!p?.use_proxy && isProxyConfigured(synced.proxy.url),
+            model: p?.model || '',
+            model_list: Array.isArray(p?.model_list) ? p!.model_list : [],
+          };
+          // Only write enabled_models when curated (array, including empty).
+          // Omit when null so legacy "all model_list" round-trips as missing key…
+          // but Rust Option needs Some for empty; we always send array once user curated.
+          if (p?.enabled_models !== undefined && p?.enabled_models !== null) {
+            base.enabled_models = Array.isArray(p.enabled_models)
+              ? p.enabled_models
+              : [];
+          }
+          return base;
+        };
         // Preserve mcp_servers / skills_dirs / agent / safety extras already on disk
         let existingExt: any = {};
         let existingAgent: any = { global_prompt: '', replace_system_prompt: false };
@@ -435,6 +533,9 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
           proxy: {
             url: synced.proxy.url.trim(),
             global: isProxyConfigured(synced.proxy.url) && !!synced.proxy.global,
+            web_use_proxy:
+              isProxyConfigured(synced.proxy.url) &&
+              (!!synced.proxy.global || !!synced.proxy.web_use_proxy),
           },
           agent: existingAgent,
         } as any);
@@ -521,7 +622,12 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
           fetched[provider]?.length
             ? fetched[provider]
             : nextProv.model_list || [];
-        if (scanned.length === 0 || scanned.includes(p.model)) {
+        const curated = effectiveEnabledModels(nextProv, scanned);
+        const allowed =
+          curated.length === 0
+            ? scanned.length === 0 || scanned.includes(p.model)
+            : curated.includes(p.model);
+        if (allowed) {
           merged = withSyncedModel(merged, p.model, provider, fetched);
         }
       } else if (p.enabled === false) {

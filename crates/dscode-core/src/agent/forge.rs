@@ -44,9 +44,11 @@ Background vs foreground shell:
   NEVER run dev servers with do_bash (it will hang "running" forever). NEVER use `cmd &` inside do_bash for servers.
 
 Web (built-in, no API key):
-- do_web_search — public web search (DuckDuckGo). Use to find docs / error solutions / package pages.
-- do_web_fetch — GET a URL and return readable text (HTML stripped). Use after search, or when you already have a URL.
-  Prefer these over inventing facts. Do not fetch localhost / private IPs.
+- do_web_search — public web search (title / URL / snippet). Use when you need links and have no URL yet.
+- do_web_fetch — GET public page(s) as text. Pass `url` or concurrent `urls` (up to 4).
+  HTML results include **Candidate links** ranked for same-site/docs — for the user task, deep-fetch
+  the best related links (official docs, API ref, next chapter). Prefer better known official URLs
+  over random mirrors when you know them. Optional use_proxy. Never fetch localhost / private IPs.
 
 Skills (Agent Skills / skills.sh ecosystem):
 - Local packages live under ~/.dscode/skills (also reads ~/.claude/skills, ~/.agents/skills, project .claude/skills).
@@ -718,19 +720,29 @@ impl Forge {
                 // and before tool results so the API sees Assistant→Tool ordering.
                 messages.push(assistant_msg);
 
-                for tc in &response.tool_calls {
-                    execute_one_tool(
-                        &self.tools,
-                        tc,
-                        &self.working_dir,
-                        session_id,
-                        &event_tx,
-                        &mut messages,
-                        self.safety_guard.clone(),
-                        self.permission_hub.clone(),
-                        self.permission_timeout_secs,
-                    )
-                    .await;
+                // Same-turn tool calls run concurrently (e.g. multiple do_web_fetch).
+                // Results are appended in the original tool_call order for the LLM.
+                let tool_results = {
+                    let futs: Vec<_> = response
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            execute_one_tool(
+                                &self.tools,
+                                tc,
+                                &self.working_dir,
+                                session_id,
+                                &event_tx,
+                                self.safety_guard.clone(),
+                                self.permission_hub.clone(),
+                                self.permission_timeout_secs,
+                            )
+                        })
+                        .collect();
+                    futures::future::join_all(futs).await
+                };
+                for msg in tool_results {
+                    messages.push(msg);
                 }
 
                 // Loop again so the model can process tool results.
@@ -1277,6 +1289,10 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
         }
     }
 
+    // Legacy/desktop bug: parallel ToolStart wrote one assistant per call.
+    // OpenAI requires a single assistant(tool_calls=[…]) then matching tools.
+    merge_consecutive_tool_call_assistants(&mut messages);
+
     // Sequential tool chain fix: scan left-to-right, track which tool_call_ids
     // have been declared by assistant(tc) messages. Only allow Tool messages
     // whose tool_call_id was declared by a PREVIOUS assistant. Remove tool_calls
@@ -1338,6 +1354,63 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
     result
 }
 
+/// Collapse consecutive assistant messages that each carry tool_calls into one.
+fn merge_consecutive_tool_call_assistants(messages: &mut Vec<Message>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let has_tc = messages[i].role == Role::Assistant
+            && messages[i]
+                .tool_calls
+                .as_ref()
+                .map(|tc| !tc.is_empty())
+                .unwrap_or(false);
+        if !has_tc {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < messages.len()
+            && messages[j].role == Role::Assistant
+            && messages[j]
+                .tool_calls
+                .as_ref()
+                .map(|tc| !tc.is_empty())
+                .unwrap_or(false)
+        {
+            j += 1;
+        }
+        if j > i + 1 {
+            let mut combined = messages[i].tool_calls.take().unwrap_or_default();
+            for k in (i + 1)..j {
+                if let Some(tcs) = messages[k].tool_calls.take() {
+                    for tc in tcs {
+                        if !combined.iter().any(|x| x.id == tc.id) {
+                            combined.push(tc);
+                        }
+                    }
+                }
+                if messages[i].content.is_empty() && !messages[k].content.is_empty() {
+                    messages[i].content = messages[k].content.clone();
+                }
+                if messages[i]
+                    .reasoning_content
+                    .as_ref()
+                    .map_or(true, |r| r.is_empty())
+                {
+                    if let Some(ref rc) = messages[k].reasoning_content {
+                        if !rc.is_empty() {
+                            messages[i].reasoning_content = Some(rc.clone());
+                        }
+                    }
+                }
+            }
+            messages[i].tool_calls = Some(combined);
+            messages.drain((i + 1)..j);
+        }
+        i += 1;
+    }
+}
+
 fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
     let responded: std::collections::HashSet<String> = messages
         .iter().filter(|m| m.role == Role::Tool)
@@ -1380,30 +1453,25 @@ fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
 }
 
 /// Execute a single tool call and emit lifecycle events (`ToolStart`,
-/// `ToolProgress`, `ToolEnd`). The resulting tool output (or error) is
-/// appended to `messages` as a `Role::Tool` message so the LLM can see it
-/// on the next turn.
+/// `ToolProgress`, `ToolEnd`). Returns a `Role::Tool` message for the LLM.
 async fn execute_one_tool(
     tools: &ToolRegistry,
     tc: &ToolCall,
     working_dir: &PathBuf,
     session_id: &str,
     event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
-    messages: &mut Vec<Message>,
     safety_guard: Arc<SafetyGuard>,
     permission_hub: Option<Arc<PermissionHub>>,
     permission_timeout_secs: u64,
-) {
+) -> Message {
     let tool_name = &tc.function.name;
     let tool_call_id = &tc.id;
 
-    // --- Look up the tool for its description ---
     let description = tools
         .get(tool_name)
         .map(|t| t.description().to_string())
         .unwrap_or_default();
 
-    // --- Emit ToolStart ---
     let _ = event_tx.send(StreamEvent::ToolStart {
         id: tool_call_id.clone(),
         name: tool_name.clone(),
@@ -1411,7 +1479,6 @@ async fn execute_one_tool(
         arguments: tc.function.arguments.clone(),
     });
 
-    // --- Parse arguments ---
     let args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
         Ok(v) => v,
         Err(e) => {
@@ -1425,18 +1492,18 @@ async fn execute_one_tool(
                 status: ToolStatus::Error,
                 result: err_msg.clone(),
             });
-            messages.push(Message {
+            return Message {
                 role: Role::Tool,
                 content: MessageContent::Text(err_msg),
                 name: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
-                reasoning_content: None, created_at: 0 });
-            return;
+                reasoning_content: None,
+                created_at: 0,
+            };
         }
     };
 
-    // --- Build tool context (real safety policy — never empty+allow_outside) ---
     let ctx = ToolContext {
         working_dir: working_dir.clone(),
         session_id: session_id.to_string(),
@@ -1453,7 +1520,6 @@ async fn execute_one_tool(
         read_before_edit: false,
     };
 
-    // --- Execute the tool ---
     match tools.execute(tool_name, args, &ctx).await {
         Ok(result) => {
             let status = if result.success {
@@ -1486,13 +1552,15 @@ async fn execute_one_tool(
                 result: output.clone(),
             });
 
-            messages.push(Message {
+            Message {
                 role: Role::Tool,
                 content: MessageContent::Text(output),
                 name: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
-                reasoning_content: None, created_at: 0 });
+                reasoning_content: None,
+                created_at: 0,
+            }
         }
         Err(e) => {
             let err_str = e.to_string();
@@ -1509,13 +1577,15 @@ async fn execute_one_tool(
                 result: err_str.clone(),
             });
 
-            messages.push(Message {
+            Message {
                 role: Role::Tool,
                 content: MessageContent::Text(err_str),
                 name: None,
                 tool_calls: None,
                 tool_call_id: Some(tool_call_id.clone()),
-                reasoning_content: None, created_at: 0 });
+                reasoning_content: None,
+                created_at: 0,
+            }
         }
     }
 }
@@ -1529,4 +1599,152 @@ fn truncate_tool_result(s: &str, max_chars: usize) -> String {
     format!(
         "{head}\n\n…[tool output truncated at {max_chars} chars; re-read file/path if more is needed]…"
     )
+}
+
+#[cfg(test)]
+mod tool_chain_tests {
+    use super::*;
+    use crate::providers::trait_def::{FunctionCall, MessageContent, ToolCall};
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    fn assistant_tc(ids: &[&str]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            name: None,
+            tool_calls: Some(ids.iter().map(|id| tool_call(id, "do_web_fetch")).collect()),
+            tool_call_id: None,
+            reasoning_content: None,
+            created_at: 0,
+        }
+    }
+
+    fn tool_result(id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: MessageContent::Text(format!("result-{id}")),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            reasoning_content: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn merge_parallel_tool_call_assistants() {
+        let mut msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("find proxies".into()),
+                ..Default::default()
+            },
+            // Legacy split: one assistant per parallel ToolStart
+            assistant_tc(&["a"]),
+            assistant_tc(&["b"]),
+            assistant_tc(&["c"]),
+            tool_result("a"),
+            tool_result("b"),
+            tool_result("c"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("here are proxies".into()),
+                ..Default::default()
+            },
+        ];
+        merge_consecutive_tool_call_assistants(&mut msgs);
+        assert_eq!(msgs.len(), 6); // user + 1 assistant(tc) + 3 tools + final
+        assert_eq!(msgs[1].role, Role::Assistant);
+        let ids: Vec<_> = msgs[1]
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("b"));
+        assert_eq!(msgs[4].tool_call_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn validate_accepts_merged_parallel_chain() {
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("sys".into()),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("q".into()),
+                ..Default::default()
+            },
+            assistant_tc(&["a"]),
+            assistant_tc(&["b"]),
+            tool_result("a"),
+            tool_result("b"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("done".into()),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("second msg".into()),
+                ..Default::default()
+            },
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        // One combined assistant with both tool_calls
+        let tc_assistants: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert_eq!(tc_assistants.len(), 1);
+        assert_eq!(tc_assistants[0].tool_calls.as_ref().unwrap().len(), 2);
+        // Both tool results retained immediately after
+        let tools: Vec<_> = out.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tools.len(), 2);
+        // No assistant(tool_calls) without following tools — count positions
+        let mut i = 0;
+        while i < out.len() {
+            if out[i].role == Role::Assistant {
+                if let Some(ref tcs) = out[i].tool_calls {
+                    for (k, tc) in tcs.iter().enumerate() {
+                        let tool_msg = &out[i + 1 + k];
+                        assert_eq!(tool_msg.role, Role::Tool, "tool must follow assistant");
+                        assert_eq!(tool_msg.tool_call_id.as_deref(), Some(tc.id.as_str()));
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn does_not_merge_across_tool_results() {
+        // Sequential tool turns (iteration 1 then 2) must stay separate.
+        let mut msgs = vec![
+            assistant_tc(&["a"]),
+            tool_result("a"),
+            assistant_tc(&["b"]),
+            tool_result("b"),
+        ];
+        merge_consecutive_tool_call_assistants(&mut msgs);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(msgs[2].tool_calls.as_ref().unwrap().len(), 1);
+    }
 }

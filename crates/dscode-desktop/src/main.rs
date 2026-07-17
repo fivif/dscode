@@ -69,6 +69,7 @@ fn main() {
             dscode_desktop::commands::session::get_last_session,
             dscode_desktop::commands::session::update_session_workspace,
             dscode_desktop::commands::session::update_session_title,
+            dscode_desktop::commands::session::update_session_model,
             dscode_desktop::commands::session::delete_session,
             dscode_desktop::commands::config::get_config,
             dscode_desktop::commands::config::update_config,

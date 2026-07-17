@@ -41,7 +41,75 @@ pub async fn send_message(
     // DB5: Per-session mutex — prevent concurrent sends to the same session.
     let _session_guard = state.acquire_session_lock(&session_id).await;
 
-    // 1. Read config and create the correct provider (OpenAI-compat / Anthropic).
+    // Load session first so provider uses session-bound model (not global only).
+    state.ensure_session_manager().await?;
+
+    let (history, working_dir, full_message, session_model) = {
+        let sm_guard = state.session_manager.lock().await;
+        let sm = sm_guard
+            .as_ref()
+            .ok_or_else(|| "Session manager not initialized".to_string())?;
+
+        let session = sm
+            .get_session(&session_id)?
+            .ok_or_else(|| format!("Session '{}' not found", session_id))?;
+        let history = session.messages;
+        let session_model = session.model.trim().to_string();
+
+        let wd = if session.workspace.is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        } else {
+            PathBuf::from(&session.workspace)
+        };
+
+        let paths = attachments.unwrap_or_default();
+        let full_message = crate::attachments::build_message_with_attachments(
+            &message,
+            &paths,
+            &wd,
+            &session_id,
+        )?;
+
+        // Persist the user message (with attachment context for history continuity).
+        sm.add_message(
+            &session_id,
+            &Message {
+                role: Role::User,
+                content: MessageContent::Text(full_message.clone()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                created_at: 0,
+            },
+        )?;
+
+        // Auto-name from user-visible text when possible
+        let title_src = if message.trim().is_empty() && !paths.is_empty() {
+            format!(
+                "附件: {}",
+                paths
+                    .iter()
+                    .filter_map(|p| PathBuf::from(p).file_name()?.to_str().map(|s| s.to_string()))
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            message.clone()
+        };
+        if let Ok(Some(new_title)) = sm.maybe_auto_title(&session_id, &title_src) {
+            info!(%session_id, %new_title, "session: auto-titled");
+            let _ = app_handle.emit(
+                "session-title-updated",
+                serde_json::json!({ "session_id": session_id, "title": new_title }),
+            );
+        }
+
+        (history, wd, full_message, session_model)
+    };
+
+    // Provider: session.model if set, else global default_model.
     let (
         provider,
         context_cfg,
@@ -54,7 +122,12 @@ pub async fn send_message(
         read_before_edit,
     ) = {
         let config = state.config.lock().await;
-        let model = config.default_model.clone();
+        let model = if !session_model.is_empty() {
+            session_model.clone()
+        } else {
+            config.default_model.clone()
+        };
+        info!(%session_id, %model, "chat: using model");
         let provider = create_provider(&model, &config)
             .map_err(|e| format!("Failed to create provider for '{model}': {e}"))?;
         let mut system_prompt = config
@@ -91,73 +164,6 @@ pub async fn send_message(
         )
     };
     let _ = read_before_edit; // reserved: wire into ToolContext when main-agent RBE enabled
-
-    // DB4: Hold session_manager lock once for all session DB operations.
-    state.ensure_session_manager().await?;
-
-    let (history, working_dir, full_message) = {
-        let sm_guard = state.session_manager.lock().await;
-        let sm = sm_guard
-            .as_ref()
-            .ok_or_else(|| "Session manager not initialized".to_string())?;
-
-        let session = sm
-            .get_session(&session_id)?
-            .ok_or_else(|| format!("Session '{}' not found", session_id))?;
-        let history = session.messages;
-
-        let wd = if session.workspace.is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-        } else {
-            PathBuf::from(&session.workspace)
-        };
-
-        let paths = attachments.unwrap_or_default();
-        let full_message = crate::attachments::build_message_with_attachments(
-            &message,
-            &paths,
-            &wd,
-            &session_id,
-        )?;
-
-        // 3. Persist the user message (with attachment context for history continuity).
-        sm.add_message(
-            &session_id,
-            &Message {
-                role: Role::User,
-                content: MessageContent::Text(full_message.clone()),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                created_at: 0,
-            },
-        )?;
-
-        // Auto-name from user-visible text when possible
-        let title_src = if message.trim().is_empty() && !paths.is_empty() {
-            format!(
-                "附件: {}",
-                paths
-                    .iter()
-                    .filter_map(|p| PathBuf::from(p).file_name()?.to_str().map(|s| s.to_string()))
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            message.clone()
-        };
-        if let Ok(Some(new_title)) = sm.maybe_auto_title(&session_id, &title_src) {
-            info!(%session_id, %new_title, "session: auto-titled");
-            let _ = app_handle.emit(
-                "session-title-updated",
-                serde_json::json!({ "session_id": session_id, "title": new_title }),
-            );
-        }
-
-        (history, wd, full_message)
-    };
 
     // 4. Build the Forge using the session's workspace + global system prompt.
     let forge = Forge::new(
@@ -199,6 +205,10 @@ pub async fn send_message(
         let mut assistant_content = String::new();
         // DB6: Accumulate thinking content across events, persist as one message.
         let mut thinking_buffer = String::new();
+        // Parallel tools emit one ToolStart each; OpenAI requires a SINGLE assistant
+        // message with all tool_calls, then tool results. Buffer starts and flush
+        // combined on the first ToolEnd of the batch.
+        let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
 
         loop {
             tokio::select! {
@@ -227,6 +237,9 @@ pub async fn send_message(
                                 reasoning_content: None, created_at: now,
                             }).ok();
                         }
+                        // Incomplete tool batch: drop pending tool_calls so next turn
+                        // does not send orphaned assistant(tool_calls) without results.
+                        pending_tool_calls.clear();
                     }
                     info!(session = %persist_sid, "forge cancelled, partial content persisted");
                     break;
@@ -260,40 +273,39 @@ pub async fn send_message(
                                     let sm_guard = app_state.session_manager.lock().await;
                                     if let Some(ref sm) = *sm_guard {
                                         let now = chrono::Utc::now().timestamp();
-                                        if !thinking_buffer.is_empty() {
-                                            sm.add_message(&persist_sid, &Message {
-                                                role: Role::Assistant,
-                                                content: MessageContent::Text(String::new()),
-                                                name: None, tool_calls: None, tool_call_id: None,
-                                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
-                                                created_at: now,
-                                            }).ok();
+                                        // Flush pre-tool text/thinking only once per batch
+                                        // (before the first pending tool_call accumulates).
+                                        if pending_tool_calls.is_empty() {
+                                            if !thinking_buffer.is_empty() {
+                                                sm.add_message(&persist_sid, &Message {
+                                                    role: Role::Assistant,
+                                                    content: MessageContent::Text(String::new()),
+                                                    name: None, tool_calls: None, tool_call_id: None,
+                                                    reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
+                                                    created_at: now,
+                                                }).ok();
+                                            }
+                                            if !assistant_content.is_empty() {
+                                                sm.add_message(&persist_sid, &Message {
+                                                    role: Role::Assistant,
+                                                    content: MessageContent::Text(std::mem::take(&mut assistant_content)),
+                                                    name: None, tool_calls: None, tool_call_id: None,
+                                                    reasoning_content: None, created_at: now,
+                                                }).ok();
+                                            }
                                         }
-                                        if !assistant_content.is_empty() {
-                                            sm.add_message(&persist_sid, &Message {
-                                                role: Role::Assistant,
-                                                content: MessageContent::Text(std::mem::take(&mut assistant_content)),
-                                                name: None, tool_calls: None, tool_call_id: None,
-                                                reasoning_content: None, created_at: now,
-                                            }).ok();
-                                        }
-                                        let tool_msg = Message {
-                                            role: Role::Assistant,
-                                            content: MessageContent::Text(String::new()),
-                                            name: None,
-                                            tool_call_id: None,
-                                            tool_calls: Some(vec![ToolCall {
+                                        // Buffer — do NOT write assistant(tool_calls) yet.
+                                        // First ToolEnd will flush the full batch as one message.
+                                        if !pending_tool_calls.iter().any(|t| t.id == *id) {
+                                            pending_tool_calls.push(ToolCall {
                                                 id: id.clone(),
                                                 call_type: "function".into(),
                                                 function: FunctionCall {
                                                     name: name.clone(),
                                                     arguments: arguments.clone(),
                                                 },
-                                            }]),
-                                            reasoning_content: None,
-                                            created_at: now,
-                                        };
-                                        sm.add_message(&persist_sid, &tool_msg).ok();
+                                            });
+                                        }
                                     }
                                 }
                                 StreamEvent::ToolEnd { id, result, .. } => {
@@ -301,12 +313,17 @@ pub async fn send_message(
                                     let sm_guard = app_state.session_manager.lock().await;
                                     if let Some(ref sm) = *sm_guard {
                                         let now = chrono::Utc::now().timestamp();
-                                        if !thinking_buffer.is_empty() {
+                                        // First result of a parallel batch: persist ONE assistant
+                                        // with all buffered tool_calls, then this tool result.
+                                        // Never insert assistant between tool_calls and tools.
+                                        if !pending_tool_calls.is_empty() {
                                             sm.add_message(&persist_sid, &Message {
                                                 role: Role::Assistant,
                                                 content: MessageContent::Text(String::new()),
-                                                name: None, tool_calls: None, tool_call_id: None,
-                                                reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
+                                                name: None,
+                                                tool_call_id: None,
+                                                tool_calls: Some(std::mem::take(&mut pending_tool_calls)),
+                                                reasoning_content: None,
                                                 created_at: now,
                                             }).ok();
                                         }

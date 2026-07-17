@@ -82,6 +82,7 @@ pub fn tool_names_for_role(role: AgentRole, explore_bash: bool) -> RoleToolPolic
             "do_skill_list".to_string(),
             "do_task_status".to_string(),
             "do_web_fetch".to_string(),
+            "do_web_search".to_string(),
         ]),
     }
 }

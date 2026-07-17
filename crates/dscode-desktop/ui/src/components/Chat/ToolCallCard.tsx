@@ -23,16 +23,42 @@ function StatusIcon({ status }: { status: ToolCallRecord['status'] }) {
   return <IconX className={cls} size={12} />;
 }
 
+function lastProgressLine(text: string): string {
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return '';
+  // Prefer last checkmark / progress line for multi-lane search UX
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (
+      l.startsWith('✓') ||
+      l.startsWith('✗') ||
+      l.startsWith('●') ||
+      l.startsWith('⟳') ||
+      l.startsWith('▸') ||
+      l.includes('…')
+    ) {
+      return l.length > 72 ? l.slice(0, 72) + '…' : l;
+    }
+  }
+  const last = lines[lines.length - 1];
+  return last.length > 72 ? last.slice(0, 72) + '…' : last;
+}
+
 function ToolCallCardInner({ tool }: Props) {
   // Default collapsed while running — expanding huge streaming logs freezes the UI.
+  const isSearch = tool.name === 'do_web_search';
   const [expanded, setExpanded] = useState(false);
   const userToggledRef = useRef(false);
 
   useEffect(() => {
-    if (tool.status !== 'running' && !userToggledRef.current) {
-      // Keep collapsed after finish unless user opened it
+    if (userToggledRef.current) return;
+    if (isSearch && tool.status === 'running') {
+      setExpanded(true);
     }
-  }, [tool.status]);
+  }, [isSearch, tool.status, tool.result]);
 
   const handleToggle = () => {
     userToggledRef.current = true;
@@ -51,6 +77,11 @@ function ToolCallCardInner({ tool }: Props) {
     return tool.result;
   }, [tool.result, tool.status]);
 
+  const liveHint = useMemo(() => {
+    if (tool.status !== 'running' || !tool.result) return '';
+    return lastProgressLine(tool.result);
+  }, [tool.status, tool.result]);
+
   return (
     <div className={`mb-1.5 ml-1 border ${COLORS[tool.status]} bg-card/60 rounded-md overflow-hidden transition-colors`}>
       <button
@@ -58,9 +89,15 @@ function ToolCallCardInner({ tool }: Props) {
         onClick={handleToggle}
       >
         <StatusIcon status={tool.status} />
-        <span className="text-[11px] text-gray-300 font-mono truncate flex-1">{tool.name}</span>
-        {tool.status === 'running' && (
-          <span className="text-[10px] text-amber-400/70 animate-pulse">running</span>
+        <span className="text-[11px] text-gray-300 font-mono truncate shrink-0 max-w-[9rem]">{tool.name}</span>
+        {tool.status === 'running' && liveHint ? (
+          <span className="text-[10px] text-amber-400/80 truncate flex-1 font-mono animate-pulse">
+            {liveHint}
+          </span>
+        ) : tool.status === 'running' ? (
+          <span className="text-[10px] text-amber-400/70 animate-pulse flex-1">running</span>
+        ) : (
+          <span className="flex-1" />
         )}
         <svg className={`w-3 h-3 text-gray-600 transition-transform shrink-0 ${expanded ? 'rotate-90' : ''}`}
           viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -69,11 +106,15 @@ function ToolCallCardInner({ tool }: Props) {
       </button>
       {expanded && (
         <div className="px-2.5 pb-2 pt-0.5 border-t border-border/30">
-          {displayResult && (
+          {displayResult ? (
             <pre className="text-[11px] text-gray-400 bg-black/20 rounded p-2 max-h-44 overflow-y-auto whitespace-pre-wrap font-mono leading-relaxed">
               {displayResult}
             </pre>
-          )}
+          ) : tool.status === 'running' ? (
+            <div className="text-[10px] text-gray-600 px-1 py-1.5 animate-pulse">
+              准备并发检索…
+            </div>
+          ) : null}
         </div>
       )}
     </div>

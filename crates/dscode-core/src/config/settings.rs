@@ -164,6 +164,28 @@ impl Config {
         }
     }
 
+    /// Soft default for web tools when the agent omits `use_proxy`.
+    /// Agent can still force direct or proxy per call if a proxy URL exists.
+    pub fn proxy_for_web(&self) -> Option<&str> {
+        if !self.proxy.is_configured() {
+            return None;
+        }
+        if self.proxy.global || self.proxy.web_use_proxy {
+            Some(self.proxy.url.trim())
+        } else {
+            None
+        }
+    }
+
+    /// Raw configured proxy URL for web tools (if any), ignoring toggles.
+    pub fn web_proxy_url_if_configured(&self) -> Option<&str> {
+        if self.proxy.is_configured() {
+            Some(self.proxy.url.trim())
+        } else {
+            None
+        }
+    }
+
     /// Save config to ~/.dscode/config.toml
     pub fn save(&self) -> Result<(), ConfigError> {
         let config_path = Self::config_path()?;
@@ -329,12 +351,110 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub use_proxy: bool,
     /// Last successful `/models` scan for this channel (persisted). Empty = not scanned.
-    /// UI pickers use this list only — never invent hardcoded catalog entries.
+    /// Full catalog for the settings multi-select UI.
     #[serde(default)]
     pub model_list: Vec<String>,
+    /// Models that appear in the global picker (default model + input box).
+    /// - `None` / missing in TOML: not curated yet → treat as "all of model_list" (legacy).
+    /// - `Some([])`: user cleared selection → contribute nothing to global list.
+    /// - `Some([...])`: explicit whitelist.
+    #[serde(default)]
+    pub enabled_models: Option<Vec<String>>,
     /// Last selected model id for this channel (optional UI hint / fallback).
     #[serde(default)]
     pub model: String,
+}
+
+impl ProviderConfig {
+    /// Models that should appear in global pickers for this channel.
+    pub fn effective_enabled_models(&self) -> Vec<String> {
+        match &self.enabled_models {
+            Some(v) => v
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => self
+                .model_list
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_web_tests {
+    use super::{Config, ProxyConfig};
+
+    #[test]
+    fn web_proxy_off_by_default() {
+        let mut c = Config::default();
+        c.proxy = ProxyConfig {
+            url: "http://127.0.0.1:7890".into(),
+            global: false,
+            web_use_proxy: false,
+        };
+        assert!(c.proxy_for_web().is_none());
+    }
+
+    #[test]
+    fn web_proxy_toggle() {
+        let mut c = Config::default();
+        c.proxy = ProxyConfig {
+            url: "http://127.0.0.1:7890".into(),
+            global: false,
+            web_use_proxy: true,
+        };
+        assert_eq!(c.proxy_for_web(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn web_proxy_global_forces() {
+        let mut c = Config::default();
+        c.proxy = ProxyConfig {
+            url: "socks5://127.0.0.1:1080".into(),
+            global: true,
+            web_use_proxy: false,
+        };
+        assert_eq!(c.proxy_for_web(), Some("socks5://127.0.0.1:1080"));
+    }
+}
+
+#[cfg(test)]
+mod provider_enabled_models_tests {
+    use super::ProviderConfig;
+
+    #[test]
+    fn none_falls_back_to_model_list() {
+        let p = ProviderConfig {
+            model_list: vec!["a".into(), "b".into()],
+            enabled_models: None,
+            ..Default::default()
+        };
+        assert_eq!(p.effective_enabled_models(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn some_empty_means_nothing() {
+        let p = ProviderConfig {
+            model_list: vec!["a".into(), "b".into()],
+            enabled_models: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(p.effective_enabled_models().is_empty());
+    }
+
+    #[test]
+    fn some_whitelist() {
+        let p = ProviderConfig {
+            model_list: vec!["a".into(), "b".into(), "c".into()],
+            enabled_models: Some(vec!["b".into()]),
+            ..Default::default()
+        };
+        assert_eq!(p.effective_enabled_models(), vec!["b"]);
+    }
 }
 
 fn default_true() -> bool { true }
@@ -346,10 +466,14 @@ pub struct ProxyConfig {
     /// Empty = not configured (channel/mcp/skill proxy toggles cannot enable).
     #[serde(default)]
     pub url: String,
-    /// When true and URL is valid, force proxy for the whole app (LLM / MCP / skills).
+    /// When true and URL is valid, force proxy for the whole app (LLM / MCP / skills / web).
     /// Individual toggles are treated as on and must not be turned off in UI.
     #[serde(default)]
     pub global: bool,
+    /// Built-in web tools (`do_web_search` / `do_web_fetch`) use the proxy.
+    /// Forced on when `global` is true. Default false — enable when network needs it.
+    #[serde(default)]
+    pub web_use_proxy: bool,
 }
 
 impl Default for ProxyConfig {
@@ -357,6 +481,7 @@ impl Default for ProxyConfig {
         Self {
             url: String::new(),
             global: false,
+            web_use_proxy: false,
         }
     }
 }
@@ -673,4 +798,88 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("TOML serialize error: {0}")]
     TomlSer(#[from] toml::ser::Error),
+}
+
+#[cfg(test)]
+mod enabled_models_serde_tests {
+    use super::{Config, ProviderConfig};
+
+    #[test]
+    fn toml_missing_enabled_models_is_none() {
+        let raw = r#"
+default_model = "m1"
+active_provider = "deepseek"
+
+[providers.deepseek]
+api_key = "k"
+base_url = "https://api.deepseek.com/v1"
+enabled = true
+model_list = ["m1", "m2"]
+model = "m1"
+"#;
+        let c: Config = toml::from_str(raw).expect("parse");
+        assert!(c.providers.deepseek.enabled_models.is_none());
+        assert_eq!(
+            c.providers.deepseek.effective_enabled_models(),
+            vec!["m1", "m2"]
+        );
+    }
+
+    #[test]
+    fn toml_empty_enabled_models_is_some_empty() {
+        let raw = r#"
+default_model = ""
+active_provider = "openai"
+
+[providers.openai]
+api_key = "k"
+base_url = "https://api.openai.com/v1"
+enabled = true
+model_list = ["gpt-a", "gpt-b"]
+enabled_models = []
+"#;
+        let c: Config = toml::from_str(raw).expect("parse");
+        assert_eq!(c.providers.openai.enabled_models, Some(vec![]));
+        assert!(c.providers.openai.effective_enabled_models().is_empty());
+    }
+
+    #[test]
+    fn toml_whitelist_roundtrip() {
+        let mut c = Config::default();
+        c.providers.deepseek.model_list = vec!["a".into(), "b".into(), "c".into()];
+        c.providers.deepseek.enabled_models = Some(vec!["a".into(), "c".into()]);
+        let s = toml::to_string_pretty(&c).expect("ser");
+        assert!(s.contains("enabled_models"));
+        let back: Config = toml::from_str(&s).expect("de");
+        assert_eq!(
+            back.providers.deepseek.enabled_models,
+            Some(vec!["a".into(), "c".into()])
+        );
+        assert_eq!(
+            back.providers.deepseek.effective_enabled_models(),
+            vec!["a", "c"]
+        );
+    }
+
+    #[test]
+    fn json_null_and_array_for_desktop_payload() {
+        // Desktop may send enabled_models as array; Option deserializes
+        let p: ProviderConfig = serde_json::from_str(
+            r#"{"api_key":"","base_url":"","enabled":true,"use_proxy":false,"model_list":["x"],"enabled_models":["x"],"model":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.enabled_models, Some(vec!["x".into()]));
+
+        let p2: ProviderConfig = serde_json::from_str(
+            r#"{"api_key":"","base_url":"","enabled":true,"use_proxy":false,"model_list":["x"],"enabled_models":[],"model":""}"#,
+        )
+        .unwrap();
+        assert_eq!(p2.enabled_models, Some(vec![]));
+
+        let p3: ProviderConfig = serde_json::from_str(
+            r#"{"api_key":"","base_url":"","enabled":true,"use_proxy":false,"model_list":["x"],"model":"x"}"#,
+        )
+        .unwrap();
+        assert!(p3.enabled_models.is_none());
+    }
 }

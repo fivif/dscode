@@ -5,6 +5,8 @@ import type { AppConfig } from '@/lib/types';
 import { isProxyConfigured } from '@/lib/types';
 import {
   availableModels,
+  catalogModelOptionsForProvider,
+  effectiveEnabledModels,
   inferProvider,
   modelOptionsForProvider,
 } from '@/lib/models';
@@ -33,6 +35,7 @@ export default function SettingsPage({ onBack }: Props) {
     updateConfig,
     updateProvider,
     setDefaultModel,
+    setEnabledModels,
     error,
     fetchedModels,
     applyFetchedModels,
@@ -43,6 +46,7 @@ export default function SettingsPage({ onBack }: Props) {
   );
   const [fetchingProvider, setFetchingProvider] = useState<string | null>(null);
   const [fetchMsg, setFetchMsg] = useState<string | null>(null);
+  const [modelFilter, setModelFilter] = useState('');
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
   const [localTemp, setLocalTemp] = useState(config.temperature);
 
@@ -66,7 +70,9 @@ export default function SettingsPage({ onBack }: Props) {
     try {
       const models = await tauri.fetchModels(provider);
       await applyFetchedModels(provider, models);
-      setFetchMsg(`已加载 ${models.length} 个真实模型，并同步默认/输入框`);
+      setFetchMsg(
+        `已扫描 ${models.length} 个模型；请勾选要上架到总列表的项（首次默认全选）`,
+      );
     } catch (e: any) {
       setFetchMsg(String(e));
     }
@@ -78,11 +84,20 @@ export default function SettingsPage({ onBack }: Props) {
     [config, fetchedModels],
   );
 
-  const getModelOptions = (provider: string) =>
+  /** Curated options for channel preferred-model dropdown */
+  const getCuratedOptions = (provider: string) =>
     modelOptionsForProvider(
       provider,
       fetchedModels[provider] || [],
       config.providers[provider]?.model,
+      config.providers[provider]?.model_list,
+      config.providers[provider]?.enabled_models,
+    );
+
+  const getCatalogOptions = (provider: string) =>
+    catalogModelOptionsForProvider(
+      provider,
+      fetchedModels[provider] || [],
       config.providers[provider]?.model_list,
     );
 
@@ -137,13 +152,13 @@ export default function SettingsPage({ onBack }: Props) {
                   )}
                 </select>
                 <p className="mt-1.5 text-[10px] text-gray-600">
-                  仅已启用渠道 · 与输入框同一数据源 · 只显示「获取列表」扫到的真实模型
+                  仅已启用渠道 · 已勾选上架的模型 · 与输入框同一数据源
                   {config.active_provider
                     ? ` · 当前渠道：${PROVIDER_LABELS[config.active_provider] || config.active_provider}`
                     : ''}
-                  {fetchedModels[config.active_provider]?.length
-                    ? ` · 已扫描 ${fetchedModels[config.active_provider].length} 个`
-                    : ' · 请在渠道页点击「获取列表」'}
+                  {defaultModelOptions.length
+                    ? ` · 共 ${defaultModelOptions.length} 个可选`
+                    : ' · 请在渠道页获取列表并勾选上架'}
                 </p>
               </Row>
 
@@ -292,7 +307,41 @@ export default function SettingsPage({ onBack }: Props) {
                     }
                   />
                   <span className="text-xs text-gray-400">
-                    强制全软件走代理（模型 / MCP / Skill 下载全部启用，各处不可单独关闭）
+                    强制全软件走代理（模型 / 联网 / MCP / Skill 全部启用，各处不可单独关闭）
+                  </span>
+                </label>
+              </Row>
+
+              <Row label="联网工具">
+                <label
+                  className={`flex items-center gap-2 ${
+                    isProxyConfigured(config.proxy?.url) && !config.proxy?.global
+                      ? 'cursor-pointer'
+                      : 'opacity-40 cursor-not-allowed'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 rounded accent-gray-500"
+                    checked={
+                      isProxyConfigured(config.proxy?.url) &&
+                      (!!config.proxy?.global || !!config.proxy?.web_use_proxy)
+                    }
+                    disabled={
+                      !isProxyConfigured(config.proxy?.url) || !!config.proxy?.global
+                    }
+                    onChange={(e) =>
+                      updateConfig({
+                        proxy: {
+                          ...config.proxy,
+                          web_use_proxy: e.target.checked,
+                        },
+                      })
+                    }
+                  />
+                  <span className="text-xs text-gray-400">
+                    联网默认走代理（Agent 仍可在每次调用时用 use_proxy 自行覆盖）
+                    {config.proxy?.global ? ' · 全局默认开' : ''}
                   </span>
                 </label>
               </Row>
@@ -364,7 +413,11 @@ export default function SettingsPage({ onBack }: Props) {
                       ? 'border-gray-400 text-gray-200'
                       : 'border-transparent text-gray-500 hover:text-gray-400'
                   }`}
-                  onClick={() => setActiveTab(k)}
+                  onClick={() => {
+                    setActiveTab(k);
+                    setModelFilter('');
+                    setFetchMsg(null);
+                  }}
                 >
                   {PROVIDER_LABELS[k]}
                 </button>
@@ -434,27 +487,58 @@ export default function SettingsPage({ onBack }: Props) {
                       placeholder="https://api.example.com/v1" />
                   </Row>
 
-                  <Row label="模型" action={
+                  <Row label="上架模型" action={
                     <button className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
                       onClick={() => handleFetchModels(k)} disabled={fetchingProvider === k}>
-                      {fetchingProvider === k ? '获取中...' : (fetchedModels[k]?.length ? `已加载 ${fetchedModels[k].length} 个` : '获取列表')}
+                      {fetchingProvider === k
+                        ? '获取中...'
+                        : (fetchedModels[k]?.length || prov.model_list?.length)
+                          ? `重新扫描`
+                          : '获取列表'}
                     </button>
                   }>
                     {(() => {
-                      const opts = getModelOptions(k);
+                      const catalog = getCatalogOptions(k);
+                      const curated = getCuratedOptions(k);
+                      const enabledSet = new Set(
+                        effectiveEnabledModels(
+                          prov,
+                          fetchedModels[k] || prov.model_list || [],
+                        ),
+                      );
                       const preferred =
                         config.active_provider === k
                           ? config.default_model
                           : prov.model;
-                      const selectValue = opts.some((m) => m.id === preferred)
+                      const selectValue = curated.some((m) => m.id === preferred)
                         ? preferred
-                        : opts[0]?.id || '';
-                      const fetched = fetchedModels[k] || [];
+                        : curated[0]?.id || '';
+                      const filter = modelFilter.trim().toLowerCase();
+                      const filtered = filter
+                        ? catalog.filter((m) => m.id.toLowerCase().includes(filter))
+                        : catalog;
+                      const listedN = catalog.length;
+                      const enabledN = enabledSet.size;
+
+                      const toggleOne = (id: string, on: boolean) => {
+                        const next = new Set(enabledSet);
+                        if (on) next.add(id);
+                        else next.delete(id);
+                        void setEnabledModels(k, Array.from(next));
+                      };
+                      const selectAll = () =>
+                        void setEnabledModels(
+                          k,
+                          catalog.map((m) => m.id),
+                        );
+                      const clearAll = () => void setEnabledModels(k, []);
+
                       return (
                         <>
+                          {/* Preferred model among curated only */}
                           <select
                             className="w-full bg-card border border-border rounded-lg px-3 py-2.5 text-sm text-gray-200 focus:outline-none focus:border-gray-500 disabled:opacity-40"
-                            disabled={!prov.enabled || opts.length === 0}
+                            disabled={!prov.enabled || curated.length === 0}
                             value={selectValue}
                             onChange={(e) => {
                               const id = e.target.value;
@@ -462,57 +546,107 @@ export default function SettingsPage({ onBack }: Props) {
                               if (prov.enabled) setDefaultModel(id, k);
                             }}
                           >
-                            {opts.length === 0 ? (
-                              <option value="">暂无模型 — 点「获取列表」</option>
+                            {curated.length === 0 ? (
+                              <option value="">暂无上架模型 — 扫描并勾选</option>
                             ) : (
-                              opts.map((m) => (
+                              curated.map((m) => (
                                 <option key={m.id} value={m.id}>
                                   {m.label}
                                 </option>
                               ))
                             )}
                           </select>
+                          <p className="mt-1 text-[10px] text-gray-600">
+                            上表为渠道偏好/设为默认；下方勾选决定哪些进入总列表与输入框
+                          </p>
 
-                          {/* Scrollable list so long API results are actually readable */}
-                          {fetched.length > 0 && (
-                            <div className="mt-2 rounded-lg border border-border bg-card/60 max-h-48 overflow-y-auto">
-                              <div className="sticky top-0 px-2.5 py-1.5 text-[10px] text-gray-500 border-b border-border/60 bg-card/95 backdrop-blur-sm flex items-center justify-between">
-                                <span>已扫描 {fetched.length} 个真实模型（点击选用）</span>
-                                <button
-                                  type="button"
-                                  className="text-gray-600 hover:text-gray-300"
-                                  onClick={() => clearFetchedModels(k)}
-                                >
-                                  清除缓存
-                                </button>
+                          {listedN > 0 && (
+                            <div className="mt-2 rounded-lg border border-border bg-card/60 overflow-hidden">
+                              <div className="px-2.5 py-1.5 text-[10px] text-gray-500 border-b border-border/60 bg-card/95 space-y-1.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span>
+                                    已扫 {listedN} · 已上架 {enabledN}
+                                  </span>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    <button
+                                      type="button"
+                                      className="text-gray-400 hover:text-gray-200"
+                                      onClick={selectAll}
+                                      disabled={!prov.enabled}
+                                    >
+                                      全选
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="text-gray-400 hover:text-gray-200"
+                                      onClick={clearAll}
+                                      disabled={!prov.enabled}
+                                    >
+                                      清空
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="text-gray-600 hover:text-gray-300"
+                                      onClick={() => clearFetchedModels(k)}
+                                    >
+                                      清除扫描
+                                    </button>
+                                  </div>
+                                </div>
+                                {listedN > 8 && (
+                                  <input
+                                    type="search"
+                                    className="w-full bg-main border border-border/60 rounded px-2 py-1 text-[11px] text-gray-300 placeholder:text-gray-600 focus:outline-none focus:border-gray-500"
+                                    placeholder="过滤模型 id…"
+                                    value={activeTab === k ? modelFilter : ''}
+                                    onChange={(e) => setModelFilter(e.target.value)}
+                                  />
+                                )}
                               </div>
-                              {opts.map((m) => {
-                                const selected = m.id === selectValue;
-                                return (
-                                  <button
-                                    key={m.id}
-                                    type="button"
-                                    disabled={!prov.enabled}
-                                    onClick={() => {
-                                      updateProvider(k, { model: m.id });
-                                      if (prov.enabled) setDefaultModel(m.id, k);
-                                    }}
-                                    className={`w-full text-left px-2.5 py-1.5 text-[11px] font-mono border-b border-white/[0.03] last:border-0 transition-colors disabled:opacity-40 ${
-                                      selected
-                                        ? 'bg-gray-600/40 text-gray-100'
-                                        : 'text-gray-400 hover:bg-white/[0.04] hover:text-gray-200'
-                                    }`}
-                                  >
-                                    {m.id}
-                                  </button>
-                                );
-                              })}
+                              <div className="max-h-52 overflow-y-auto">
+                                {filtered.map((m) => {
+                                  const checked = enabledSet.has(m.id);
+                                  return (
+                                    <label
+                                      key={m.id}
+                                      className={`flex items-center gap-2 px-2.5 py-1.5 text-[11px] font-mono border-b border-white/[0.03] last:border-0 cursor-pointer transition-colors ${
+                                        checked
+                                          ? 'bg-gray-600/25 text-gray-100'
+                                          : 'text-gray-400 hover:bg-white/[0.04]'
+                                      } ${!prov.enabled ? 'opacity-40 pointer-events-none' : ''}`}
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        className="w-3.5 h-3.5 rounded accent-gray-400 shrink-0"
+                                        checked={checked}
+                                        disabled={!prov.enabled}
+                                        onChange={(e) =>
+                                          toggleOne(m.id, e.target.checked)
+                                        }
+                                      />
+                                      <span className="truncate flex-1" title={m.id}>
+                                        {m.id}
+                                      </span>
+                                      {checked && selectValue === m.id && (
+                                        <span className="text-[9px] text-emerald-500/80 shrink-0">
+                                          默认
+                                        </span>
+                                      )}
+                                    </label>
+                                  );
+                                })}
+                                {filtered.length === 0 && (
+                                  <div className="px-2.5 py-3 text-[11px] text-gray-600">
+                                    无匹配
+                                  </div>
+                                )}
+                              </div>
                             </div>
                           )}
 
                           {!prov.enabled && (
                             <p className="mt-1.5 text-[10px] text-gray-600">
-                              渠道未启用 — 启用后才会出现在默认模型/输入框列表
+                              渠道未启用 — 启用后上架模型才会出现在默认/输入框
                             </p>
                           )}
                           {prov.enabled && config.active_provider === k && (
@@ -520,13 +654,19 @@ export default function SettingsPage({ onBack }: Props) {
                               正在作为默认/输入框模型使用
                             </p>
                           )}
-                          {prov.enabled && !fetched.length && (
+                          {prov.enabled && listedN === 0 && (
                             <p className="mt-1.5 text-[10px] text-gray-600">
-                              点击「获取列表」从接口加载完整模型（显示在下方列表）
+                              点击「获取列表」扫描接口模型，再勾选上架到总列表
                             </p>
                           )}
                           {fetchMsg && activeTab === k && (
-                            <p className={`mt-1.5 text-xs ${fetchMsg.startsWith('已加载') ? 'text-emerald-500/80' : 'text-red-400/90'}`}>
+                            <p
+                              className={`mt-1.5 text-xs ${
+                                fetchMsg.startsWith('已扫描')
+                                  ? 'text-emerald-500/80'
+                                  : 'text-red-400/90'
+                              }`}
+                            >
                               {fetchMsg}
                             </p>
                           )}
