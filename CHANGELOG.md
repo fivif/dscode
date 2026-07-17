@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 — 修复已知错误 (2026-07-17)
+
+### Fixed
+- 修复 ChatArea 与 chatStore 已知问题
+
 ## 0.3.0 — Teams v2 & agent quality (2026-07-11)
 
 ### Multi-agent Teams v2

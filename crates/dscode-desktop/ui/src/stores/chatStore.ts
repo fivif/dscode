@@ -49,6 +49,9 @@ function patchMessageById(messages: Message[], msgId: string, patch: Partial<Mes
 
 function flushStreamBatch(set: (fn: (s: ChatStore) => Partial<ChatStore>) => void, get: () => ChatStore) {
   _flushScheduled = false;
+  if (_rafId != null && typeof cancelAnimationFrame === 'function') {
+    cancelAnimationFrame(_rafId);
+  }
   _rafId = null;
   const text = _pendingText;
   _pendingText = '';
@@ -73,21 +76,66 @@ function flushStreamBatch(set: (fn: (s: ChatStore) => Partial<ChatStore>) => voi
     let teamHostId = s._teamHostMsgId;
 
     if (text && st) {
-      const newText = st.text + text;
-      const toolCalls = st.toolCalls;
-      messages = patchMessageById(messages, st.msgId, {
-        content: newText,
-        thinking_blocks: st.thinking,
-        tool_calls: toolCalls,
-        fact_cards: st.facts,
-        stream_state: {
-          text: newText,
-          thinking: st.thinking,
-          tool_calls: toolCalls,
+      // Never glue post-tool prose onto a tool-card bubble — seal tools first.
+      if (st.toolCalls.length > 0) {
+        const prev = messages.find((m) => m.id === st.msgId);
+        const sealed: Message = {
+          id: st.msgId,
+          session_id: st.sessionId,
+          role: 'assistant',
+          content: '',
+          thinking_blocks: st.thinking,
+          tool_calls: st.toolCalls,
           fact_cards: st.facts,
-        },
-      });
-      stream = { ...st, text: newText };
+          team_agents: prev?.team_agents,
+          created_at: prev?.created_at ?? Math.floor(Date.now() / 1000),
+          stream_state: undefined,
+        };
+        const newId = genId();
+        const newText = text; // tools sealed with empty content; text starts fresh
+        const fresh: Message = {
+          id: newId,
+          session_id: st.sessionId,
+          role: 'assistant',
+          content: newText,
+          created_at: Math.floor(Date.now() / 1000),
+          thinking_blocks: [],
+          tool_calls: [],
+          fact_cards: [],
+          team_agents: [],
+          stream_state: {
+            text: newText,
+            thinking: [],
+            tool_calls: [],
+            fact_cards: [],
+          },
+        };
+        messages = messages.map((m) => (m.id === st.msgId ? sealed : m)).concat(fresh);
+        stream = {
+          sessionId: st.sessionId,
+          msgId: newId,
+          text: newText,
+          thinking: [],
+          toolCalls: [],
+          facts: [],
+        };
+        teamHostId = newId;
+      } else {
+        const newText = st.text + text;
+        messages = patchMessageById(messages, st.msgId, {
+          content: newText,
+          thinking_blocks: st.thinking,
+          tool_calls: st.toolCalls,
+          fact_cards: st.facts,
+          stream_state: {
+            text: newText,
+            thinking: st.thinking,
+            tool_calls: st.toolCalls,
+            fact_cards: st.facts,
+          },
+        });
+        stream = { ...st, text: newText };
+      }
     }
 
     if (toolKeys.length > 0 && stream) {
@@ -163,6 +211,60 @@ function drainPending() {
   _pendingText = '';
   for (const k of Object.keys(_pendingToolChunks)) delete _pendingToolChunks[k];
   for (const k of Object.keys(_pendingTeamChunks)) delete _pendingTeamChunks[k];
+}
+
+/** Finalize stream msg so content and tool_calls never share one bubble. */
+function finalizeStreamMessages(
+  messages: Message[],
+  st: ActiveStream,
+): Message[] {
+  const prev = messages.find((m) => m.id === st.msgId);
+  const hasText = !!st.text.trim();
+  const hasTools = st.toolCalls.length > 0;
+
+  if (hasText && hasTools) {
+    // Reaching complete with BOTH usually means a race glued post-tool prose onto
+    // the tool bubble. Prefer tools → answer so the summary is never above cards.
+    // (True preamble→tools is sealed earlier in tool_start.)
+    const toolsMsg: Message = {
+      id: st.msgId,
+      session_id: st.sessionId,
+      role: 'assistant',
+      content: '',
+      thinking_blocks: st.thinking,
+      tool_calls: st.toolCalls,
+      fact_cards: st.facts,
+      team_agents: prev?.team_agents,
+      created_at: prev?.created_at ?? Math.floor(Date.now() / 1000),
+      stream_state: undefined,
+    };
+    const textMsg: Message = {
+      id: genId(),
+      session_id: st.sessionId,
+      role: 'assistant',
+      content: st.text,
+      thinking_blocks: [],
+      tool_calls: [],
+      fact_cards: [],
+      team_agents: [],
+      created_at: Math.floor(Date.now() / 1000),
+      stream_state: undefined,
+    };
+    return messages.map((m) => (m.id === st.msgId ? toolsMsg : m)).concat(textMsg);
+  }
+
+  return messages.map((m) =>
+    m.id === st.msgId
+      ? {
+          ...m,
+          content: st.text,
+          thinking_blocks: st.thinking,
+          tool_calls: st.toolCalls,
+          fact_cards: st.facts,
+          stream_state: undefined,
+        }
+      : m,
+  );
 }
 
 function snapshotActive(s: {
@@ -754,21 +856,40 @@ export const useChatStore = create<ChatStore>((set, get) => {
         case 'tool_start': {
           flushStreamBatch(set, get);
           const stream = get()._stream;
-          if (stream && stream.text.trim()) {
-            get()._flushAndNewStreamMsg(stream.text);
+          // Seal any preamble text (or leftover content on the bubble) before tools.
+          // Otherwise tools land under a long "summary-looking" assistant message.
+          if (stream) {
+            const live = get().messages.find((m) => m.id === stream.msgId);
+            const preamble = stream.text.trim() || (live?.content || '').trim();
+            if (preamble && stream.toolCalls.length === 0) {
+              get()._flushAndNewStreamMsg(stream.text || live?.content || '');
+            }
           }
           const tc: ToolCallRecord = { id: event.id, name: event.name, description: event.description, status: 'running', result: '' };
           set((s) => {
             const st = s._stream;
             if (!st) return s;
             const toolCalls = [...st.toolCalls, tc];
+            // Tools live on a tools-only bubble (preamble already sealed above).
+            const nextStream = {
+              ...st,
+              toolCalls,
+              text: st.toolCalls.length === 0 ? '' : st.text,
+            };
             const messages = patchMessageById(s.messages, st.msgId, {
+              content: st.toolCalls.length === 0 ? '' : (s.messages.find((m) => m.id === st.msgId)?.content || ''),
               tool_calls: [...(s.messages.find((m) => m.id === st.msgId)?.tool_calls || []), tc],
             });
             return {
-              _stream: { ...st, toolCalls },
+              _stream: nextStream,
               messages,
-              sessionBuffers: { ...s.sessionBuffers, [sessionId]: { ...snapshotActive({ ...s, messages, _stream: { ...st, toolCalls } }), isStreaming: true } },
+              sessionBuffers: {
+                ...s.sessionBuffers,
+                [sessionId]: {
+                  ...snapshotActive({ ...s, messages, _stream: nextStream }),
+                  isStreaming: true,
+                },
+              },
             };
           });
           break;
@@ -983,18 +1104,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 },
               };
             }
-            const messages = s.messages.map((m) =>
-              m.id === st.msgId
-                ? {
-                    ...m,
-                    content: st.text,
-                    thinking_blocks: st.thinking,
-                    tool_calls: st.toolCalls,
-                    fact_cards: st.facts,
-                    stream_state: undefined,
-                  }
-                : m,
-            );
+            const messages = finalizeStreamMessages(s.messages, st);
             return {
               isStreaming: false,
               _stream: null,
@@ -1028,20 +1138,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
         if (target === s.activeSessionId) {
           const st = s._stream;
-          const messages = st
-            ? s.messages.map((m) =>
-                m.id === st.msgId
-                  ? {
-                      ...m,
-                      content: st.text,
-                      thinking_blocks: st.thinking,
-                      tool_calls: st.toolCalls,
-                      fact_cards: st.facts,
-                      stream_state: undefined,
-                    }
-                  : m,
-              )
-            : s.messages;
+          const messages = st ? finalizeStreamMessages(s.messages, st) : s.messages;
           return {
             isStreaming: false,
             _stream: null,
@@ -1151,6 +1248,52 @@ function applyBackgroundEvent(
     switch (event.type) {
       case 'token': {
         if (!st) return s;
+        // Seal tools before post-tool prose (same rule as foreground path).
+        if (st.toolCalls.length > 0) {
+          const prev = buf.messages.find((m) => m.id === st!.msgId);
+          const sealed: Message = {
+            id: st.msgId,
+            session_id: st.sessionId,
+            role: 'assistant',
+            content: '',
+            thinking_blocks: st.thinking,
+            tool_calls: st.toolCalls,
+            fact_cards: st.facts,
+            team_agents: prev?.team_agents,
+            created_at: prev?.created_at ?? Math.floor(Date.now() / 1000),
+            stream_state: undefined,
+          };
+          const newId = genId();
+          const text = event.content;
+          const fresh: Message = {
+            id: newId,
+            session_id: st.sessionId,
+            role: 'assistant',
+            content: text,
+            created_at: Math.floor(Date.now() / 1000),
+            thinking_blocks: [],
+            tool_calls: [],
+            fact_cards: [],
+            team_agents: [],
+          };
+          const messages = buf.messages
+            .map((m) => (m.id === st!.msgId ? sealed : m))
+            .concat(fresh);
+          return write({
+            ...buf,
+            messages,
+            isStreaming: true,
+            _stream: {
+              sessionId: st.sessionId,
+              msgId: newId,
+              text,
+              thinking: [],
+              toolCalls: [],
+              facts: [],
+            },
+            _teamHostMsgId: newId,
+          });
+        }
         const text = st.text + event.content;
         const messages = buf.messages.map((m) =>
           m.id === st!.msgId ? { ...m, content: text } : m,
@@ -1164,25 +1307,103 @@ function applyBackgroundEvent(
       }
       case 'thinking': {
         if (!st) return s;
-        const idx = st.thinking.findIndex((t) => t.step === event.step);
+        let cur = st;
+        let messages = buf.messages;
+        if (cur.toolCalls.length > 0) {
+          const prev = messages.find((m) => m.id === cur.msgId);
+          const sealed: Message = {
+            id: cur.msgId,
+            session_id: cur.sessionId,
+            role: 'assistant',
+            content: '',
+            thinking_blocks: cur.thinking,
+            tool_calls: cur.toolCalls,
+            fact_cards: cur.facts,
+            team_agents: prev?.team_agents,
+            created_at: prev?.created_at ?? Math.floor(Date.now() / 1000),
+            stream_state: undefined,
+          };
+          const newId = genId();
+          const fresh: Message = {
+            id: newId,
+            session_id: cur.sessionId,
+            role: 'assistant',
+            content: '',
+            created_at: Math.floor(Date.now() / 1000),
+            thinking_blocks: [],
+            tool_calls: [],
+            fact_cards: [],
+            team_agents: [],
+          };
+          messages = messages.map((m) => (m.id === cur.msgId ? sealed : m)).concat(fresh);
+          cur = {
+            sessionId: cur.sessionId,
+            msgId: newId,
+            text: '',
+            thinking: [],
+            toolCalls: [],
+            facts: [],
+          };
+        }
+        const idx = cur.thinking.findIndex((t) => t.step === event.step);
         const thinking =
           idx >= 0
-            ? st.thinking.map((t, i) =>
+            ? cur.thinking.map((t, i) =>
                 i === idx ? { step: t.step, content: t.content + event.content } : t,
               )
-            : [...st.thinking, { step: event.step, content: event.content }];
-        const messages = buf.messages.map((m) =>
-          m.id === st!.msgId ? { ...m, thinking_blocks: thinking } : m,
+            : [...cur.thinking, { step: event.step, content: event.content }];
+        messages = messages.map((m) =>
+          m.id === cur.msgId ? { ...m, thinking_blocks: thinking } : m,
         );
         return write({
           ...buf,
           messages,
           isStreaming: true,
-          _stream: { ...st, thinking },
+          _stream: { ...cur, thinking },
+          _teamHostMsgId: cur.msgId,
         });
       }
       case 'tool_start': {
         if (!st) return s;
+        let cur = st;
+        let messages = buf.messages;
+        // Seal preamble text before tools land under it.
+        if (cur.text.trim() && cur.toolCalls.length === 0) {
+          const prev = messages.find((m) => m.id === cur.msgId);
+          const sealed: Message = {
+            id: cur.msgId,
+            session_id: cur.sessionId,
+            role: 'assistant',
+            content: cur.text,
+            thinking_blocks: cur.thinking,
+            tool_calls: [],
+            fact_cards: cur.facts,
+            team_agents: prev?.team_agents,
+            created_at: prev?.created_at ?? Math.floor(Date.now() / 1000),
+            stream_state: undefined,
+          };
+          const newId = genId();
+          const fresh: Message = {
+            id: newId,
+            session_id: cur.sessionId,
+            role: 'assistant',
+            content: '',
+            created_at: Math.floor(Date.now() / 1000),
+            thinking_blocks: [],
+            tool_calls: [],
+            fact_cards: [],
+            team_agents: [],
+          };
+          messages = messages.map((m) => (m.id === cur.msgId ? sealed : m)).concat(fresh);
+          cur = {
+            sessionId: cur.sessionId,
+            msgId: newId,
+            text: '',
+            thinking: [],
+            toolCalls: [],
+            facts: [],
+          };
+        }
         const tc: ToolCallRecord = {
           id: event.id,
           name: event.name,
@@ -1190,17 +1411,18 @@ function applyBackgroundEvent(
           status: 'running',
           result: '',
         };
-        const toolCalls = [...st.toolCalls, tc];
-        const messages = buf.messages.map((m) =>
-          m.id === st!.msgId
-            ? { ...m, tool_calls: [...(m.tool_calls || []), tc] }
+        const toolCalls = [...cur.toolCalls, tc];
+        messages = messages.map((m) =>
+          m.id === cur.msgId
+            ? { ...m, content: '', tool_calls: [...(m.tool_calls || []), tc] }
             : m,
         );
         return write({
           ...buf,
           messages,
           isStreaming: true,
-          _stream: { ...st, toolCalls, text: st.text },
+          _stream: { ...cur, toolCalls, text: '' },
+          _teamHostMsgId: cur.msgId,
         });
       }
       case 'tool_end': {
@@ -1289,17 +1511,7 @@ function applyBackgroundEvent(
       }
       case 'complete': {
         if (st) {
-          const messages = buf.messages.map((m) =>
-            m.id === st!.msgId
-              ? {
-                  ...m,
-                  content: st!.text,
-                  thinking_blocks: st!.thinking,
-                  tool_calls: st!.toolCalls,
-                  stream_state: undefined,
-                }
-              : m,
-          );
+          const messages = finalizeStreamMessages(buf.messages, st);
           return write({
             ...buf,
             messages,

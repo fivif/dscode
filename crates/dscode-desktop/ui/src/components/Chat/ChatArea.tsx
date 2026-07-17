@@ -21,15 +21,17 @@ const MessageRow = memo(function MessageRow({
   const thinking = msg.thinking_blocks || [];
   const toolCalls = msg.tool_calls || [];
   const teamAgentsOnMsg = msg.team_agents || [];
+  // Tools ABOVE content: if a bubble ever carries both (stream-split miss),
+  // the final answer must not sit above its tool cards.
   return (
     <div className="mb-4">
       {thinking.length > 0 && (
         <ThinkingBlockView blocks={thinking} streaming={isStreaming && isLast} />
       )}
-      {msg.content && <MessageBubble message={msg} />}
       {toolCalls.map((tc) => (
         <ToolCallCard key={tc.id} tool={tc} />
       ))}
+      {msg.content && <MessageBubble message={msg} />}
       {msg.fact_cards && msg.fact_cards.length > 0 && <FactCard facts={msg.fact_cards} />}
       {msg.plan_choice && <PlanChoiceCard messageId={msg.id} choice={msg.plan_choice} />}
       {teamAgentsOnMsg.length > 0 && (
