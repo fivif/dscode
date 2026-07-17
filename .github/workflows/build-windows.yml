@@ -45,21 +45,26 @@ jobs:
 
       - name: Find MSI installer
         id: find-msi
-        shell: bash
+        shell: pwsh
         run: |
-          MSI=$(find target/release/bundle/msi -name "*.msi" 2>/dev/null | head -1)
-          if [ -z "$MSI" ]; then
-            echo "No MSI found, trying exe..."
-            MSI=$(find target/release/bundle/nsis -name "*.exe" 2>/dev/null | head -1)
-          fi
-          echo "installer=$MSI" >> $GITHUB_OUTPUT
-          echo "Found: $MSI"
+          $msi = Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+            Write-Host "No MSI found, checking for exe..."
+            $msi = Get-ChildItem -Path "target/release/bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($msi) {
+            "installer=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "Found: $($msi.FullName)"
+          } else {
+            Write-Error "No installer found!"
+            exit 1
+          }
 
       - name: Upload to Release
         if: steps.find-msi.outputs.installer != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}
-          files: crates/dscode-desktop/${{ steps.find-msi.outputs.installer }}
+          files: ${{ steps.find-msi.outputs.installer }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
