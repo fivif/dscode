@@ -1,0 +1,64 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.3.1)'
+        required: true
+        default: '0.3.1'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: crates/dscode-desktop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: crates/dscode-desktop/ui
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2"
+
+      - name: Build Tauri (Windows MSI)
+        run: cargo tauri build --bundles msi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Find MSI installer
+        id: find-msi
+        shell: bash
+        run: |
+          MSI=$(find target/release/bundle/msi -name "*.msi" 2>/dev/null | head -1)
+          if [ -z "$MSI" ]; then
+            echo "No MSI found, trying exe..."
+            MSI=$(find target/release/bundle/nsis -name "*.exe" 2>/dev/null | head -1)
+          fi
+          echo "installer=$MSI" >> $GITHUB_OUTPUT
+          echo "Found: $MSI"
+
+      - name: Upload to Release
+        if: steps.find-msi.outputs.installer != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          files: crates/dscode-desktop/${{ steps.find-msi.outputs.installer }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
