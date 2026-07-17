@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "dscode-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "dscode-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "dscode-desktop"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "dscode-tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "argh",
