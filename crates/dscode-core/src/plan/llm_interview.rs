@@ -4,11 +4,13 @@
 //! next best clarifying question given: goal, phase, project snapshot, and Q&A so far.
 //! The model can also advance phases or declare the interview complete.
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{info, warn};
 
 use super::phases::PlanPhase;
+use crate::agent::stream::StreamEvent;
 use crate::providers::trait_def::{LlmProvider, Message, MessageContent, Role};
 
 /// Max user-facing questions per phase before forcing advance (token control).
@@ -114,6 +116,9 @@ pub fn project_snapshot(working_dir: &Path) -> String {
 }
 
 /// Ask the LLM for the next interview action.
+///
+/// When `progress` is set, emits live Thinking (reasoning) + status Tokens so the
+/// UI is not blank while waiting for the full JSON plan turn.
 pub async fn next_llm_turn(
     provider: &dyn LlmProvider,
     user_goal: &str,
@@ -121,6 +126,7 @@ pub async fn next_llm_turn(
     qa_history: &[(String, String)],
     questions_in_phase: u32,
     project_snapshot: &str,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
 ) -> Result<LlmInterviewAction, String> {
     // Soft force advance when phase budget exhausted
     if questions_in_phase >= MAX_QUESTIONS_PER_PHASE {
@@ -206,23 +212,118 @@ Rules:
 "#
     );
 
-    let response = provider
-        .chat(
-            vec![Message {
-                role: Role::User,
-                content: MessageContent::Text(prompt),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                created_at: 0,
-            }],
-            vec![],
-        )
-        .await
-        .map_err(|e| format!("plan LLM error: {e}"))?;
+    if let Some(tx) = progress {
+        let _ = tx.send(StreamEvent::Token {
+            content: format!("_规划中 · {}：分析上下文并生成问题…_\n", phase.label()),
+        });
+    }
 
-    parse_llm_turn(&response.content)
+    let messages = vec![Message {
+        role: Role::User,
+        content: MessageContent::Text(prompt),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        created_at: 0,
+    }];
+
+    let content = collect_plan_llm_response(provider, messages.clone(), progress).await?;
+    match parse_llm_turn(&content) {
+        Ok(action) => Ok(action),
+        Err(first_err) => {
+            // Stream ended but produced truncated / partial JSON (network drop
+            // or provider cut). Retry once via chat() before giving up so a
+            // flaky stream doesn't kill the whole /plan interview.
+            warn!(%first_err, "plan stream parse failed — retrying once with chat()");
+            let r = provider
+                .chat(messages, vec![])
+                .await
+                .map_err(|e| format!("plan LLM error: {e}"))?;
+            emit_reasoning(progress, r.reasoning_content.as_deref());
+            parse_llm_turn(&r.content)
+        }
+    }
+}
+
+/// Stream plan LLM when possible: forward reasoning as Thinking, keep JSON off the chat body.
+async fn collect_plan_llm_response(
+    provider: &dyn LlmProvider,
+    messages: Vec<Message>,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+) -> Result<String, String> {
+    match provider.chat_stream(messages.clone(), vec![]).await {
+        Ok(mut stream) => {
+            let mut content = String::new();
+            let mut saw_content = false;
+            while let Some(item) = stream.next().await {
+                let chunk = item.map_err(|e| format!("plan stream error: {e}"))?;
+                if let Some(rc) = chunk.reasoning_content {
+                    if !rc.is_empty() {
+                        if let Some(tx) = progress {
+                            let _ = tx.send(StreamEvent::Thinking {
+                                content: rc,
+                                step: 0,
+                            });
+                        }
+                    }
+                }
+                if let Some(c) = chunk.content {
+                    if !c.is_empty() {
+                        if !saw_content {
+                            saw_content = true;
+                            // Do not dump raw JSON into the chat — just show liveness.
+                            if let Some(tx) = progress {
+                                let _ = tx.send(StreamEvent::Token {
+                                    content: "_模型生成中…_\n".into(),
+                                });
+                            }
+                        }
+                        content.push_str(&c);
+                    }
+                }
+            }
+            if content.trim().is_empty() {
+                warn!("plan stream empty — falling back to chat()");
+                let r = provider
+                    .chat(messages, vec![])
+                    .await
+                    .map_err(|e| format!("plan LLM error: {e}"))?;
+                emit_reasoning(progress, r.reasoning_content.as_deref());
+                Ok(r.content)
+            } else {
+                Ok(content)
+            }
+        }
+        Err(e) => {
+            warn!(%e, "plan chat_stream open failed — chat()");
+            let r = provider
+                .chat(messages, vec![])
+                .await
+                .map_err(|e| format!("plan LLM error: {e}"))?;
+            emit_reasoning(progress, r.reasoning_content.as_deref());
+            if let Some(tx) = progress {
+                let _ = tx.send(StreamEvent::Token {
+                    content: "_模型已返回，解析问题…_\n".into(),
+                });
+            }
+            Ok(r.content)
+        }
+    }
+}
+
+fn emit_reasoning(
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    reasoning: Option<&str>,
+) {
+    if let (Some(tx), Some(rc)) = (progress, reasoning) {
+        if !rc.is_empty() {
+            let _ = tx.send(StreamEvent::Thinking {
+                content: rc.to_string(),
+                step: 0,
+            });
+        }
+    }
 }
 
 fn parse_llm_turn(raw: &str) -> Result<LlmInterviewAction, String> {

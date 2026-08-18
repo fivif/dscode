@@ -29,7 +29,7 @@ export default function Sidebar({ onOpenSettings, onOpenMcp, onOpenSkills, width
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        const { listen } = await import('@tauri-apps/api/event');
+        const { listen } = await import('@/lib/tauri');
         unlisten = await listen<{ session_id: string; title: string }>('session-title-updated', (e) => {
           const { session_id, title } = e.payload || {};
           if (session_id && title) applyTitleLocal(session_id, title);

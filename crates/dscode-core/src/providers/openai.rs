@@ -179,7 +179,7 @@ impl LlmProvider for OpenAiProvider {
 
         // P1: Use byte buffer with per-chunk read timeout to prevent hangs
         let byte_stream = resp.bytes_stream();
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(128);
 
         tokio::spawn(async move {
             let mut buf: Vec<u8> = Vec::new();
@@ -193,14 +193,18 @@ impl LlmProvider for OpenAiProvider {
                             let line_bytes = buf.drain(..=pos).collect::<Vec<_>>();
                             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len()-1]);
                             if line.starts_with("data: ") {
-                                if tx.send(line.to_string()).await.is_err() { return; }
+                                if tx.send(Ok(line.to_string())).await.is_err() { return; }
                             }
                         }
                     }
-                    Ok(Some(Err(_))) => { return; }
+                    Ok(Some(Err(e))) => {
+                        let _ = tx.send(Err(format!("byte stream: {e}"))).await;
+                        return;
+                    }
                     Ok(None) => { break; }
                     Err(_timeout) => {
                         tracing::warn!("chat_stream chunk read timeout, closing stream");
+                        let _ = tx.send(Err("chunk read timeout (90s)".into())).await;
                         return;
                     }
                 }
@@ -208,13 +212,16 @@ impl LlmProvider for OpenAiProvider {
             if !buf.is_empty() {
                 let line = String::from_utf8_lossy(&buf);
                 if line.starts_with("data: ") {
-                    let _ = tx.send(line.to_string()).await;
+                    let _ = tx.send(Ok(line.to_string())).await;
                 }
             }
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-            .map(|line| parse_sse_chunk(&line));
+            .map(|item| match item {
+                Ok(line) => parse_sse_chunk(&line),
+                Err(e) => Err(ProviderError::StreamInterrupted(e)),
+            });
 
         Ok(Box::pin(stream))
     }

@@ -14,6 +14,12 @@ export interface SessionStore {
   updateTitle: (sessionId: string, title: string) => Promise<void>;
   updateModel: (sessionId: string, model: string) => Promise<void>;
   applyTitleLocal: (sessionId: string, title: string) => void;
+  /** Bump updated_at + re-sort so the session moves into "今天" after activity. */
+  touchSession: (sessionId: string, at?: number) => void;
+}
+
+function sortByUpdatedDesc(sessions: Session[]): Session[] {
+  return [...sessions].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
 }
 
 export const useSessionStore = create<SessionStore>((set, get) => ({
@@ -49,9 +55,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   updateWorkspace: async (sessionId, workspace) => {
     try {
       await tauri.updateSessionWorkspace(sessionId, workspace);
+      const now = Math.floor(Date.now() / 1000);
       set((s) => ({
-        sessions: s.sessions.map((ss) =>
-          ss.id === sessionId ? { ...ss, workspace } : ss
+        sessions: sortByUpdatedDesc(
+          s.sessions.map((ss) =>
+            ss.id === sessionId ? { ...ss, workspace, updated_at: now } : ss,
+          ),
         ),
       }));
     } catch (err: unknown) {
@@ -75,9 +84,12 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     if (!mid) return;
     try {
       await tauri.updateSessionModel(sessionId, mid);
+      const now = Math.floor(Date.now() / 1000);
       set((s) => ({
-        sessions: s.sessions.map((ss) =>
-          ss.id === sessionId ? { ...ss, model: mid } : ss
+        sessions: sortByUpdatedDesc(
+          s.sessions.map((ss) =>
+            ss.id === sessionId ? { ...ss, model: mid, updated_at: now } : ss,
+          ),
         ),
       }));
     } catch (err: unknown) {
@@ -86,11 +98,31 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   applyTitleLocal: (sessionId, title) => {
+    const now = Math.floor(Date.now() / 1000);
     set((s) => ({
-      sessions: s.sessions.map((ss) =>
-        ss.id === sessionId ? { ...ss, title } : ss
+      sessions: sortByUpdatedDesc(
+        s.sessions.map((ss) =>
+          ss.id === sessionId ? { ...ss, title, updated_at: now } : ss,
+        ),
       ),
     }));
+  },
+
+  touchSession: (sessionId, at) => {
+    const now = at ?? Math.floor(Date.now() / 1000);
+    set((s) => {
+      const idx = s.sessions.findIndex((ss) => ss.id === sessionId);
+      if (idx < 0) return s;
+      // Already newest with same/newer timestamp — skip churn
+      if (idx === 0 && (s.sessions[0].updated_at || 0) >= now) return s;
+      return {
+        sessions: sortByUpdatedDesc(
+          s.sessions.map((ss) =>
+            ss.id === sessionId ? { ...ss, updated_at: now } : ss,
+          ),
+        ),
+      };
+    });
   },
 
   deleteSession: async (id) => {

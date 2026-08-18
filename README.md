@@ -8,7 +8,7 @@
 <p align="center">
   <strong>通用 AI 代码助手</strong> · DeepSeek 原生 · 跨模型
   <br/>
-  桌面 GUI 应用。Rust 引擎，React 前端，Tauri 外壳。
+  桌面 GUI + 浏览器 Web 双端。Rust 引擎，React 前端。
 </p>
 
 <p align="center">
@@ -27,9 +27,15 @@
 ## 架构 Architecture
 
 ```
-dscode-desktop (Tauri 2 + React) ───┐
-dscode-cli ────────────────────────┤
-                                   ▼
+dscode-desktop (Tauri 2 + React) ──┐
+dscode-web (axum + SSE, 浏览器) ──┤
+dscode-cli ──────────────────────┤
+                                 ▼
+                     ┌──────────────────────┐
+                     │    dscode-server      │  ← 共享业务层
+                     │ 命令分发 · 事件总线 · 状态 │
+                     └──────────────────────┘
+                                 ▼
 ┌──────────────────────────────────────────────────┐
 │                  dscode-core                       │
 │                                                    │
@@ -39,7 +45,7 @@ dscode-cli ───────────────────────
 │                                                    │
 │  Provider ─ DeepSeek / OpenAI / Anthropic          │
 │  Session ─ SQLite 持久化                            │
-│  Tools ─ bash · file · bg · mcp · skills           │
+│  Tools ─ bash · file · bg · web · rss · github    │
 │  Safety ─ 超时检测 · 危险拦截                       │
 └──────────────────────────────────────────────────┘
 ```
@@ -51,6 +57,7 @@ dscode-cli ───────────────────────
 - **上下文窗口** — 可配置最高 1M tokens，支持阈值触发自动压缩
 - **工具链校验** — 加载时 + 运行时自动清理孤立工具调用，杜绝 400 错误
 - **多模型支持** — DeepSeek V4、OpenAI、Anthropic Claude（原生 API）、本地 Ollama
+- **Responses API** — 支持 OpenAI/DeepSeek 新版 `/responses` 端点（`input` + `instructions` 格式，语义化 SSE 事件）
 - **思考模式** — Anthropic 扩展思考 + DeepSeek R1 推理链，支持 reasoning_effort 配置
 
 ### /auto 自动执行模式
@@ -80,14 +87,18 @@ dscode-cli ───────────────────────
   - YAML 前置元数据的技能文件，按触发器路由
   - 自动激活匹配技能，支持脚本/参考文档/资源目录
   - `do_skill_install` 从 GitHub 安装第三方技能包
+- **RSS / Atom 阅读器** — 解析任意订阅源为结构化条目，Agent 可直接读取
+- **GitHub 搜索** — 公共 REST API 代码/仓库搜索，免 token（限流）
 
-### 桌面应用 Desktop GUI
+### 桌面 + Web 应用 Desktop & Web
+- **双端同源** — Tauri 桌面与浏览器 Web 共用同一套 React 前端与业务逻辑
 - **附件上传** — 拖拽/粘贴文件（图片、文本、代码），自动识别类型
 - **模型切换** — 运行时切换模型与 Provider
 - **团队模式** — 一键启用多 Agent 协作
 - **会话管理** — 创建/重命名/删除/搜索会话，SQLite 持久化
 - **设置面板** — MCP 服务器配置、Skills 管理、Provider API Key
 - **流式渲染** — Thinking 块、Tool Call 卡片、Fact 提取实时展示
+- **Web 部署** — axum 服务 + SSE 事件流，一键安装脚本，默认绑定本机
 
 ---
 
@@ -107,6 +118,22 @@ dscode-cli ───────────────────────
 cd crates/dscode-desktop/ui && npm install
 cd .. && cargo tauri dev
 ```
+
+### Web 应用 Web（浏览器）
+```bash
+# 一键安装：编译 + 装到 ~/.local
+bash scripts/install-web.sh
+
+# 启动 → 浏览器打开 http://127.0.0.1:8080
+dscode-web
+
+# 自定义监听地址 / 前端目录（可选）
+DSCODE_WEB_ADDR=0.0.0.0:8080 dscode-web
+DSCODE_WEB_DIST=/path/to/dist dscode-web
+```
+
+> 默认仅绑定 `127.0.0.1`（本机访问）。暴露到网络前请自行加反向代理认证，
+> 否则等于开放本机 shell。
 
 ### 命令行 CLI
 ```bash
@@ -197,16 +224,20 @@ DS_code/
 │   │       ├── session/            # 会话持久化 (SQLite)
 │   │       ├── teams/              # 多 Agent 团队分发与监控
 │   │       └── tools/              # 工具注册表与实现 (bash/fs/bg/skills/mcp)
-│   ├── dscode-desktop/             # Tauri 2.x 桌面应用
-│   │   ├── src/                    # Rust 后端 (commands, state, events)
+│   ├── dscode-server/              # 共享业务层（命令分发、事件总线、状态）
+│   ├── dscode-desktop/             # Tauri 2.x 桌面壳（转发到 dscode-server）
+│   │   ├── src/                    # Rust 后端（薄壳 + Tauri 命令转发）
 │   │   └── ui/                     # React 18 前端 (TypeScript + Tailwind)
 │   │       └── src/
 │   │           ├── components/     # UI 组件 (Chat, Settings, Sidebar)
 │   │           ├── hooks/          # 自定义 Hooks
-│   │           ├── lib/            # 工具库 (tauri bindings, types, models)
+│   │           ├── lib/            # 工具库 (双通道: tauri IPC / fetch+SSE)
 │   │           └── stores/         # Zustand 状态管理
+│   ├── dscode-web/                 # axum 服务壳（HTTP + SSE，浏览器访问）
 │   ├── dscode-tui/                 # ratatui 终端界面
 │   └── dscode-cli/                 # 单次命令行工具
+├── scripts/
+│   └── install-web.sh              # Web 版一键安装脚本
 ├── config/
 │   └── default.toml                # 默认配置模板
 ├── Cargo.toml                      # 工作区根配置
@@ -221,6 +252,7 @@ DS_code/
 |---|---|
 | 核心引擎 | Rust (tokio, reqwest, rusqlite) |
 | 桌面 GUI | Tauri 2.x + React 18 + TypeScript + Tailwind CSS |
+| Web 服务 | axum + SSE (EventSource) + tower-http |
 | 状态管理 | Zustand |
 | 会话存储 | SQLite (rusqlite + FTS5) |
 | Markdown | react-markdown + remark-gfm |

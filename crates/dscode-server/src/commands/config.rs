@@ -8,11 +8,11 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::app_state::AppState;
+use std::sync::Arc;
 
 /// Get the current application configuration.
-#[tauri::command]
 pub async fn get_config(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
 ) -> Result<Config, String> {
     let config = state.config.lock().await;
     Ok(config.clone())
@@ -32,9 +32,8 @@ pub struct GlobalPromptInfo {
 }
 
 /// Read global prompt settings + default text for the modal editor.
-#[tauri::command]
 pub async fn get_global_prompt(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
 ) -> Result<GlobalPromptInfo, String> {
     let config = state.config.lock().await;
     let agent = config.agent.clone();
@@ -47,9 +46,8 @@ pub async fn get_global_prompt(
 }
 
 /// Update only the global system prompt fields (does not touch other config).
-#[tauri::command]
 pub async fn set_global_prompt(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     global_prompt: String,
     replace_system_prompt: bool,
 ) -> Result<GlobalPromptInfo, String> {
@@ -86,9 +84,8 @@ pub async fn set_global_prompt(
 /// The config is first persisted to disk. If the save succeeds, the in-memory
 /// state is updated. If the save fails, the in-memory state is NOT modified
 /// (the error is returned with the original config intact).
-#[tauri::command]
 pub async fn update_config(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     config: Config,
 ) -> Result<(), String> {
     info!("config: updating");
@@ -119,9 +116,8 @@ pub async fn update_config(
 }
 
 /// Fetch available models from a provider's API (OpenAI-compatible `/v1/models`).
-#[tauri::command]
 pub async fn fetch_models(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     provider_key: String,
 ) -> Result<Vec<String>, String> {
     let (api_key, base_url, proxy) = {

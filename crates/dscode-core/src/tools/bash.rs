@@ -51,9 +51,36 @@ fn kill_process_group(pgid: Option<u32>) {
             tracing::debug!(pgid = pid, "kill process group finished (may already be empty)");
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Windows has no POSIX process groups: kill the whole tree via taskkill.
+        if let Some(pid) = pgid.filter(|&p| p > 1) {
+            let pid_str = pid.to_string();
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", pid_str.as_str(), "/T", "/F"])
+                .status();
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = pgid;
+    }
+}
+
+/// Platform-appropriate shell for `do_bash`:
+/// - Unix: `bash -c <command>` (process-group killable)
+/// - Windows: `cmd.exe /C <command>` (no bash by default; cmd is universal)
+fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    #[cfg(windows)]
+    {
+        let mut args: Vec<std::ffi::OsString> = Vec::new();
+        args.push("/C".into());
+        args.push(command.into());
+        (std::ffi::OsString::from("cmd.exe"), args)
+    }
+    #[cfg(not(windows))]
+    {
+        (std::ffi::OsString::from("bash"), vec!["-c".into(), command.into()])
     }
 }
 
@@ -236,9 +263,9 @@ impl Tool for DoBash {
         });
 
         // Build the command with process group support
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(command)
+        let (shell, shell_args) = shell_command(command);
+        let mut cmd = Command::new(&shell);
+        cmd.args(&shell_args)
             .current_dir(&ctx.working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

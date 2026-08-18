@@ -105,6 +105,9 @@ impl ToolRegistry {
         self.register(crate::tools::skill_ops::DoSkillInstall::new());
         self.register(crate::tools::web::DoWebFetch::new());
         self.register(crate::tools::web::DoWebSearch::new());
+        self.register(crate::tools::web::DoDeepSearch::new());
+        self.register(crate::tools::github::DoGithubSearch::new());
+        self.register(crate::tools::feeds::DoRssRead::new());
     }
 
     /// Return the number of registered tools.

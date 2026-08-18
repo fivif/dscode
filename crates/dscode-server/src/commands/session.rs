@@ -6,6 +6,7 @@ use dscode_core::session::manager::Session;
 use tracing::info;
 
 use crate::app_state::AppState;
+use std::sync::Arc;
 
 /// List sessions, most-recently-updated first.
 /// Messages are NOT loaded (use [`get_session`] for full details).
@@ -13,9 +14,8 @@ use crate::app_state::AppState;
 /// # Parameters
 /// - `limit`: maximum number of sessions to return (default 100, max 500).
 /// - `offset`: number of sessions to skip before returning results (default 0).
-#[tauri::command]
 pub async fn list_sessions(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<Session>, String> {
@@ -43,9 +43,8 @@ pub async fn list_sessions(
 }
 
 /// Get a session by id, including all messages.
-#[tauri::command]
 pub async fn get_session(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     id: String,
 ) -> Result<Session, String> {
     state.ensure_session_manager().await?;
@@ -62,9 +61,8 @@ pub async fn get_session(
 /// Create a new session with the given title.
 /// Snapshots the current global `default_model` onto the session.
 /// Returns the session with an empty message list.
-#[tauri::command]
 pub async fn create_session(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     title: String,
     workspace: String,
 ) -> Result<Session, String> {
@@ -86,9 +84,8 @@ pub async fn create_session(
 }
 
 /// Get the most recently used session.
-#[tauri::command]
 pub async fn get_last_session(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
 ) -> Result<Option<Session>, String> {
     state.ensure_session_manager().await?;
     let sm_guard = state.session_manager.lock().await;
@@ -97,9 +94,8 @@ pub async fn get_last_session(
 }
 
 /// Update the workspace directory for a session.
-#[tauri::command]
 pub async fn update_session_workspace(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     session_id: String,
     workspace: String,
 ) -> Result<(), String> {
@@ -110,9 +106,8 @@ pub async fn update_session_workspace(
 }
 
 /// Rename a session (manual rename from sidebar).
-#[tauri::command]
 pub async fn update_session_title(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     session_id: String,
     title: String,
 ) -> Result<(), String> {
@@ -126,9 +121,8 @@ pub async fn update_session_title(
 }
 
 /// Bind a model to a session (chat model picker). Does not change global default.
-#[tauri::command]
 pub async fn update_session_model(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     session_id: String,
     model: String,
 ) -> Result<(), String> {
@@ -142,9 +136,8 @@ pub async fn update_session_model(
 }
 
 /// Delete a session and all its messages.
-#[tauri::command]
 pub async fn delete_session(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     id: String,
 ) -> Result<(), String> {
     info!(%id, "session: deleting");

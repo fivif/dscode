@@ -2,9 +2,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use dscode_desktop::app_state::AppState;
+use dscode_server::app_state::AppState;
 use tauri::Manager;
 
 fn main() {
@@ -13,13 +14,17 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::new())
+        .manage(Arc::new(AppState::new()))
         .setup(|app| {
             let handle = app.handle().clone();
-            // Load MCP servers into the tool registry at startup
+
+            // Bridge shared EventBus → Tauri events for the webview.
+            dscode_desktop::shell::spawn_event_bridge(&handle);
+
+            // Load MCP servers into the tool registry at startup.
             let mcp_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                let state = mcp_handle.state::<AppState>();
+                let state = mcp_handle.state::<Arc<AppState>>();
                 let (n, status) =
                     dscode_core::tools::mcp_ops::register_mcp_tools(&state.tool_registry).await;
                 for line in &status {
@@ -27,10 +32,12 @@ fn main() {
                 }
                 tracing::info!(registered = n, "MCP tools ready for agent");
             });
+
+            // Periodic session auto-cleanup.
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-                    let state = handle.state::<AppState>();
+                    let state = handle.state::<Arc<AppState>>();
                     let guard = state.session_manager.lock().await;
                     if let Some(ref mgr) = *guard {
                         if let Err(e) = mgr.purge_now() {
@@ -41,42 +48,43 @@ fn main() {
                     }
                 }
             });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            dscode_desktop::commands::chat::send_message,
-            dscode_desktop::commands::chat::stage_upload,
-            dscode_desktop::commands::chat::approve_permission,
-            dscode_desktop::commands::chat::deny_permission,
-            dscode_desktop::commands::chat::abort,
-            dscode_desktop::commands::chat::stop_team_agent,
-            dscode_desktop::commands::chat::nudge_team_agent,
-            dscode_desktop::commands::chat::list_tools,
-            dscode_desktop::commands::mcp::list_mcp_servers,
-            dscode_desktop::commands::mcp::add_mcp_server,
-            dscode_desktop::commands::mcp::update_mcp_server,
-            dscode_desktop::commands::mcp::remove_mcp_server,
-            dscode_desktop::commands::mcp::reload_mcp,
-            dscode_desktop::commands::chat::list_skills,
-            dscode_desktop::commands::chat::save_skill,
-            dscode_desktop::commands::chat::write_skill_file,
-            dscode_desktop::commands::chat::skills_dir,
-            dscode_desktop::commands::chat::install_skill_package,
-            dscode_desktop::commands::chat::delete_skill,
-            dscode_desktop::commands::session::list_sessions,
-            dscode_desktop::commands::session::get_session,
-            dscode_desktop::commands::session::create_session,
-            dscode_desktop::commands::session::get_last_session,
-            dscode_desktop::commands::session::update_session_workspace,
-            dscode_desktop::commands::session::update_session_title,
-            dscode_desktop::commands::session::update_session_model,
-            dscode_desktop::commands::session::delete_session,
-            dscode_desktop::commands::config::get_config,
-            dscode_desktop::commands::config::update_config,
-            dscode_desktop::commands::config::get_global_prompt,
-            dscode_desktop::commands::config::set_global_prompt,
-            dscode_desktop::commands::config::fetch_models,
-            dscode_desktop::commands::chat::subscribe_task_events,
+            dscode_desktop::shell::send_message,
+            dscode_desktop::shell::stage_upload,
+            dscode_desktop::shell::approve_permission,
+            dscode_desktop::shell::deny_permission,
+            dscode_desktop::shell::abort,
+            dscode_desktop::shell::stop_team_agent,
+            dscode_desktop::shell::nudge_team_agent,
+            dscode_desktop::shell::list_tools,
+            dscode_desktop::shell::list_mcp_servers,
+            dscode_desktop::shell::add_mcp_server,
+            dscode_desktop::shell::update_mcp_server,
+            dscode_desktop::shell::remove_mcp_server,
+            dscode_desktop::shell::reload_mcp,
+            dscode_desktop::shell::list_skills,
+            dscode_desktop::shell::save_skill,
+            dscode_desktop::shell::write_skill_file,
+            dscode_desktop::shell::skills_dir,
+            dscode_desktop::shell::install_skill_package,
+            dscode_desktop::shell::delete_skill,
+            dscode_desktop::shell::list_sessions,
+            dscode_desktop::shell::get_session,
+            dscode_desktop::shell::create_session,
+            dscode_desktop::shell::get_last_session,
+            dscode_desktop::shell::update_session_workspace,
+            dscode_desktop::shell::update_session_title,
+            dscode_desktop::shell::update_session_model,
+            dscode_desktop::shell::delete_session,
+            dscode_desktop::shell::get_config,
+            dscode_desktop::shell::update_config,
+            dscode_desktop::shell::get_global_prompt,
+            dscode_desktop::shell::set_global_prompt,
+            dscode_desktop::shell::fetch_models,
+            dscode_desktop::shell::subscribe_task_events,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DS Code Desktop");

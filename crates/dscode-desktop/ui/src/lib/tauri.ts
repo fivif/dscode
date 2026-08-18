@@ -1,6 +1,74 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { listen as tauriListen } from '@tauri-apps/api/event';
 import type { StreamEvent, Session, AppConfig } from './types';
+
+const IS_TAURI = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+/** Unified invoke: Tauri IPC in the desktop shell, HTTP `/api/invoke` in the browser. */
+export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (IS_TAURI) {
+    return tauriInvoke<T>(command, args);
+  }
+  const res = await fetch('/api/invoke', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command, args: args ?? {} }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`invoke(${command}) failed: ${text}`);
+  }
+  return (await res.json()) as T;
+}
+
+// ── SSE event bridge (browser only) ──
+let _es: EventSource | null = null;
+const sseListeners = new Map<string, Set<(payload: unknown) => void>>();
+
+function emitLocal(event: string, payload: unknown) {
+  const set = sseListeners.get(event);
+  if (!set) return;
+  for (const cb of set) cb({ event, payload });
+}
+
+function ensureEventSource(): EventSource {
+  if (_es) return _es;
+  _es = new EventSource('/api/events');
+  _es.addEventListener('server-event', (e) => {
+    let data: unknown;
+    try {
+      data = JSON.parse((e as MessageEvent).data);
+    } catch {
+      return;
+    }
+    const d = data as Record<string, unknown>;
+    if (d.Stream) emitLocal('stream-event', d.Stream);
+    else if (d.SessionTitleUpdated) emitLocal('session-title-updated', d.SessionTitleUpdated);
+    else if (d.TaskNotification) emitLocal('task-notification', d.TaskNotification);
+  });
+  return _es;
+}
+
+/** Unified listen: Tauri event in desktop, SSE in the browser. */
+export async function listen<T>(
+  event: string,
+  callback: (e: { event: string; payload: T }) => void,
+): Promise<() => void> {
+  if (IS_TAURI) {
+    return tauriListen(event, callback as never);
+  }
+  ensureEventSource();
+  let set = sseListeners.get(event);
+  if (!set) {
+    set = new Set();
+    sseListeners.set(event, set);
+  }
+  const cb = callback as unknown as (payload: unknown) => void;
+  set.add(cb);
+  return () => {
+    set?.delete(cb);
+  };
+}
 
 // ── Chat ──
 export async function sendMessage(

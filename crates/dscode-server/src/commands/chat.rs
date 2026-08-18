@@ -6,12 +6,11 @@ use dscode_core::agent::forge::Forge;
 use dscode_core::agent::stream::StreamEvent;
 use dscode_core::providers::create_provider;
 use dscode_core::providers::trait_def::{FunctionCall, Message, MessageContent, Role, ToolCall};
-use tauri::{Emitter, Manager};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::app_state::{ActiveForge, AppState};
-use crate::events;
 
 /// Send a user message to the agent and stream the response back to the
 /// frontend via `stream-event` Tauri events.
@@ -19,10 +18,8 @@ use crate::events;
 /// `attachments` — optional absolute file paths (from dialog / staged uploads).
 /// Files are copied into the workspace `.dscode/uploads/` and described in the
 /// prompt so the agent can open them with tools.
-#[tauri::command]
 pub async fn send_message(
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
+    state: Arc<AppState>,
     session_id: String,
     message: String,
     teams_mode: bool,
@@ -100,10 +97,7 @@ pub async fn send_message(
         };
         if let Ok(Some(new_title)) = sm.maybe_auto_title(&session_id, &title_src) {
             info!(%session_id, %new_title, "session: auto-titled");
-            let _ = app_handle.emit(
-                "session-title-updated",
-                serde_json::json!({ "session_id": session_id, "title": new_title }),
-            );
+            state.event_bus.emit_session_title(&session_id, new_title);
         }
 
         (history, wd, full_message, session_model)
@@ -180,7 +174,7 @@ pub async fn send_message(
     .with_permission_timeout(perm_timeout);
 
     // 5. Spawn the agent loop in a background task with cancellation support.
-    let app_handle_clone = app_handle.clone();
+    let state_clone = state.clone();
     let session_id_clone = session_id.clone();
     let persist_sid = session_id.clone();
 
@@ -215,7 +209,7 @@ pub async fn send_message(
                 biased;
                 // DB2: On cancellation, persist accumulated content before exiting.
                 _ = event_loop_cancel.cancelled() => {
-                    let app_state = app_handle_clone.state::<AppState>();
+                    let app_state = state_clone.clone();
                     let sm_guard = app_state.session_manager.lock().await;
                     if let Some(ref sm) = *sm_guard {
                         let now = chrono::Utc::now().timestamp();
@@ -269,7 +263,7 @@ pub async fn send_message(
                                     // UI-only or end-of-turn; no per-chunk SQLite.
                                 }
                                 StreamEvent::ToolStart { id, name, arguments, .. } => {
-                                    let app_state = app_handle_clone.state::<AppState>();
+                                    let app_state = state_clone.clone();
                                     let sm_guard = app_state.session_manager.lock().await;
                                     if let Some(ref sm) = *sm_guard {
                                         let now = chrono::Utc::now().timestamp();
@@ -309,7 +303,7 @@ pub async fn send_message(
                                     }
                                 }
                                 StreamEvent::ToolEnd { id, result, .. } => {
-                                    let app_state = app_handle_clone.state::<AppState>();
+                                    let app_state = state_clone.clone();
                                     let sm_guard = app_state.session_manager.lock().await;
                                     if let Some(ref sm) = *sm_guard {
                                         let now = chrono::Utc::now().timestamp();
@@ -345,7 +339,7 @@ pub async fn send_message(
                                     }
                                 }
                             }
-                            events::emit_event(&app_handle_clone, ev, &persist_sid);
+                            state_clone.event_bus.emit_stream(&persist_sid, ev.clone());
                         }
                         None => break, // Channel closed, forge finished.
                     }
@@ -370,7 +364,7 @@ pub async fn send_message(
         };
 
         // DB2: Persist final accumulated content after normal completion.
-        let app_state = app_handle_clone.state::<AppState>();
+        let app_state = state_clone.clone();
         let sm_guard = app_state.session_manager.lock().await;
         if let Some(ref sm) = *sm_guard {
             let now = chrono::Utc::now().timestamp();
@@ -421,9 +415,8 @@ pub async fn send_message(
 /// Abort the forge task for a specific session.
 ///
 /// Cancels only that session's agent turn; other concurrent sessions continue.
-#[tauri::command]
 pub async fn abort(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     session_id: String,
 ) -> Result<(), String> {
     info!(%session_id, "chat: abort requested");
@@ -445,8 +438,7 @@ pub async fn abort(
 }
 
 /// List all registered tools (built-in + MCP).
-#[tauri::command]
-pub async fn list_tools(state: tauri::State<'_, AppState>) -> Result<Vec<ToolInfo>, String> {
+pub async fn list_tools(state: Arc<AppState>) -> Result<Vec<ToolInfo>, String> {
     Ok(state
         .tool_registry
         .list_tools_detailed()
@@ -462,7 +454,6 @@ pub struct ToolInfo { pub name: String, pub description: String }
 /// Scans DS Code + Claude + agents.sh + project skill directories.
 /// Shows every package path (same name under different roots appears multiple times)
 /// so each copy can be deleted independently.
-#[tauri::command]
 pub async fn list_skills() -> Result<Vec<SkillInfo>, String> {
     let mut loader = dscode_core::extensions::skills::SkillLoader::new();
     let count = loader
@@ -537,7 +528,6 @@ pub struct SkillFileInput {
 
 /// Create or update a skill package.
 /// `triggers` optional; `files` optional bundled scripts/docs.
-#[tauri::command]
 pub async fn save_skill(
     name: String,
     description: String,
@@ -573,7 +563,6 @@ pub async fn save_skill(
 }
 
 /// Write a single file into an existing skill package (scripts/references/assets).
-#[tauri::command]
 pub async fn write_skill_file(
     skill_name: String,
     relative_path: String,
@@ -588,7 +577,6 @@ pub async fn write_skill_file(
 }
 
 /// Reveal the skills root directory path (for Finder / file manager).
-#[tauri::command]
 pub async fn skills_dir() -> Result<String, String> {
     Ok(dscode_core::extensions::skills::SkillLoader::default_skills_dir()
         .display()
@@ -597,7 +585,6 @@ pub async fn skills_dir() -> Result<String, String> {
 
 /// Install a third-party skill package from GitHub / skills.sh.
 /// Spec: `owner/repo` or `owner/repo/skill-path`.
-#[tauri::command]
 pub async fn install_skill_package(package: String) -> Result<String, String> {
     info!(%package, "skills: install package");
     let report =
@@ -606,9 +593,8 @@ pub async fn install_skill_package(package: String) -> Result<String, String> {
 }
 
 /// Approve a pending dangerous-command permission request (Safe mode).
-#[tauri::command]
 pub async fn approve_permission(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     request_id: String,
 ) -> Result<(), String> {
     info!(%request_id, "permission: approve");
@@ -616,9 +602,8 @@ pub async fn approve_permission(
 }
 
 /// Deny a pending dangerous-command permission request.
-#[tauri::command]
 pub async fn deny_permission(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     request_id: String,
 ) -> Result<(), String> {
     info!(%request_id, "permission: deny");
@@ -627,9 +612,8 @@ pub async fn deny_permission(
 
 /// Stage raw file bytes (paste / drag from webview) into session uploads.
 /// Returns absolute path for use in `send_message` attachments.
-#[tauri::command]
 pub async fn stage_upload(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     session_id: String,
     name: String,
     base64_data: String,
@@ -671,7 +655,6 @@ pub async fn stage_upload(
 ///
 /// Prefer `root` (absolute package path from list_skills) so multi-path skills
 /// under ~/.claude/skills etc. can be removed — not only ~/.dscode/skills.
-#[tauri::command]
 pub async fn delete_skill(name: String, root: Option<String>) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() || name.contains("..") {
@@ -699,16 +682,15 @@ pub async fn delete_skill(name: String, root: Option<String>) -> Result<String, 
 /// channel and emits `task-notification` Tauri events to the frontend for each
 /// task start, progress, and completion. The frontend should call this once at
 /// startup to enable push-based task monitoring.
-#[tauri::command]
 pub async fn subscribe_task_events(
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
+    state: Arc<AppState>,
 ) -> Result<(), String> {
     let mut rx = state.task_manager.subscribe();
+    let bus = state.event_bus.clone();
 
     tokio::spawn(async move {
         while let Ok(notification) = rx.recv().await {
-            let _ = app_handle.emit("task-notification", &notification);
+            bus.emit_task_notification(notification);
         }
     });
 
@@ -716,7 +698,6 @@ pub async fn subscribe_task_events(
 }
 
 /// Stop a running teams sub-agent by id (Teams v2 control plane).
-#[tauri::command]
 pub async fn stop_team_agent(session_id: String, agent_id: String) -> Result<bool, String> {
     if let Some(cp) = dscode_core::teams::global_control_planes()
         .get(&session_id)
@@ -729,7 +710,6 @@ pub async fn stop_team_agent(session_id: String, agent_id: String) -> Result<boo
 }
 
 /// Nudge a running teams sub-agent with extra instruction text.
-#[tauri::command]
 pub async fn nudge_team_agent(
     session_id: String,
     agent_id: String,

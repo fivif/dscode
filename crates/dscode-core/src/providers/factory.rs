@@ -2,6 +2,7 @@
 
 use super::anthropic::AnthropicProvider;
 use super::openai::OpenAiProvider;
+use super::responses::ResponsesProvider;
 use super::trait_def::{LlmProvider, ProviderError};
 use crate::config::settings::Config;
 
@@ -9,6 +10,7 @@ use crate::config::settings::Config;
 ///
 /// Routing rules:
 /// - `anthropic/*` or `claude-*` → native Anthropic Messages API
+/// - `api_format = "responses"` channel → OpenAI Responses API (DeepSeek /responses)
 /// - everything else (DeepSeek / OpenAI / Ollama / custom) → OpenAI-compatible
 pub fn create_provider(model: &str, conf: &Config) -> Result<Box<dyn LlmProvider>, ProviderError> {
     let pc = conf
@@ -23,8 +25,12 @@ pub fn create_provider(model: &str, conf: &Config) -> Result<Box<dyn LlmProvider
         || model.starts_with("claude-")
         || pc.base_url.contains("anthropic.com");
 
+    let use_responses = pc.api_format.trim().eq_ignore_ascii_case("responses");
+
     if is_anthropic {
         Ok(Box::new(AnthropicProvider::from_config(model, conf)))
+    } else if use_responses {
+        Ok(Box::new(ResponsesProvider::from_config(model, conf)))
     } else {
         Ok(Box::new(OpenAiProvider::from_config(model, conf)))
     }

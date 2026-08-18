@@ -127,10 +127,24 @@ impl TaskManager {
         });
 
         tokio::spawn(async move {
-            let mut builder = Command::new("bash");
+            // Windows: cmd.exe /C (no bash by default); Unix: bash -c.
+            #[cfg(windows)]
+            let (shell, shell_args) = {
+                let mut args: Vec<std::ffi::OsString> = Vec::new();
+                args.push("/C".into());
+                args.push(command.clone().into());
+                (std::ffi::OsString::from("cmd.exe"), args)
+            };
+            #[cfg(not(windows))]
+            let (shell, shell_args) = {
+                let mut args: Vec<std::ffi::OsString> = Vec::new();
+                args.push("-c".into());
+                args.push(command.clone().into());
+                (std::ffi::OsString::from("bash"), args)
+            };
+            let mut builder = Command::new(&shell);
             builder
-                .arg("-c")
-                .arg(&command)
+                .args(&shell_args)
                 .current_dir(&working_dir)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

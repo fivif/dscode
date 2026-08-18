@@ -76,7 +76,7 @@ impl ErrorWithholder {
                     || lower.contains("529")
             }
             // Parse errors and missing keys are permanent — don't retry.
-            ProviderError::Parse(_) | ProviderError::NoApiKey => false,
+            ProviderError::Parse(_) | ProviderError::NoApiKey | ProviderError::StreamInterrupted(_) => false,
         }
     }
 

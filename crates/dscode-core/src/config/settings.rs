@@ -363,6 +363,10 @@ pub struct ProviderConfig {
     /// Last selected model id for this channel (optional UI hint / fallback).
     #[serde(default)]
     pub model: String,
+    /// API wire format for this channel: "" (empty) = OpenAI-compatible Chat
+    /// Completions; "responses" = OpenAI Responses API (e.g. DeepSeek /responses).
+    #[serde(default)]
+    pub api_format: String,
 }
 
 impl ProviderConfig {

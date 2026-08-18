@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { sendMessage as tauriSendMessage, abort as tauriAbort, getSession } from '@/lib/tauri';
 import type { Message, StreamEvent, ToolCallRecord, ThinkingBlock, FactRecord, TeamAgent, PlanChoice } from '@/lib/types';
 import { genId } from '@/lib/types';
+import { useSessionStore } from '@/stores/sessionStore';
 
 interface ActiveStream { sessionId: string; msgId: string; text: string; thinking: ThinkingBlock[]; toolCalls: ToolCallRecord[]; facts: FactRecord[]; }
 
@@ -1122,6 +1123,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
               },
             };
           });
+          // Keep sidebar group in sync with latest activity (e.g. 昨天 → 今天).
+          useSessionStore.getState().touchSession(sessionId);
           break;
         }
       }
@@ -1209,9 +1212,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
           kind: 'binary' as const,
         })),
       };
+      // Move session into "今天" immediately on activity (DB also bumps updated_at).
+      useSessionStore.getState().touchSession(sid);
       get().startStream(sid, userMsg);
       try {
         await tauriSendMessage(sid, content, teams, paths.length ? paths : undefined);
+        // Re-touch after turn starts so late-night sessions still land in "today"
+        // if the request crossed midnight (rare) or list was reloaded mid-flight.
+        useSessionStore.getState().touchSession(sid);
       } catch (e: any) {
         get().endStream(String(e), sid);
       }
@@ -1237,6 +1245,7 @@ function applyBackgroundEvent(
   sessionId: string,
   event: StreamEvent,
 ) {
+  let touchAfter = false;
   set((s) => {
     const buf = { ...(s.sessionBuffers[sessionId] || emptyBuffer()) };
     let st = buf._stream;
@@ -1512,6 +1521,7 @@ function applyBackgroundEvent(
       case 'complete': {
         if (st) {
           const messages = finalizeStreamMessages(buf.messages, st);
+          touchAfter = true;
           return write({
             ...buf,
             messages,
@@ -1526,4 +1536,8 @@ function applyBackgroundEvent(
         return s;
     }
   });
+  // Sidebar: keep grouping by last activity even for background sessions.
+  if (touchAfter || event.type === 'tool_start' || event.type === 'token') {
+    useSessionStore.getState().touchSession(sessionId);
+  }
 }

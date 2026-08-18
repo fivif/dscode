@@ -1,21 +1,22 @@
 //! Built-in web tools:
 //! - **do_web_fetch** — GET a public URL, strip HTML, return text
-//! - **do_web_search** — public web search (Bing RSS primary + JSON fallbacks)
+//! - **do_web_search** — Bing web search (title/URL/snippet)
+//! - **do_deep_search** — concurrent multi-query research with full-text fetch
 //!
 //! When a proxy URL is configured, the agent may set `use_proxy` per call
 //! (Settings `web_use_proxy` / `global` are the default when omitted).
-//!
-//! Note: DuckDuckGo HTML SERP is often bot-blocked (HTTP 202 empty). Search
-//! uses Bing RSS + Wikipedia OpenSearch which work over the same proxy path
-//! as `do_web_fetch`.
 
 use async_trait::async_trait;
+use base64::Engine;
+use futures::stream::{self, StreamExt};
 use regex::Regex;
 use reqwest::Client;
 use std::time::Duration;
 
 use crate::agent::stream::StreamEvent;
 use crate::config::settings::Config;
+use crate::tools::feeds::DoRssRead;
+use crate::tools::github::DoGithubSearch;
 use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 
 const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
@@ -24,7 +25,7 @@ const MAX_SEARCH_RESULTS: usize = 10;
 
 // ── proxy helpers ──────────────────────────────────────────────────────────
 
-fn proxy_configured_url() -> Option<String> {
+pub(crate) fn proxy_configured_url() -> Option<String> {
     Config::load().ok().and_then(|c| {
         if c.proxy.is_configured() {
             Some(c.proxy.url.trim().to_string())
@@ -56,7 +57,7 @@ fn resolve_use_proxy(args: &serde_json::Value) -> (bool, Option<String>) {
     }
 }
 
-fn web_client_for_args(args: &serde_json::Value) -> Result<(Client, Option<String>), ToolError> {
+pub(crate) fn web_client_for_args(args: &serde_json::Value) -> Result<(Client, Option<String>), ToolError> {
     let (_want, proxy) = resolve_use_proxy(args);
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -79,7 +80,7 @@ fn web_client_for_args(args: &serde_json::Value) -> Result<(Client, Option<Strin
     Ok((client, proxy))
 }
 
-fn proxy_note(proxy: &Option<String>, explicit: Option<bool>) -> String {
+pub(crate) fn proxy_note(proxy: &Option<String>, explicit: Option<bool>) -> String {
     match proxy {
         Some(u) => {
             let display = u.split('@').last().unwrap_or(u);
@@ -99,7 +100,7 @@ fn proxy_note(proxy: &Option<String>, explicit: Option<bool>) -> String {
     }
 }
 
-fn use_proxy_param_schema() -> serde_json::Value {
+pub(crate) fn use_proxy_param_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "boolean",
         "description": "If true, use the user-configured proxy (Settings). If false, direct. \
@@ -161,30 +162,6 @@ fn html_entities_basic(s: &str) -> String {
         .replace("&#39;", "'")
         .replace("&#x27;", "'")
         .replace("&nbsp;", " ")
-}
-
-fn url_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.as_bytes() {
-        match *b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char)
-            }
-            b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-fn has_cjk(s: &str) -> bool {
-    s.chars().any(|c| {
-        let u = c as u32;
-        (0x4E00..=0x9FFF).contains(&u)
-            || (0x3400..=0x4DBF).contains(&u)
-            || (0x3040..=0x30FF).contains(&u)
-            || (0xAC00..=0xD7AF).contains(&u)
-    })
 }
 
 // ── do_web_fetch ───────────────────────────────────────────────────────────
@@ -588,211 +565,140 @@ fn emit_progress(ctx: &ToolContext, chunk: impl Into<String>) {
     });
 }
 
-fn parse_rss_items(xml: &str, limit: usize, source: &str) -> Vec<SearchHit> {
-    let re_item = Regex::new(r"(?is)<item>(.*?)</item>").unwrap();
-    let re_title = Regex::new(r"(?is)<title>(.*?)</title>").unwrap();
-    let re_link = Regex::new(r"(?is)<link>(.*?)</link>").unwrap();
-    let re_desc = Regex::new(r"(?is)<description>(.*?)</description>").unwrap();
-    let re_cdata = Regex::new(r"(?is)<!\[CDATA\[(.*?)\]\]>").unwrap();
+// ── Bing web search (free, no key, operator-aware) ────────────────────────
+//
+// Scrapes the public Bing SERP (https://www.bing.com/search). Precision comes
+// from passing the query verbatim so Bing advanced operators work
+// (site: filetype: intitle: -exclude "phrase" OR), locking market/language via
+// mkt/setlang/cc, and parsing only real organic <li class="b_algo"> results —
+// decoding Bing's /ck/a redirect links back to the real destination URL.
 
-    let strip = |s: &str| -> String {
-        let s = re_cdata
-            .captures(s)
-            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
-            .unwrap_or_else(|| s.to_string());
-        let re_tags = Regex::new(r"(?is)<[^>]+>").unwrap();
-        html_entities_basic(&re_tags.replace_all(&s, " "))
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
+const BING_SEARCH_URL: &str = "https://www.bing.com/search";
+const BING_TIMEOUT: Duration = Duration::from_secs(20);
+const BING_MAX_RETRIES: u32 = 2;
+const BING_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+/// Decode a Bing `/ck/a?...&u=a1<base64url>` redirect into the real URL.
+/// Non-redirect http(s) links pass through unchanged.
+fn bing_decode_url(href: &str) -> Option<String> {
+    if !href.contains("/ck/a") {
+        return (href.starts_with("http://") || href.starts_with("https://"))
+            .then(|| href.to_string());
+    }
+    let u = href.split("u=").nth(1)?.split('&').next()?;
+    // Observed payload is `a1<url-safe base64, no padding>` — the leading `a1`
+    // is a redirect marker, not part of the encoded URL.
+    let payload = u.strip_prefix("a1").unwrap_or(u);
+    let pad = "=".repeat((4 - payload.len() % 4) % 4);
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&format!("{payload}{pad}"))
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Strip HTML tags + decode basic entities from a Bing result fragment.
+fn bing_clean(s: &str, tag_re: &Regex) -> String {
+    html_entities_basic(&tag_re.replace_all(s, "")).trim().to_string()
+}
+
+/// Parse Bing's SERP HTML into clean organic [`SearchHit`]s.
+fn bing_parse_html(html: &str, limit: usize) -> Vec<SearchHit> {
+    let block_re = Regex::new(r#"<li class="b_algo".*?(?=<li class="b_algo"|</ol>)"#).unwrap();
+    let title_re = Regex::new(r#"<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap();
+    let snip_re = Regex::new(r#"<p[^>]*>(.*?)</p>"#).unwrap();
+    let tag_re = Regex::new(r"<[^>]+>").unwrap();
 
     let mut hits = Vec::new();
-    for cap in re_item.captures_iter(xml) {
+    for block in block_re.find_iter(html) {
         if hits.len() >= limit {
             break;
         }
-        let block = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let title = re_title
-            .captures(block)
-            .and_then(|c| c.get(1).map(|m| strip(m.as_str())))
-            .unwrap_or_default();
-        let link = re_link
-            .captures(block)
-            .and_then(|c| c.get(1).map(|m| strip(m.as_str())))
-            .unwrap_or_default();
-        let snippet = re_desc
-            .captures(block)
-            .and_then(|c| c.get(1).map(|m| strip(m.as_str())))
-            .unwrap_or_default();
-        if title.is_empty() || !(link.starts_with("http://") || link.starts_with("https://")) {
+        let b = block.as_str();
+        let Some(caps) = title_re.captures(b) else {
+            continue;
+        };
+        let href = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let Some(url) = bing_decode_url(href) else {
+            continue;
+        };
+        // Drop Bing's own pages and anything without a real title.
+        if url.contains("bing.com") {
             continue;
         }
+        let title = bing_clean(caps.get(2).map(|m| m.as_str()).unwrap_or(""), &tag_re);
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = snip_re
+            .captures(b)
+            .map(|c| bing_clean(c.get(1).map(|m| m.as_str()).unwrap_or(""), &tag_re))
+            .unwrap_or_default();
+
         hits.push(SearchHit {
             title,
-            url: link,
-            snippet: snippet.chars().take(240).collect(),
-            source: source.into(),
+            url,
+            snippet,
+            source: "bing".into(),
         });
     }
     hits
 }
 
-/// Bing RSS works through normal HTTP clients + proxy (unlike DDG HTML which is bot-blocked).
-async fn search_bing_rss(client: &Client, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
-    let q = url_encode(query);
-    // Region: Chinese queries → zh-CN market; else en-US
-    let (mkt, setlang, cc) = if has_cjk(query) {
-        ("zh-CN", "zh-hans", "CN")
-    } else {
-        ("en-US", "en-us", "US")
-    };
-    let url = format!(
-        "https://www.bing.com/search?q={q}&format=rss&setlang={setlang}&cc={cc}&mkt={mkt}"
-    );
+/// One Bing search request (no retry — see [`bing_search`]).
+async fn bing_search_once(
+    client: &Client,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let count = limit.min(10).to_string();
     let resp = client
-        .get(&url)
-        .header("Accept", "application/rss+xml, application/xml, text/xml, */*")
+        .get(BING_SEARCH_URL)
+        .query(&[
+            ("q", query),
+            ("count", count.as_str()),
+            ("setlang", "en-US"),
+            ("mkt", "en-US"),
+            ("cc", "US"),
+        ])
+        .header("User-Agent", BING_UA)
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(BING_TIMEOUT)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("Bing RSS HTTP {}", resp.status()));
+        .map_err(|e| format!("Bing HTTP: {e}"))?;
+
+    let status = resp.status();
+    let html = resp.text().await.map_err(|e| format!("Bing body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Bing HTTP {status}"));
     }
-    let body = resp.text().await.map_err(|e| e.to_string())?;
-    if !body.contains("<item>") {
-        return Err("Bing RSS returned no <item> entries".into());
-    }
-    let hits = parse_rss_items(&body, limit, "bing");
+    let hits = bing_parse_html(&html, limit);
     if hits.is_empty() {
-        Err("Bing RSS parse empty".into())
+        Err("Bing: no organic results".into())
     } else {
         Ok(hits)
     }
 }
 
-async fn search_wikipedia(
+/// Retry-aware Bing search — a transient network/proxy blip never kills it.
+async fn bing_search(
     client: &Client,
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>, String> {
-    let lang = if has_cjk(query) { "zh" } else { "en" };
-    let url = format!(
-        "https://{lang}.wikipedia.org/w/api.php?action=opensearch&search={}&limit={limit}&namespace=0&format=json",
-        url_encode(query)
-    );
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("Wikipedia HTTP {}", resp.status()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let titles = v.get(1).and_then(|x| x.as_array()).cloned().unwrap_or_default();
-    let descs = v.get(2).and_then(|x| x.as_array()).cloned().unwrap_or_default();
-    let urls = v.get(3).and_then(|x| x.as_array()).cloned().unwrap_or_default();
-    let mut hits = Vec::new();
-    for i in 0..titles.len().min(limit) {
-        let title = titles[i].as_str().unwrap_or("").trim();
-        let page = urls.get(i).and_then(|u| u.as_str()).unwrap_or("").trim();
-        if title.is_empty() || page.is_empty() {
-            continue;
+    let mut last_err = String::new();
+    for attempt in 0..BING_MAX_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
         }
-        let snippet = descs
-            .get(i)
-            .and_then(|d| d.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        hits.push(SearchHit {
-            title: title.to_string(),
-            url: page.to_string(),
-            snippet,
-            source: format!("wikipedia/{lang}"),
-        });
-    }
-    if hits.is_empty() {
-        Err("Wikipedia: no results".into())
-    } else {
-        Ok(hits)
-    }
-}
-
-async fn search_ddg_instant(
-    client: &Client,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<SearchHit>, String> {
-    let url = format!(
-        "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-        url_encode(query)
-    );
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("DDG Instant HTTP {}", resp.status()));
-    }
-    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let mut hits = Vec::new();
-
-    let abs = v.get("AbstractText").and_then(|t| t.as_str()).unwrap_or("");
-    let abs_url = v.get("AbstractURL").and_then(|t| t.as_str()).unwrap_or("");
-    let heading = v
-        .get("Heading")
-        .and_then(|t| t.as_str())
-        .unwrap_or("Abstract");
-    if !abs.is_empty() && abs_url.starts_with("http") {
-        hits.push(SearchHit {
-            title: heading.to_string(),
-            url: abs_url.to_string(),
-            snippet: abs.chars().take(240).collect(),
-            source: "ddg-instant".into(),
-        });
-    }
-
-    if let Some(rel) = v.get("RelatedTopics").and_then(|t| t.as_array()) {
-        fn walk(arr: &[serde_json::Value], hits: &mut Vec<SearchHit>, limit: usize) {
-            for item in arr {
-                if hits.len() >= limit {
-                    return;
-                }
-                if let Some(topics) = item.get("Topics").and_then(|t| t.as_array()) {
-                    walk(topics, hits, limit);
-                    continue;
-                }
-                let text = item.get("Text").and_then(|t| t.as_str()).unwrap_or("");
-                let first = item
-                    .get("FirstURL")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                if text.is_empty() || !first.starts_with("http") {
-                    continue;
-                }
-                let title = text.split(" - ").next().unwrap_or(text).trim();
-                hits.push(SearchHit {
-                    title: title.to_string(),
-                    url: first.to_string(),
-                    snippet: text.chars().take(200).collect(),
-                    source: "ddg-instant".into(),
-                });
-            }
+        match bing_search_once(client, query, limit).await {
+            Ok(hits) => return Ok(hits),
+            Err(e) => last_err = e,
         }
-        walk(rel, &mut hits, limit);
     }
-
-    if hits.is_empty() {
-        Err("DDG Instant: no results".into())
-    } else {
-        hits.truncate(limit);
-        Ok(hits)
-    }
+    Err(format!(
+        "Bing search failed after {BING_MAX_RETRIES} tries: {last_err}"
+    ))
 }
 
 fn dedupe_hits(hits: Vec<SearchHit>, max: usize) -> Vec<SearchHit> {
@@ -817,68 +723,29 @@ async fn public_web_search(
     limit: usize,
     ctx: &ToolContext,
 ) -> Result<(Vec<SearchHit>, Vec<String>), String> {
-    let mut all = Vec::new();
     let mut logs = Vec::new();
 
-    // 1) Bing RSS — primary (works with same proxy as fetch)
-    emit_progress(ctx, "  ▸ Bing …\n");
-    match search_bing_rss(client, query, limit).await {
+    // Bing organic search — primary (free, no key, operator-aware)
+    emit_progress(ctx, "  ▸ Bing 搜索 …\n");
+    let hits = match bing_search(client, query, limit).await {
         Ok(hits) => {
             emit_progress(ctx, format!("  ✓ Bing · {} 条\n", hits.len()));
             logs.push(format!("✓ Bing: {}", hits.len()));
-            all.extend(hits);
+            hits
         }
         Err(e) => {
             emit_progress(
                 ctx,
-                format!("  ✗ Bing · {}\n", e.chars().take(100).collect::<String>()),
+                format!("  ✗ Bing · {}\n", e.chars().take(120).collect::<String>()),
             );
             logs.push(format!("✗ Bing: {e}"));
+            return Err(e);
         }
-    }
+    };
 
-    // 2) Wikipedia — encyclopedia / entities
-    emit_progress(ctx, "  ▸ Wikipedia …\n");
-    match search_wikipedia(client, query, 4.min(limit)).await {
-        Ok(hits) => {
-            emit_progress(ctx, format!("  ✓ Wikipedia · {} 条\n", hits.len()));
-            logs.push(format!("✓ Wikipedia: {}", hits.len()));
-            all.extend(hits);
-        }
-        Err(e) => {
-            emit_progress(
-                ctx,
-                format!("  ✗ Wikipedia · {}\n", e.chars().take(80).collect::<String>()),
-            );
-            logs.push(format!("✗ Wikipedia: {e}"));
-        }
-    }
-
-    // 3) DDG Instant Answer JSON — knowledge cards (not full SERP, but useful)
-    if all.len() < limit {
-        emit_progress(ctx, "  ▸ DDG Instant …\n");
-        match search_ddg_instant(client, query, 4.min(limit)).await {
-            Ok(hits) => {
-                emit_progress(ctx, format!("  ✓ DDG Instant · {} 条\n", hits.len()));
-                logs.push(format!("✓ DDG Instant: {}", hits.len()));
-                all.extend(hits);
-            }
-            Err(e) => {
-                emit_progress(
-                    ctx,
-                    format!(
-                        "  ✗ DDG Instant · {}\n",
-                        e.chars().take(80).collect::<String>()
-                    ),
-                );
-                logs.push(format!("✗ DDG Instant: {e}"));
-            }
-        }
-    }
-
-    let merged = dedupe_hits(all, limit);
+    let merged = dedupe_hits(hits, limit);
     if merged.is_empty() {
-        Err(format!("all backends empty. Logs:\n{}", logs.join("\n")))
+        Err("Bing: no results after dedupe".into())
     } else {
         Ok((merged, logs))
     }
@@ -891,7 +758,9 @@ impl Tool for DoWebSearch {
     }
 
     fn description(&self) -> &str {
-        "Search the public web (Bing + Wikipedia + knowledge cards). Returns title/URL/snippet. \
+        "Web search powered by Bing (free, no API key). \
+         Returns title/URL/snippet from Bing's organic results. \
+         Supports Bing operators: site:, filetype:, intitle:, -exclude, \"phrase\", OR. \
          Use when you need links and have no URL yet; then do_web_fetch the best URL. \
          Optional use_proxy — prefer true if direct access fails (same proxy as do_web_fetch)."
     }
@@ -985,6 +854,268 @@ impl Tool for DoWebSearch {
     }
 }
 
+// ── Deep concurrent search: multi-query × full-text (Bing + Jina) ───────
+//
+// One Bing search per query (Jina Reader for full text),
+// all queries run concurrently (buffer_unordered). This is safe against
+// shared-session races and lets the free tier breathe.
+
+#[derive(Debug, Clone)]
+struct DeepItem {
+    title: String,
+    url: String,
+    snippet: String,
+    full: String,
+}
+
+/// Read a URL as clean markdown via Jina Reader (https://r.jina.ai, free, no key).
+/// Strips the leading metadata block; returns Err on any failure so callers can
+/// fall back to another channel (multi-backend routing, Agent-Reach style).
+async fn jina_fetch(client: &Client, url: &str, max_chars: usize) -> Result<String, String> {
+    let jina_url = format!("https://r.jina.ai/{url}");
+    let resp = client
+        .get(&jina_url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        )
+        .header("Accept", "text/plain")
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await
+        .map_err(|e| format!("Jina Reader HTTP: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Jina Reader body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Jina Reader HTTP {status}"));
+    }
+    // Jina prepends metadata (Title / URL Source / Published Time / Markdown Content:)
+    let body = match text.find("Markdown Content:") {
+        Some(idx) => text[idx + "Markdown Content:".len()..].trim().to_string(),
+        None => text,
+    };
+    if body.trim().is_empty() {
+        return Err("Jina Reader: empty content".into());
+    }
+    Ok(body.chars().take(max_chars).collect())
+}
+
+/// One Bing query: search + fetch top-N full texts (Jina Reader).
+async fn bing_deep_query(
+    client: &Client,
+    query: &str,
+    per_query: usize,
+    depth: usize,
+    max_chars: usize,
+) -> Result<(Vec<DeepItem>, usize), String> {
+    // search
+    let hits = bing_search(client, query, per_query).await?;
+
+    // full text: Jina Reader (free, no session, one GET per URL)
+    let urls: Vec<String> = hits.iter().take(depth).map(|h| h.url.clone()).collect();
+    let mut fetches: Vec<(String, String)> = Vec::new();
+    if !urls.is_empty() {
+        let jina_results: Vec<(String, Option<String>)> = stream::iter(urls.clone())
+            .map(|u| {
+                let client = client.clone();
+                async move {
+                    let r = jina_fetch(&client, &u, max_chars).await;
+                    (u, r.ok())
+                }
+            })
+            .buffer_unordered(depth.min(4))
+            .collect()
+            .await;
+        for (u, t) in jina_results {
+            if let Some(t) = t {
+                fetches.push((u, t));
+            }
+        }
+    }
+
+    let items = hits
+        .into_iter()
+        .map(|h| {
+            let full = fetches
+                .iter()
+                .find(|(u, _)| {
+                    u.trim_end_matches('/')
+                        .eq_ignore_ascii_case(h.url.trim_end_matches('/'))
+                })
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default();
+            DeepItem {
+                title: h.title,
+                url: h.url,
+                snippet: h.snippet,
+                full,
+            }
+        })
+        .collect();
+    Ok((items, fetches.len()))
+}
+
+/// Deep concurrent research: run many queries in parallel, fetch full page
+/// text for the top results of each, and merge everything into one report.
+pub struct DoDeepSearch;
+
+impl DoDeepSearch {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DoDeepSearch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for DoDeepSearch {
+    fn name(&self) -> &str {
+        "do_deep_search"
+    }
+
+    fn description(&self) -> &str {
+        "Deep concurrent web research (Bing + Jina): run multiple search queries in \
+         parallel, then fetch full page text for the top results of each query. \
+         Use when you need a thorough multi-angle answer backed by real page \
+         content, not just snippets. Split the topic into several specific \
+         `queries`. Optional use_proxy — prefer true if direct access fails."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "One or more specific search queries (split the topic into angles)"
+                },
+                "per_query": {
+                    "type": "integer",
+                    "description": "Results per query (default 5, max 10)"
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "How many top results per query get full-text fetch (default 2, max 3)"
+                },
+                "concurrency": {
+                    "type": "integer",
+                    "description": "Max parallel queries (default 4, max 8)"
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Max full-text chars per page (default 3000)"
+                },
+                "use_proxy": use_proxy_param_schema()
+            },
+            "required": ["queries"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let queries: Vec<String> = args["queries"]
+            .as_array()
+            .ok_or_else(|| ToolError::MissingParameter("queries".into()))?
+            .iter()
+            .filter_map(|q| q.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if queries.is_empty() {
+            return Ok(ToolResult::err("", "queries is empty"));
+        }
+        let per_query = args["per_query"].as_u64().unwrap_or(5).clamp(1, 10) as usize;
+        let depth = args["depth"].as_u64().unwrap_or(2).clamp(1, 3) as usize;
+        let concurrency = args["concurrency"].as_u64().unwrap_or(4).clamp(1, 8) as usize;
+        let max_chars = args["max_chars"].as_u64().unwrap_or(3000).clamp(500, 8000) as usize;
+
+        let explicit = args.get("use_proxy").and_then(|v| v.as_bool());
+        let (client, proxy) = web_client_for_args(&args)?;
+        let net = proxy_note(&proxy, explicit);
+
+        emit_progress(
+            ctx,
+            format!(
+                "⟳ 深度并发搜索 · {net}\n  {} 个查询 · 并发 {} · 每查询 {} 条 / 深挖 {} 篇全文\n",
+                queries.len(),
+                concurrency,
+                per_query,
+                depth
+            ),
+        );
+
+        let client2 = client.clone();
+        let results: Vec<(usize, String, Result<(Vec<DeepItem>, usize), String>)> =
+            stream::iter(queries.iter().cloned().enumerate())
+                .map(move |(i, q)| {
+                    let client = client2.clone();
+                    async move {
+                        let r = bing_deep_query(&client, &q, per_query, depth, max_chars).await;
+                        (i, q, r)
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+        // re-order by original query index
+        let mut by_idx: Vec<Option<(String, Result<(Vec<DeepItem>, usize), String>)>> =
+            vec![None; queries.len()];
+        for (i, q, r) in results {
+            by_idx[i] = Some((q, r));
+        }
+
+        let mut out = String::from("Deep Search\n");
+        out.push_str(&format!("Network: {net}\nQueries ({}):\n", queries.len()));
+        for (i, q) in queries.iter().enumerate() {
+            out.push_str(&format!("  {}. \"{q}\"\n", i + 1));
+        }
+
+        let mut ok_count = 0usize;
+        let mut item_count = 0usize;
+        let mut full_count = 0usize;
+        for (i, q) in queries.iter().enumerate() {
+            match &by_idx[i] {
+                Some((_, Ok((items, n_full)))) => {
+                    ok_count += 1;
+                    item_count += items.len();
+                    full_count += n_full;
+                    out.push_str(&format!("\n── Query {}: \"{q}\" — {} results, {n_full} full texts\n", i + 1, items.len()));
+                    for (j, it) in items.iter().enumerate() {
+                        out.push_str(&format!("[{}] {}\n    {}\n    {}\n", j + 1, it.title, it.url, it.snippet));
+                        if !it.full.is_empty() {
+                            let head: String = it.full.chars().take(600).collect();
+                            out.push_str(&format!("    📄 {}", head.replace('\n', "\n    ")));
+                            out.push('\n');
+                        }
+                    }
+                }
+                Some((_, Err(e))) => {
+                    out.push_str(&format!("\n── Query {}: \"{q}\" ❌ {e}\n", i + 1));
+                }
+                None => {}
+            }
+        }
+        out.push_str(&format!(
+            "\nSummary: {ok_count}/{} queries OK · {item_count} results · {full_count} full texts\n\
+             Tip: follow up with do_web_fetch for any single page.",
+            queries.len()
+        ));
+        Ok(ToolResult::ok(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,33 +1125,6 @@ mod tests {
         let t = html_to_text("<html><script>x</script><p>Hello <b>world</b></p></html>");
         assert!(t.contains("Hello"));
         assert!(t.contains("world"));
-    }
-
-    #[test]
-    fn parse_rss_basic() {
-        let xml = r#"<?xml version="1.0"?>
-        <rss><channel>
-          <item>
-            <title>OpenAI News</title>
-            <link>https://openai.com/news</link>
-            <description>Latest from OpenAI</description>
-          </item>
-          <item>
-            <title><![CDATA[GPT-4]]></title>
-            <link>https://openai.com/gpt-4</link>
-            <description><![CDATA[Model update]]></description>
-          </item>
-        </channel></rss>"#;
-        let hits = parse_rss_items(xml, 10, "bing");
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].url, "https://openai.com/news");
-        assert_eq!(hits[1].title, "GPT-4");
-    }
-
-    #[test]
-    fn cjk_detect() {
-        assert!(has_cjk("今日热点"));
-        assert!(!has_cjk("OpenAI news"));
     }
 
     #[test]
@@ -1075,7 +1179,7 @@ async fn private_url_blocked() {
     assert!(!r.success);
 }
 
-/// Live smoke: search via proxy if configured, else direct.
+/// Live smoke: Bing search via proxy if configured, else direct.
 #[tokio::test]
 async fn live_search_bing_smoke() {
     use crate::safety::guard::SafetyGuard;
@@ -1122,10 +1226,8 @@ async fn live_search_bing_smoke() {
     );
     if r.output.contains("https://") {
         assert!(
-            r.output.contains("[bing]")
-                || r.output.contains("[wikipedia")
-                || r.output.contains("[ddg-instant]"),
-            "expected known source tags"
+            r.output.contains("[bing]"),
+            "expected bing source tag"
         );
     }
 }

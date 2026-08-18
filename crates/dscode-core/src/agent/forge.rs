@@ -77,6 +77,21 @@ const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 /// Start tool-loop detection after this many ReAct turns.
 const LOOP_DETECT_FROM_ITERATION: u32 = 5;
 
+/// Tool-call fingerprint: (tool name, hash of name + arguments).
+///
+/// Comparing only tool *names* caused false positives on legitimate
+/// single-tool workflows (e.g. many `do_bash` calls with different commands,
+/// or a compile → fix → recompile cycle). Hashing the arguments means a
+/// repeated call only counts when both the tool AND its parameters are the
+/// same — which is what an actual tool loop looks like.
+fn tool_fingerprint(tc: &ToolCall) -> (String, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tc.function.name.hash(&mut h);
+    tc.function.arguments.hash(&mut h);
+    (tc.function.name.clone(), h.finish())
+}
+
 /// Errors that can occur during the agent loop.
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
@@ -458,9 +473,11 @@ impl Forge {
         // detection only examines messages added during the current run.
         let initial_msg_count = messages.len();
 
-        // F2: Sliding window of tool-call sets (order-independent) from the
-        // last 5 iterations for alternating-pattern stall detection.
-        let mut recent_tool_sets: std::collections::VecDeque<std::collections::BTreeSet<String>> =
+        // F2: Sliding window of tool-call fingerprints (name + args hash) from
+        // the last 5 iterations for alternating-pattern stall detection. Args
+        // are hashed so different parameters are not conflated as a loop.
+        let mut recent_tool_sets:
+            std::collections::VecDeque<std::collections::BTreeSet<(String, u64)>> =
             std::collections::VecDeque::new();
 
         // Transient provider errors + empty model responses: retry with backoff.
@@ -532,11 +549,11 @@ impl Forge {
                 // Only scan messages added during this execute() call (F5).
                 let run_messages = &messages[initial_msg_count..];
                 // Last assistant tool-call set (most recent turn)
-                let current_set: std::collections::BTreeSet<String> = run_messages
+                let current_set: std::collections::BTreeSet<(String, u64)> = run_messages
                     .iter()
                     .rev()
                     .find_map(|m| m.tool_calls.as_ref())
-                    .map(|tc| tc.iter().map(|t| t.function.name.clone()).collect())
+                    .map(|tc| tc.iter().map(tool_fingerprint).collect())
                     .unwrap_or_default();
                 if !current_set.is_empty() {
                     if recent_tool_sets.len() >= 5 {
@@ -544,7 +561,7 @@ impl Forge {
                     }
                     recent_tool_sets.push_back(current_set.clone());
                     let mut counts: std::collections::HashMap<
-                        &std::collections::BTreeSet<String>,
+                        &std::collections::BTreeSet<(String, u64)>,
                         usize,
                     > = std::collections::HashMap::new();
                     for s in recent_tool_sets.iter() {
@@ -552,7 +569,8 @@ impl Forge {
                     }
                     // ≥3 appearances of the same tool-set in the last 5 turns
                     if counts.values().any(|&c| c >= 3) {
-                        let repeated: Vec<String> = current_set.iter().cloned().collect();
+                        let repeated: Vec<String> =
+                            current_set.iter().map(|(name, _)| name.clone()).collect();
                         let _ = event_tx.send(StreamEvent::Token {
                             content: format!(
                                 "\n\n**Tool loop detected** (iteration {iteration}): \
@@ -894,11 +912,12 @@ impl Forge {
             session_id,
             goal,
             self.working_dir.clone(),
+            Some(event_tx),
         )
         .await
         {
             Ok((_session, result)) => {
-                emit_plan_turn(event_tx, &result);
+                emit_plan_turn(event_tx, &result).await;
                 Ok(())
             }
             Err(e) => {
@@ -928,9 +947,12 @@ impl Forge {
             }
         };
 
-        match session.answer_with_llm(&*self.provider, answer).await {
+        match session
+            .answer_with_llm(&*self.provider, answer, Some(event_tx))
+            .await
+        {
             Ok(result) => {
-                emit_plan_turn(event_tx, &result);
+                emit_plan_turn(event_tx, &result).await;
                 Ok(())
             }
             Err(e) => {
@@ -1007,13 +1029,25 @@ impl Forge {
     }
 }
 
-/// Emit plan turn markdown + structured PlanQuestion for button UI.
-fn emit_plan_turn(
+/// Emit plan turn markdown (chunked for progressive UI) + PlanQuestion buttons.
+async fn emit_plan_turn(
     event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     result: &PlanTurnResult,
 ) {
     let md = format_question(result);
-    let _ = event_tx.send(StreamEvent::Token { content: md });
+    // Chunk markdown so the question/PRD appears progressively after status lines.
+    let chars: Vec<char> = md.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + 48).min(chars.len());
+        let chunk: String = chars[i..end].iter().collect();
+        let _ = event_tx.send(StreamEvent::Token { content: chunk });
+        i = end;
+        // Yield so the desktop event loop can paint between chunks.
+        if i < chars.len() {
+            tokio::task::yield_now().await;
+        }
+    }
     if let Some(pq) = plan_question_event(result) {
         let _ = event_tx.send(pq);
     }
@@ -1269,7 +1303,7 @@ pub async fn compress_context(
 /// Remove tool_calls from messages that have no matching tool response.
 /// Validate that messages sent to the provider have intact tool chains.
 /// Returns cloned+fixed messages, logging any issues found.
-fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
+pub fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
     clean_orphaned_tool_calls(&mut messages);
     // Remove consecutive duplicates
     let mut i = 1;
@@ -1293,51 +1327,73 @@ fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> 
     // OpenAI requires a single assistant(tool_calls=[…]) then matching tools.
     merge_consecutive_tool_call_assistants(&mut messages);
 
-    // Sequential tool chain fix: scan left-to-right, track which tool_call_ids
-    // have been declared by assistant(tc) messages. Only allow Tool messages
-    // whose tool_call_id was declared by a PREVIOUS assistant. Remove tool_calls
-    // from assistants that have no following tool messages.
-    let mut pending_tc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut responded_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // First pass: mark which IDs have responses
-    for m in &messages {
+    // Position-aware tool chain pairing.
+    //
+    // Old logic collected ALL tool-response ids up front, then dropped Tool
+    // messages whose id wasn't "declared" by an earlier assistant. When history
+    // was out of order (Tool row before its assistant — SQLite same-second
+    // ordering, compression rebuilds, desktop re-inserts), the Tool message was
+    // dropped while the assistant KEPT its tool_calls → provider 400
+    // "assistant message with 'tool_calls' must be followed by tool messages".
+    //
+    // New logic pairs each declared tool_call_id with the FIRST unused response
+    // that appears AFTER the declaring assistant, without crossing a User/System
+    // turn boundary. Only paired responses are kept, and assistants only keep
+    // tool_calls that were actually paired.
+    let mut resp_pos: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (i, m) in messages.iter().enumerate() {
         if m.role == Role::Tool {
             if let Some(ref id) = m.tool_call_id {
-                responded_ids.insert(id.clone());
+                resp_pos.entry(id.clone()).or_default().push(i);
             }
         }
     }
 
-    // Second pass: sequential validation
-    let mut result = Vec::new();
-    for mut m in messages {
+    // Pair declarations → responses (index-aware, order-preserving).
+    let mut used_resp: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut kept: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
+    for (i, m) in messages.iter().enumerate() {
         if m.role == Role::Assistant {
-            // Track declared tool_call IDs from this assistant
             if let Some(ref tc) = m.tool_calls {
                 for t in tc.iter() {
-                    pending_tc_ids.insert(t.id.clone());
+                    if let Some(poss) = resp_pos.get(&t.id) {
+                        if let Some(&p) = poss
+                            .iter()
+                            .find(|&&p| p > i && !used_resp.contains(&p))
+                        {
+                            // Do not pair across a User/System boundary (new turn).
+                            let crossing = messages[i + 1..p]
+                                .iter()
+                                .any(|mm| mm.role == Role::User || mm.role == Role::System);
+                            if !crossing {
+                                used_resp.insert(p);
+                                kept.insert((i, t.id.clone()));
+                            }
+                        }
+                    }
                 }
             }
-            // Only include tool_calls that will have responses
+        }
+    }
+
+    // Rebuild with only the paired tool chain.
+    let mut result = Vec::new();
+    for (i, m) in messages.into_iter().enumerate() {
+        if m.role == Role::Assistant {
+            let mut m = m;
             if let Some(ref mut tc) = m.tool_calls {
-                tc.retain(|t| responded_ids.contains(&t.id));
+                tc.retain(|t| kept.contains(&(i, t.id.clone())));
                 if tc.is_empty() {
                     m.tool_calls = None;
                 }
             }
             result.push(m);
         } else if m.role == Role::Tool {
-            // Only keep Tool messages whose ID was declared by a previous assistant.
-            // Consume the ID so it can't be reused (OpenAI requires uniqueness).
-            if let Some(ref id) = m.tool_call_id {
-                if pending_tc_ids.remove(id) {
-                    result.push(m);
-                }
+            // Keep only responses that were actually paired with a declaration.
+            if used_resp.contains(&i) {
+                result.push(m);
             }
         } else {
-            // User/System — clear pending tool calls (new conversation turn)
-            pending_tc_ids.clear();
             result.push(m);
         }
     }
@@ -1746,5 +1802,119 @@ mod tool_chain_tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].tool_calls.as_ref().unwrap().len(), 1);
         assert_eq!(msgs[2].tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_drops_out_of_order_tool_chain() {
+        // Regression: Tool response BEFORE its assistant (bad SQLite ordering /
+        // compression rebuild / desktop re-insert) previously produced a 400
+        // "assistant message with 'tool_calls' must be followed by tool messages"
+        // because the Tool msg was dropped while the assistant kept its tool_calls.
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: MessageContent::Text("sys".into()),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("q".into()),
+                ..Default::default()
+            },
+            tool_result("call_x"), // out-of-order: no assistant declared it yet
+            assistant_tc(&["call_x"]),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("done".into()),
+                ..Default::default()
+            },
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        let tc_assts: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert!(
+            tc_assts.is_empty(),
+            "assistant must not keep unpaired tool_calls"
+        );
+        assert_eq!(
+            out.iter().filter(|m| m.role == Role::Tool).count(),
+            0,
+            "orphan tool dropped"
+        );
+        assert!(out.iter().any(|m| {
+            m.role == Role::Assistant
+                && m.content.as_text().map_or(false, |c| c == "done")
+        }));
+    }
+
+    #[test]
+    fn validate_keeps_in_order_tool_chain() {
+        let msgs = vec![
+            assistant_tc(&["a", "b"]),
+            tool_result("a"),
+            tool_result("b"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("answer".into()),
+                ..Default::default()
+            },
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        let tc_assts: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert_eq!(tc_assts.len(), 1);
+        assert_eq!(tc_assts[0].tool_calls.as_ref().unwrap().len(), 2);
+        assert_eq!(out.iter().filter(|m| m.role == Role::Tool).count(), 2);
+    }
+
+    #[test]
+    fn validate_pairs_first_response_only() {
+        // Duplicate responses for one id: only the first (after the assistant)
+        // is paired; the extra Tool message must be dropped.
+        let msgs = vec![
+            assistant_tc(&["a"]),
+            tool_result("a"),
+            tool_result("a"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("answer".into()),
+                ..Default::default()
+            },
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        let tc_assts: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert_eq!(tc_assts.len(), 1);
+        assert_eq!(tc_assts[0].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            out.iter().filter(|m| m.role == Role::Tool).count(),
+            1,
+            "duplicate response dropped"
+        );
+    }
+
+    #[test]
+    fn tool_fingerprint_distinguishes_args() {
+        // Same tool + same args → same fingerprint (real loop).
+        let a = tool_call("1", "do_bash");
+        let b = tool_call("2", "do_bash");
+        assert_eq!(tool_fingerprint(&a), tool_fingerprint(&b));
+
+        // Same tool + DIFFERENT args → different fingerprint (NOT a loop).
+        let mut c = tool_call("3", "do_bash");
+        c.function.arguments = "{\"command\":\"ls\"}".into();
+        let mut d = tool_call("4", "do_bash");
+        d.function.arguments = "{\"command\":\"cargo check\"}".into();
+        assert_ne!(tool_fingerprint(&c), tool_fingerprint(&d));
+
+        // Different tool → different fingerprint.
+        let e = tool_call("5", "do_web_search");
+        assert_ne!(tool_fingerprint(&a), tool_fingerprint(&e));
     }
 }

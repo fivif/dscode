@@ -6,3 +6,5 @@ pub mod background;
 pub mod skill_ops;
 pub mod mcp_ops;
 pub mod web;
+pub mod github;
+pub mod feeds;

@@ -385,6 +385,7 @@ async fn plan_llm_json_parse_unit_path() {
         &[],
         0,
         "Working directory: /tmp\nTop-level: Cargo.toml",
+        None,
     )
     .await
     .expect("llm turn");

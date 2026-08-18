@@ -8,6 +8,7 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::app_state::AppState;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerInfo {
@@ -25,8 +26,7 @@ pub struct McpReloadResult {
 }
 
 /// List configured MCP servers and how many tools they contributed.
-#[tauri::command]
-pub async fn list_mcp_servers(state: tauri::State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
+pub async fn list_mcp_servers(state: Arc<AppState>) -> Result<Vec<McpServerInfo>, String> {
     let configs = load_mcp_server_configs();
     let tools = state.tool_registry.list_tools();
     let mut out = Vec::new();
@@ -58,9 +58,8 @@ pub async fn list_mcp_servers(state: tauri::State<'_, AppState>) -> Result<Vec<M
 }
 
 /// Add an MCP server, persist, and reload tools.
-#[tauri::command]
 pub async fn add_mcp_server(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     name: String,
     command: String,
     args: String,
@@ -89,14 +88,13 @@ pub async fn add_mcp_server(
     save_mcp_servers_file(&servers)?;
     sync_mcp_to_config(&servers)?;
     info!(%name, "MCP server added");
-    reload_mcp_inner(&state).await
+    reload_mcp_inner(state.as_ref()).await
 }
 
 /// Update an existing MCP server (matched by `original_name`).
 /// `name` may rename the server; command/args are replaced.
-#[tauri::command]
 pub async fn update_mcp_server(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     original_name: String,
     name: String,
     command: String,
@@ -140,13 +138,12 @@ pub async fn update_mcp_server(
     save_mcp_servers_file(&servers)?;
     sync_mcp_to_config(&servers)?;
     info!(from = %original, to = %name, "MCP server updated");
-    reload_mcp_inner(&state).await
+    reload_mcp_inner(state.as_ref()).await
 }
 
 /// Remove an MCP server and reload.
-#[tauri::command]
 pub async fn remove_mcp_server(
-    state: tauri::State<'_, AppState>,
+    state: Arc<AppState>,
     name: String,
 ) -> Result<McpReloadResult, String> {
     let mut servers = load_mcp_server_configs();
@@ -158,13 +155,12 @@ pub async fn remove_mcp_server(
     save_mcp_servers_file(&servers)?;
     sync_mcp_to_config(&servers)?;
     info!(%name, "MCP server removed");
-    reload_mcp_inner(&state).await
+    reload_mcp_inner(state.as_ref()).await
 }
 
 /// Reconnect all MCP servers and re-register tools.
-#[tauri::command]
-pub async fn reload_mcp(state: tauri::State<'_, AppState>) -> Result<McpReloadResult, String> {
-    reload_mcp_inner(&state).await
+pub async fn reload_mcp(state: Arc<AppState>) -> Result<McpReloadResult, String> {
+    reload_mcp_inner(state.as_ref()).await
 }
 
 async fn reload_mcp_inner(state: &AppState) -> Result<McpReloadResult, String> {

@@ -204,7 +204,8 @@ impl SkillLoader {
         dedupe_by_name: bool,
     ) -> Result<usize, String> {
         let mut total = 0;
-        let mut seen_names: HashSet<String> = HashSet::new();
+        // name → index into self.skills (for same-name dedupe across roots).
+        let mut seen_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let mut seen_roots: HashSet<String> = HashSet::new();
         for dir in Self::search_paths(extra_dirs, workspace) {
             if !dir.exists() {
@@ -220,12 +221,34 @@ impl SkillLoader {
                         }
                         if dedupe_by_name {
                             let key = s.name.to_lowercase();
-                            if !seen_names.insert(key) {
-                                continue;
+                            match seen_names.get(&key) {
+                                None => {
+                                    seen_names.insert(key, self.skills.len());
+                                    self.skills.push(s);
+                                    total += 1;
+                                }
+                                Some(&idx) => {
+                                    // Same skill name from another search root
+                                    // (~/.dscode/skills vs ~/.claude/skills, project
+                                    // dirs…). Old logic kept the FIRST root only,
+                                    // which silently disabled a newer/richer copy
+                                    // installed elsewhere. Now we keep the fresher
+                                    // or richer package so the skill is FULLY
+                                    // enabled (scripts & resources all present).
+                                    let existing = &self.skills[idx];
+                                    let fresher =
+                                        skill_freshness(&s) >= skill_freshness(existing);
+                                    let richer =
+                                        s.resources.len() >= existing.resources.len();
+                                    if fresher || richer {
+                                        self.skills[idx] = s;
+                                    }
+                                }
                             }
+                        } else {
+                            self.skills.push(s);
+                            total += 1;
                         }
-                        self.skills.push(s);
-                        total += 1;
                     }
                 }
                 Ok(_) => {}
@@ -1076,6 +1099,21 @@ pub struct InstallReport {
     pub message: String,
 }
 
+/// Best-effort freshness of a skill package: SKILL.md mtime in seconds (0 if unknown).
+fn skill_freshness(s: &Skill) -> i64 {
+    file_mtime_secs(&s.root.join("SKILL.md"))
+}
+
+/// File modification time in seconds since epoch (0 if unknown/error).
+fn file_mtime_secs(p: &std::path::Path) -> i64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Install skill packages from a GitHub-style spec into `~/.dscode/skills`.
 fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
     let spec = spec.trim();
@@ -1171,7 +1209,19 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
         };
         let dest = target_root.join(&safe);
         if dest.exists() {
-            skipped.push(format!("{safe} (已存在，跳过)"));
+            // Same-name package already present (maybe installed earlier via
+            // skills.sh into ~/.claude/skills, or an older dscode install).
+            // Old logic skipped silently — a newer copy never took effect.
+            // Overwrite when the incoming SKILL.md is fresher, else skip.
+            let src_newer =
+                file_mtime_secs(&pkg.join("SKILL.md")) > file_mtime_secs(&dest.join("SKILL.md"));
+            if src_newer {
+                let _ = std::fs::remove_dir_all(&dest);
+                copy_dir_recursive(pkg, &dest)?;
+                installed.push(format!("{safe} (已更新)"));
+            } else {
+                skipped.push(format!("{safe} (已存在且未更新，跳过)"));
+            }
             continue;
         }
         copy_dir_recursive(pkg, &dest)?;

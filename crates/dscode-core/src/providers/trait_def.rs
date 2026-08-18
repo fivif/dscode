@@ -198,6 +198,10 @@ pub enum ProviderError {
     Parse(String),
     #[error("No API key configured for this provider")]
     NoApiKey,
+    /// Stream was interrupted mid-flight (byte-stream error or read timeout).
+    /// The upstream agent can detect this and retry the turn.
+    #[error("stream interrupted: {0}")]
+    StreamInterrupted(String),
 }
 
 impl From<reqwest::Error> for ProviderError {

@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::event_bus::EventBus;
+
 use dscode_core::config::settings::Config;
 use dscode_core::safety::permission::PermissionHub;
 use dscode_core::session::manager::SessionManager;
@@ -50,6 +52,9 @@ pub struct AppState {
 
     /// Whether /teams multi-agent mode is active.
     pub teams_mode: AtomicBool,
+
+    /// Unified event bus (stream / title / task notifications) relayed by the shell.
+    pub event_bus: EventBus,
 }
 
 impl AppState {
@@ -87,6 +92,7 @@ impl AppState {
             task_manager,
             permission_hub,
             teams_mode: AtomicBool::new(false),
+            event_bus: EventBus::new(),
         }
     }
 

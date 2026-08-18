@@ -217,7 +217,7 @@ impl LlmProvider for AnthropicProvider {
 
         // SSE byte-stream -> parsed frames -> StreamChunk stream
         let byte_stream = resp.bytes_stream();
-        let (tx, rx) = tokio::sync::mpsc::channel::<SseFrame>(128);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseFrame, String>>(128);
 
         tokio::spawn(async move {
             let mut buf: Vec<u8> = Vec::new();
@@ -247,7 +247,7 @@ impl LlmProvider for AnthropicProvider {
                                         event: std::mem::take(&mut current_event),
                                         data: std::mem::take(&mut current_data),
                                     };
-                                    if tx.send(frame).await.is_err() {
+                                    if tx.send(Ok(frame)).await.is_err() {
                                         return;
                                     }
                                 }
@@ -262,7 +262,8 @@ impl LlmProvider for AnthropicProvider {
                             // Ignore comment lines (starting with ':') and unknown prefixes
                         }
                     }
-                    Ok(Some(Err(_))) => {
+                    Ok(Some(Err(e))) => {
+                        let _ = tx.send(Err(format!("byte stream: {e}"))).await;
                         return;
                     }
                     Ok(None) => {
@@ -270,6 +271,7 @@ impl LlmProvider for AnthropicProvider {
                     }
                     Err(_timeout) => {
                         tracing::warn!("chat_stream chunk read timeout, closing stream");
+                        let _ = tx.send(Err("chunk read timeout (90s)".into())).await;
                         return;
                     }
                 }
@@ -281,12 +283,15 @@ impl LlmProvider for AnthropicProvider {
                     event: current_event,
                     data: current_data,
                 };
-                let _ = tx.send(frame).await;
+                let _ = tx.send(Ok(frame)).await;
             }
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-            .map(|frame| parse_anthropic_sse_frame(&frame));
+            .map(|item| match item {
+                Ok(frame) => parse_anthropic_sse_frame(&frame),
+                Err(e) => Err(ProviderError::StreamInterrupted(e)),
+            });
 
         Ok(Box::pin(stream))
     }

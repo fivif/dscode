@@ -12,6 +12,7 @@ use super::llm_interview::{
 };
 use super::phases::{PlanPhase, PlanState};
 use super::prd::{PrdDocument, PrdError, PrdGenerator};
+use crate::agent::stream::StreamEvent;
 use crate::providers::trait_def::LlmProvider;
 
 /// Result of one plan turn (start or answer).
@@ -103,6 +104,7 @@ impl ActivePlanSession {
         session_id: &str,
         user_goal: &str,
         working_dir: PathBuf,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
     ) -> Result<(Self, PlanTurnResult), String> {
         Self::clear(session_id);
 
@@ -110,6 +112,15 @@ impl ActivePlanSession {
         let title: String = user_goal.chars().take(80).collect();
         if title.trim().is_empty() {
             return Err("Usage: /plan <describe what you want to build>".into());
+        }
+
+        if let Some(tx) = progress {
+            let _ = tx.send(StreamEvent::Token {
+                content: format!(
+                    "_启动 /plan 访谈_\n\n**目标：** {}\n\n_扫描项目快照…_\n",
+                    title
+                ),
+            });
         }
 
         let snapshot = project_snapshot(&working_dir);
@@ -131,7 +142,13 @@ impl ActivePlanSession {
             project_snapshot: snapshot,
         };
 
-        let result = session.drive_llm(provider).await?;
+        if let Some(tx) = progress {
+            let _ = tx.send(StreamEvent::Token {
+                content: "_快照就绪，进入 Scope 阶段…_\n".into(),
+            });
+        }
+
+        let result = session.drive_llm(provider, progress).await?;
         session.persist_for_result(&result)?;
         Ok((session, result))
     }
@@ -141,6 +158,7 @@ impl ActivePlanSession {
         &mut self,
         provider: &dyn LlmProvider,
         answer: &str,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
     ) -> Result<PlanTurnResult, String> {
         let answer = answer.trim();
         if answer.is_empty() {
@@ -167,6 +185,15 @@ impl ActivePlanSession {
             answer.to_string()
         };
 
+        if let Some(tx) = progress {
+            let _ = tx.send(StreamEvent::Token {
+                content: format!(
+                    "_已记录回答，继续 {}…_\n",
+                    self.plan_state.phase.label()
+                ),
+            });
+        }
+
         self.qa_history
             .push((pending.text.clone(), final_answer));
         self.current_question = None;
@@ -177,7 +204,7 @@ impl ActivePlanSession {
             self.project_snapshot = project_snapshot(&self.working_dir);
         }
 
-        let result = self.drive_llm(provider).await?;
+        let result = self.drive_llm(provider, progress).await?;
         self.persist_for_result(&result)?;
         Ok(result)
     }
@@ -195,11 +222,15 @@ impl ActivePlanSession {
     }
 
     /// Drive LLM until we need a user answer or the PRD is ready.
-    async fn drive_llm(&mut self, provider: &dyn LlmProvider) -> Result<PlanTurnResult, String> {
+    async fn drive_llm(
+        &mut self,
+        provider: &dyn LlmProvider,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    ) -> Result<PlanTurnResult, String> {
         // Safety: prevent infinite advance loops
         for _ in 0..12 {
             if self.plan_state.phase == PlanPhase::Approved {
-                return self.finalize_prd().await;
+                return self.finalize_prd(progress).await;
             }
 
             let action = next_llm_turn(
@@ -209,6 +240,7 @@ impl ActivePlanSession {
                 &self.qa_history,
                 self.questions_in_phase,
                 &self.project_snapshot,
+                progress,
             )
             .await?;
 
@@ -240,14 +272,24 @@ impl ActivePlanSession {
                     info!(phase = ?self.plan_state.phase, %reason, "plan phase advance");
                     match self.plan_state.phase {
                         PlanPhase::Quality => {
-                            return self.finalize_prd().await;
+                            return self.finalize_prd(progress).await;
                         }
                         PlanPhase::Approved => {
-                            return self.finalize_prd().await;
+                            return self.finalize_prd(progress).await;
                         }
                         _ => {
+                            let from = self.plan_state.phase.label().to_string();
                             self.plan_state.advance_phase();
                             self.questions_in_phase = 0;
+                            if let Some(tx) = progress {
+                                let _ = tx.send(StreamEvent::Token {
+                                    content: format!(
+                                        "_阶段完成（{}）→ 进入 **{}**…_\n",
+                                        from,
+                                        self.plan_state.phase.label()
+                                    ),
+                                });
+                            }
                             // Loop for next phase first question
                         }
                     }
@@ -256,15 +298,23 @@ impl ActivePlanSession {
                     info!(%reason, "plan LLM complete");
                     // Jump to finalize even if earlier phases — user/model satisfied
                     self.plan_state.retreat_to(PlanPhase::Quality);
-                    return self.finalize_prd().await;
+                    return self.finalize_prd(progress).await;
                 }
             }
         }
         // Fallback: enough to write PRD
-        self.finalize_prd().await
+        self.finalize_prd(progress).await
     }
 
-    async fn finalize_prd(&mut self) -> Result<PlanTurnResult, String> {
+    async fn finalize_prd(
+        &mut self,
+        progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    ) -> Result<PlanTurnResult, String> {
+        if let Some(tx) = progress {
+            let _ = tx.send(StreamEvent::Token {
+                content: "_访谈完成，正在生成 PRD…_\n".into(),
+            });
+        }
         let generator = PrdGenerator::new(self.working_dir.clone());
         let mut answers = self.qa_history.clone();
         answers.insert(

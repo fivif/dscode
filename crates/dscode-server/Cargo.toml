@@ -1,0 +1,18 @@
+[package]
+name = "dscode-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DS Code shared server logic (used by both desktop Tauri shell and web axum shell)"
+
+[dependencies]
+dscode-core = { path = "../dscode-core" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }

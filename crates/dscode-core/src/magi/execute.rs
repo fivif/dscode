@@ -127,7 +127,9 @@ pub async fn execute_subtask(
 
     // ── ReAct loop ──
     for step in 1..=max_steps {
-        clean_orphaned_tool_calls(&mut messages);
+        // Shared position-aware validator (same fix as forge.rs) so the provider
+        // never receives an assistant(tool_calls) without its Tool responses.
+        messages = crate::agent::forge::validate_tool_chain_for_provider(messages);
 
         debug!(
             session = %session_id,
@@ -395,50 +397,6 @@ fn build_execution_prompt(prd: &str, scrutiny: &str) -> String {
          When you are finished, provide a clear summary of what you accomplished.",
         prd, scrutiny
     )
-}
-
-/// Clean orphaned tool_calls and ghost assistant messages in-place.
-/// Mirrors forge.rs:clean_orphaned_tool_calls to keep the message vector
-/// valid for provider API calls — prevents 400 errors from the provider.
-fn clean_orphaned_tool_calls(messages: &mut Vec<Message>) {
-    let responded: std::collections::HashSet<String> = messages
-        .iter().filter(|m| m.role == Role::Tool)
-        .filter_map(|m| m.tool_call_id.clone()).collect();
-
-    for msg in messages.iter_mut() {
-        if let Some(ref mut tc) = msg.tool_calls {
-            tc.retain(|t| responded.contains(&t.id));
-            if tc.is_empty() {
-                msg.tool_calls = None;
-            }
-        }
-        // Always strip tool_call_id from Assistant messages — it belongs
-        // only on Tool-role messages per OpenAI protocol.
-        if msg.role == Role::Assistant && msg.tool_call_id.is_some() {
-            msg.tool_call_id = None;
-        }
-    }
-
-    let valid_ids: std::collections::HashSet<String> = messages.iter()
-        .filter_map(|m| m.tool_calls.as_ref())
-        .flat_map(|tc| tc.iter().map(|t| t.id.clone())).collect();
-
-    messages.retain(|m| {
-        if m.role != Role::Tool { return true; }
-        m.tool_call_id.as_ref().map_or(false, |id| valid_ids.contains(id))
-    });
-
-    // Remove ghost Assistant messages: after cleaning orphaned tool_calls,
-    // an assistant may have empty content, no tool_calls, and no reasoning.
-    // These cause 400 errors: "messages with role 'assistant' must have
-    // content or tool_calls".
-    messages.retain(|m| {
-        if m.role != Role::Assistant { return true; }
-        if !m.content.is_empty() { return true; }
-        if m.tool_calls.is_some() { return true; }
-        if m.reasoning_content.as_ref().map_or(false, |r| !r.is_empty()) { return true; }
-        false
-    });
 }
 
 #[cfg(test)]

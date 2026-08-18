@@ -1,11 +1,7 @@
-//! DS Code Desktop — Tauri GUI backend library.
+//! DS Code Desktop — Tauri GUI shell over the shared `dscode-server` backend.
 //!
-//! Provides:
-//! - AppState management (config, sessions, tools, forge handle).
-//! - Tauri IPC commands (chat, session, config).
-//! - Stream event helpers for relaying agent events to the frontend.
+//! All agent/config/session behavior lives in `dscode-server`. This crate only
+//! provides the thin Tauri command adapters (see [`shell`]) and the event
+//! bridge from the shared EventBus into Tauri `emit`.
 
-pub mod app_state;
-pub mod attachments;
-pub mod commands;
-pub mod events;
+pub mod shell;
