@@ -34,29 +34,23 @@ function CopyButton({ text, copiedLabel = '已复制' }: { text: string; copiedL
   return (
     <button
       onClick={onCopy}
-      aria-label="复制"
-      title="复制"
-      className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-[10.5px] font-medium tracking-wide transition-all duration-200 select-none ${
+      aria-label={copied ? copiedLabel : '复制'}
+      title={copied ? copiedLabel : '复制'}
+      className={`inline-flex items-center justify-center w-6 h-6 rounded-lg transition-all duration-200 select-none ${
         copied
           ? 'bg-emerald-400/15 text-emerald-300 ring-1 ring-emerald-400/30'
           : 'bg-white/[0.06] text-gray-400 hover:bg-white/[0.12] hover:text-gray-200 ring-1 ring-white/[0.08]'
       }`}
     >
       {copied ? (
-        <>
-          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M20 6 9 17l-5-5" />
-          </svg>
-          {copiedLabel}
-        </>
+        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M20 6 9 17l-5-5" />
+        </svg>
       ) : (
-        <>
-          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="9" y="9" width="13" height="13" rx="2" />
-            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-          </svg>
-          复制
-        </>
+        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="9" y="9" width="13" height="13" rx="2" />
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+        </svg>
       )}
     </button>
   );

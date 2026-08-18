@@ -23,30 +23,23 @@ function CopyMarkdownButton({ text }: { text: string }) {
   return (
     <button
       onClick={onCopy}
-      aria-label="复制为 Markdown"
-      title="复制为 Markdown"
-      className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10.5px] font-medium tracking-wide transition-all duration-200 select-none ${
+      aria-label={copied ? '已复制' : '复制为 Markdown'}
+      title={copied ? '已复制' : '复制为 Markdown'}
+      className={`inline-flex items-center justify-center w-6 h-6 rounded-lg transition-all duration-200 select-none ${
         copied
           ? 'bg-emerald-400/15 text-emerald-300 ring-1 ring-emerald-400/30 opacity-100'
           : 'bg-white/[0.05] text-gray-500 hover:bg-white/[0.1] hover:text-gray-300 ring-1 ring-white/[0.07] opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
       }`}
     >
       {copied ? (
-        <>
-          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M20 6 9 17l-5-5" />
-          </svg>
-          已复制
-        </>
+        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M20 6 9 17l-5-5" />
+        </svg>
       ) : (
-        <>
-          <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-            <path d="M14 2v6h6" />
-            <path d="M9 13h6M9 17h6" />
-          </svg>
-          Markdown
-        </>
+        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <path d="M14 2v6h6" />
+        </svg>
       )}
     </button>
   );
