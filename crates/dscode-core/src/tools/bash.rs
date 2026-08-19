@@ -72,7 +72,7 @@ fn kill_process_group(pgid: Option<u32>) {
 }
 
 /// Common Git for Windows bash locations. Preferred on Windows so `do_bash`
-/// actually runs bash syntax (matching Unix) instead of `cmd.exe` quirks.
+/// actually runs bash syntax (matching Unix) instead of `cmd.exe`/PowerShell.
 #[cfg(windows)]
 const WINDOWS_BASH_CANDIDATES: &[&str] = &[
     r"C:\Program Files\Git\bin\bash.exe",
@@ -81,13 +81,26 @@ const WINDOWS_BASH_CANDIDATES: &[&str] = &[
     r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
 ];
 
-/// Platform-appropriate shell for `do_bash`:
+/// Platform-appropriate shell for `do_bash` — mirrors Claude Code's Windows
+/// shell selection:
 /// - Unix: `bash -c <command>` (process-group killable)
-/// - Windows: prefer Git Bash (`bash -c`) if installed so bash syntax works;
-///   otherwise fall back to `cmd.exe /C`.
+/// - Windows: ① user-configured Git Bash path (`agent.git_bash_path`),
+///   ② auto-detected Git for Windows `bash.exe`, ③ fall back to PowerShell
+///   (`powershell.exe -NoProfile -Command`).
 pub(crate) fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
     #[cfg(windows)]
     {
+        // 1. User-configured Git Bash path (Claude Code parity).
+        if let Ok(cfg) = crate::config::settings::Config::load() {
+            let configured = cfg.agent.git_bash_path.trim();
+            if !configured.is_empty() && std::path::Path::new(configured).is_file() {
+                return (
+                    std::ffi::OsString::from(configured),
+                    vec!["-c".into(), command.into()],
+                );
+            }
+        }
+        // 2. Auto-detect common Git for Windows locations.
         for &candidate in WINDOWS_BASH_CANDIDATES {
             if std::path::Path::new(candidate).is_file() {
                 return (
@@ -96,10 +109,12 @@ pub(crate) fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi:
                 );
             }
         }
+        // 3. Fall back to PowerShell (Claude Code's native-Windows behavior).
         let mut args: Vec<std::ffi::OsString> = Vec::new();
-        args.push("/C".into());
+        args.push("-NoProfile".into());
+        args.push("-Command".into());
         args.push(command.into());
-        (std::ffi::OsString::from("cmd.exe"), args)
+        (std::ffi::OsString::from("powershell.exe"), args)
     }
     #[cfg(not(windows))]
     {

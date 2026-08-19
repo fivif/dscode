@@ -647,6 +647,11 @@ pub struct AgentConfig {
     /// After a successful turn, optionally extract a short memory note (opt-in).
     #[serde(default)]
     pub memory_auto_ingest: bool,
+    /// Windows only: absolute path to Git Bash `bash.exe` (equivalent to Claude
+    /// Code's `CLAUDE_CODE_GIT_BASH_PATH`). When set and the file exists,
+    /// do_bash / do_background prefer it over auto-detected Git for Windows.
+    #[serde(default)]
+    pub git_bash_path: String,
 }
 
 impl AgentConfig {
