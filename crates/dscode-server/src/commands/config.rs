@@ -63,6 +63,7 @@ pub async fn set_global_prompt(
         memory_enabled: config.agent.memory_enabled,
         read_before_edit: config.agent.read_before_edit,
         memory_auto_ingest: config.agent.memory_auto_ingest,
+        git_bash_path: config.agent.git_bash_path.clone(),
     };
     config
         .save()
