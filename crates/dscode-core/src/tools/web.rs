@@ -603,17 +603,25 @@ fn bing_clean(s: &str, tag_re: &Regex) -> String {
 
 /// Parse Bing's SERP HTML into clean organic [`SearchHit`]s.
 fn bing_parse_html(html: &str, limit: usize) -> Vec<SearchHit> {
-    let block_re = Regex::new(r#"<li class="b_algo".*?(?=<li class="b_algo"|</ol>)"#).unwrap();
     let title_re = Regex::new(r#"<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap();
     let snip_re = Regex::new(r#"<p[^>]*>(.*?)</p>"#).unwrap();
     let tag_re = Regex::new(r"<[^>]+>").unwrap();
 
     let mut hits = Vec::new();
-    for block in block_re.find_iter(html) {
+    // Split on the organic-result marker. The segment before the first
+    // `<li class="b_algo"` is boilerplate; every later segment begins a result
+    // block. (Rust's regex crate has no look-ahead, so split instead.)
+    let mut blocks = html.split(r#"<li class="b_algo""#);
+    blocks.next(); // drop leading boilerplate
+
+    for block in blocks {
         if hits.len() >= limit {
             break;
         }
-        let b = block.as_str();
+        // A block runs until the next `<li class="b_algo"` or the closing
+        // `</ol>` of the results list — whichever comes first.
+        let b = block.split("</ol>").next().unwrap_or(block);
+
         let Some(caps) = title_re.captures(b) else {
             continue;
         };
