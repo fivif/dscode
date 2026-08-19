@@ -175,6 +175,13 @@ impl McpClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        // Hide the console window when the desktop app spawns an MCP server on Windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut()
+                .creation_flags(crate::tools::bash::CREATE_NO_WINDOW);
+        }
         // Inherit parent env (PATH/HOME/etc.) so GUI-launched npx/node works.
         // Ensure a usable PATH even when app is launched without shell profile.
         if let Ok(path) = std::env::var("PATH") {

@@ -1145,6 +1145,12 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
         &url,
         tmp.join("repo").to_str().unwrap_or("repo"),
     ]);
+    // Hide the console window when the desktop app runs `git` on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        git.creation_flags(crate::tools::bash::CREATE_NO_WINDOW);
+    }
     // Optional proxy for skill downloads
     if let Ok(cfg) = crate::config::settings::Config::load() {
         crate::config::settings::apply_proxy_env(&mut git, cfg.proxy_for_skills());

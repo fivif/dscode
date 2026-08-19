@@ -56,9 +56,13 @@ fn kill_process_group(pgid: Option<u32>) {
         // Windows has no POSIX process groups: kill the whole tree via taskkill.
         if let Some(pid) = pgid.filter(|&p| p > 1) {
             let pid_str = pid.to_string();
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", pid_str.as_str(), "/T", "/F"])
-                .status();
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.args(["/PID", pid_str.as_str(), "/T", "/F"]);
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let _ = cmd.status();
         }
     }
     #[cfg(all(not(unix), not(windows)))]
@@ -67,12 +71,31 @@ fn kill_process_group(pgid: Option<u32>) {
     }
 }
 
+/// Common Git for Windows bash locations. Preferred on Windows so `do_bash`
+/// actually runs bash syntax (matching Unix) instead of `cmd.exe` quirks.
+#[cfg(windows)]
+const WINDOWS_BASH_CANDIDATES: &[&str] = &[
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+];
+
 /// Platform-appropriate shell for `do_bash`:
 /// - Unix: `bash -c <command>` (process-group killable)
-/// - Windows: `cmd.exe /C <command>` (no bash by default; cmd is universal)
-fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+/// - Windows: prefer Git Bash (`bash -c`) if installed so bash syntax works;
+///   otherwise fall back to `cmd.exe /C`.
+pub(crate) fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
     #[cfg(windows)]
     {
+        for &candidate in WINDOWS_BASH_CANDIDATES {
+            if std::path::Path::new(candidate).is_file() {
+                return (
+                    std::ffi::OsString::from(candidate),
+                    vec!["-c".into(), command.into()],
+                );
+            }
+        }
         let mut args: Vec<std::ffi::OsString> = Vec::new();
         args.push("/C".into());
         args.push(command.into());
@@ -83,6 +106,11 @@ fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>)
         (std::ffi::OsString::from("bash"), vec!["-c".into(), command.into()])
     }
 }
+
+/// CREATE_NO_WINDOW — prevents a console window from flashing open when a GUI
+/// app (the Tauri desktop app) spawns `cmd.exe`/`bash.exe` on Windows.
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Check whether a command string contains any blocked dangerous pattern.
 fn is_dangerous(command: &str) -> Option<&'static str> {
@@ -271,6 +299,13 @@ impl Tool for DoBash {
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true);
+
+        // Hide the console window when the desktop app spawns a shell on Windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+        }
 
         // T3: Set process group so we can kill the entire process tree on timeout
         #[cfg(unix)]

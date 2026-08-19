@@ -127,21 +127,9 @@ impl TaskManager {
         });
 
         tokio::spawn(async move {
-            // Windows: cmd.exe /C (no bash by default); Unix: bash -c.
-            #[cfg(windows)]
-            let (shell, shell_args) = {
-                let mut args: Vec<std::ffi::OsString> = Vec::new();
-                args.push("/C".into());
-                args.push(command.clone().into());
-                (std::ffi::OsString::from("cmd.exe"), args)
-            };
-            #[cfg(not(windows))]
-            let (shell, shell_args) = {
-                let mut args: Vec<std::ffi::OsString> = Vec::new();
-                args.push("-c".into());
-                args.push(command.clone().into());
-                (std::ffi::OsString::from("bash"), args)
-            };
+            // Shared shell selection (Unix: bash -c; Windows: Git Bash if
+            // available, otherwise cmd.exe /C) — same behavior as do_bash.
+            let (shell, shell_args) = crate::tools::bash::shell_command(&command);
             let mut builder = Command::new(&shell);
             builder
                 .args(&shell_args)
@@ -150,6 +138,15 @@ impl TaskManager {
                 .stderr(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true);
+
+            // Hide the console window when the desktop app spawns a shell on Windows.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                builder
+                    .as_std_mut()
+                    .creation_flags(crate::tools::bash::CREATE_NO_WINDOW);
+            }
 
             #[cfg(unix)]
             {
