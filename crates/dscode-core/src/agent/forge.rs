@@ -18,7 +18,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::context::{build_context, compression_prompt, count_message_tokens, ContextPacket};
+use super::compression::{CompressionAction, CompressionPipeline};
+use super::context::{build_context, ContextPacket};
 use super::error_withholding::ErrorWithholder;
 use super::stream::{StreamEvent, ToolStatus};
 use crate::auto::runner::AutoRunner;
@@ -69,7 +70,7 @@ Think step by step, use tools when needed, write clean code."#;
 const DEFAULT_MAX_ITERATIONS: u32 = 120;
 
 /// Maximum number of historical messages to include in the context window.
-const DEFAULT_MAX_HISTORY_MESSAGES: usize = 100;
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 1000;
 
 /// Cap tool result text injected back into the conversation (chars).
 const MAX_TOOL_RESULT_CHARS: usize = 24_000;
@@ -598,57 +599,21 @@ impl Forge {
                 }
             }
 
-            // (a.0) Check if context compression is needed
+            // (a.0) Multi-level context compression (L0-L4) via the shared
+            // CompressionPipeline. At most one compression pass per user turn.
             if !self.compressed.load(Ordering::Relaxed) {
-                // F7: Pass reference slices instead of cloning.
-                let sys_refs: Vec<&Message> = messages.iter().filter(|m| m.role == Role::System).collect();
-                let sys_tok = count_message_tokens(&sys_refs);
-                let hist_refs: Vec<&Message> = messages.iter().filter(|m| m.role != Role::System).collect();
-                let hist_tok = count_message_tokens(&hist_refs);
-                let threshold = (self.context_config.window_tokens as f64 * self.context_config.compress_threshold) as u64;
-                if sys_tok + hist_tok > threshold {
-                    info!(session = %session_id, iteration, sys_tok, hist_tok, threshold, "compression");
-                    // Build compression prompt — ensure we don't split tool chains
-                    let non_sys: Vec<_> = messages.iter().filter(|m| m.role != Role::System).enumerate().collect::<Vec<_>>();
-                    let mut compress_count = (non_sys.len() as f64 * 0.7) as usize;
-                    // Align: skip forward past incomplete tool_call→tool_result pairs
-                    while compress_count < non_sys.len() {
-                        let (_, msg) = &non_sys[compress_count];
-                        if msg.role == Role::Tool { compress_count += 1; }
-                        else { break; }
-                    }
-                    if compress_count > 0 {
-                        let old: Vec<_> = non_sys.iter().take(compress_count).map(|(_, m)| (*m).clone()).collect();
-                        // C3: Limit compression prompt to half the context window.
-                        let half_window = (self.context_config.window_tokens / 2) as u64;
-                        let prompt = compression_prompt(&old, half_window);
-                        let summary = self.provider.chat(
-                            vec![Message { role: Role::User, content: MessageContent::Text(prompt), ..Default::default() }],
-                            vec![],
-                        ).await.map(|r| r.content).unwrap_or_default();
-                        if !summary.is_empty() {
-                            let sys = messages.iter().find(|m| m.role == Role::System).and_then(|m| m.content.as_text()).unwrap_or("").to_string();
-                            let rest: Vec<_> = messages.iter().filter(|m| m.role != Role::System).skip(compress_count).cloned().collect();
-                            // Re-anchor critical constraints after compression (anti dilution)
-                            let anchors = format!(
-                                "\n\n## Active constraints (re-asserted after compression)\n\
-                                 - Working directory: {}\n\
-                                 - Prefer tools over speculation; do not invent file paths.\n\
-                                 - Follow user global instructions and language preferences from the system prompt.\n\
-                                 - Do not re-run failed tool loops; consolidate and conclude when stuck.\n",
-                                self.working_dir.display()
-                            );
-                            messages = vec![Message {
-                                role: Role::System,
-                                content: MessageContent::Text(format!(
-                                    "{sys}\n\n## Conversation Summary\n{summary}{anchors}"
-                                )),
-                                ..Default::default()
-                            }];
-                            messages.extend(rest);
-                            self.compressed.store(true, Ordering::Relaxed);
-                        }
-                    }
+                let mut pipeline = CompressionPipeline::new(self.context_config.clone());
+                let action = pipeline
+                    .apply(&mut messages, &*self.provider, None)
+                    .await;
+                if !matches!(action, CompressionAction::None) {
+                    info!(
+                        session = %session_id,
+                        iteration,
+                        action = ?action,
+                        "context compression applied"
+                    );
+                    self.compressed.store(true, Ordering::Relaxed);
                 }
             }
 
@@ -1253,51 +1218,6 @@ async fn stream_provider_turn(
             Some(reasoning)
         },
     })
-}
-
-/// Compress older messages using LLM summarization.
-/// This is a free function (not a method) to avoid borrowing &self across await.
-pub async fn compress_context(
-    provider: &dyn LlmProvider,
-    messages: &[Message],
-    event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
-    session_id: &str,
-) -> Vec<Message> {
-    let total = messages.iter().filter(|m| m.role != Role::System).count();
-    let compress_count = (total as f64 * 0.7) as usize;
-    if compress_count == 0 { return messages.to_vec(); }
-
-    let old: Vec<_> = messages.iter().filter(|m| m.role != Role::System).take(compress_count).cloned().collect();
-    let prompt = compression_prompt(&old, 65536);
-    let summary = match provider.chat(
-        vec![Message { role: Role::User, content: MessageContent::Text(prompt), ..Default::default() }],
-        vec![],
-    ).await {
-        Ok(r) => r.content,
-        Err(e) => { warn!(session = %session_id, %e, "compression failed"); return messages.to_vec(); }
-    };
-
-    if summary.is_empty() { return messages.to_vec(); }
-    info!(session = %session_id, summary_len = summary.len(), "context compressed");
-
-    let sys_content = messages.iter().find(|m| m.role == Role::System)
-        .and_then(|m| m.content.as_text().map(|s| s.to_string())).unwrap_or_default();
-    let remaining: Vec<_> = messages.iter().filter(|m| m.role != Role::System).skip(compress_count).cloned().collect();
-
-    let mut result = Vec::new();
-    result.push(Message {
-        role: Role::System,
-        content: MessageContent::Text(format!("{}\n\n## Conversation Summary\n{}", sys_content, summary)),
-        name: None, tool_calls: None, tool_call_id: None, reasoning_content: None, created_at: 0 });
-    result.extend(remaining);
-
-    let _ = event_tx.send(StreamEvent::Fact {
-        id: format!("compress_{}", session_id),
-        subject: "context".into(),
-        predicate: "compressed".into(),
-        object: format!("compressed {} messages into summary", compress_count),
-    });
-    result
 }
 
 /// Remove tool_calls from messages that have no matching tool response.

@@ -100,6 +100,14 @@ impl CompressionPipeline {
         let total_tok = sys_tok + hist_tok;
         let ratio = total_tok as f64 / window;
 
+        // Escalating thresholds anchored to the configured compress_threshold.
+        // Default 0.8 reproduces the legacy 80/85/90/95 ladder exactly.
+        let base = self.context_config.compress_threshold.clamp(0.1, 0.85);
+        let l1 = base;
+        let l2 = base + 0.05;
+        let l3 = base + 0.10;
+        let l4 = base + 0.15;
+
         // ── L0: Zero-cost snip of stale tool results (always when >60%) ──
         if ratio > 0.60 {
             let snipped = Self::snip_stale_tool_results(messages, 3);
@@ -108,8 +116,8 @@ impl CompressionPipeline {
             }
         }
 
-        // ── L1: Truncate (>80%) ─────────────────────────────────────────
-        if ratio > 0.80 && ratio <= 0.85 {
+        // ── L1: Truncate ────────────────────────────────────────────────
+        if ratio > l1 && ratio <= l2 {
             let action = Self::truncate_oldest(messages);
             let applied = !matches!(action, CompressionAction::None);
             if applied {
@@ -118,8 +126,8 @@ impl CompressionPipeline {
             return action;
         }
 
-        // ── L2: Tag-compress verbose tool outputs (>85%) ────────────────
-        if ratio > 0.85 && ratio <= 0.90 {
+        // ── L2: Tag-compress verbose tool outputs ───────────────────────
+        if ratio > l2 && ratio <= l3 {
             let action = Self::tag_compress_tool_outputs(messages);
             if matches!(action, CompressionAction::TagCompressed { .. }) {
                 self.applied_this_turn = true;
@@ -131,8 +139,8 @@ impl CompressionPipeline {
             return trunc;
         }
 
-        // ── L3: LLM summarise (>90%) ────────────────────────────────────
-        if ratio > 0.90 && ratio <= 0.95 {
+        // ── L3: LLM summarise ───────────────────────────────────────────
+        if ratio > l3 && ratio <= l4 {
             let action = Self::llm_summarize(messages, provider).await;
             if matches!(action, CompressionAction::LlmSummarized { .. }) {
                 self.applied_this_turn = true;
@@ -143,8 +151,8 @@ impl CompressionPipeline {
             return trunc;
         }
 
-        // ── L4: Chunk (>95%) ────────────────────────────────────────────
-        if ratio > 0.95 {
+        // ── L4: Chunk ───────────────────────────────────────────────────
+        if ratio > l4 {
             let action = Self::chunk_and_continue(messages);
             self.applied_this_turn = true;
             return action;
@@ -471,6 +479,41 @@ impl CompressionPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::trait_def::{ChatResponse, ProviderError, StreamChunk, ToolDef};
+    use std::pin::Pin;
+
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for StubProvider {
+        async fn chat(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDef>,
+        ) -> Result<ChatResponse, ProviderError> {
+            Ok(ChatResponse {
+                content: "compressed summary".into(),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Vec<ToolDef>,
+        ) -> Result<
+            Pin<Box<dyn futures::stream::Stream<Item = Result<StreamChunk, ProviderError>> + Send>>,
+            ProviderError,
+        > {
+            unimplemented!()
+        }
+
+        fn clone_box(&self) -> Box<dyn LlmProvider> {
+            panic!("clone_box not used in compression tests")
+        }
+    }
 
     fn make_msg(role: Role, text: &str) -> Message {
         Message {
@@ -604,5 +647,73 @@ mod tests {
             msgs[1].content.as_text().unwrap(),
             "short output"
         );
+    }
+
+    // ── apply() threshold dispatch ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_apply_triggers_l1_when_over_threshold() {
+        // window=1000 tokens, threshold=0.8 => L1 fires above 800 tokens.
+        let cfg = ContextConfig {
+            window_tokens: 1000,
+            compress_threshold: 0.8,
+            max_agent_iterations: 120,
+        };
+        let mut pipeline = CompressionPipeline::new(cfg);
+        // 1000 chars ≈ 400 tokens each → total ≈ 801 tokens (ratio ≈ 0.801).
+        let mut msgs = vec![
+            make_msg(Role::System, "sys"),
+            make_msg(Role::User, &"a".repeat(1000)),
+            make_msg(Role::Assistant, &"b".repeat(1000)),
+        ];
+        let provider = StubProvider;
+        let action = pipeline.apply(&mut msgs, &provider, None).await;
+        assert!(
+            matches!(action, CompressionAction::Truncated { .. }),
+            "expected L1 truncation, got {action:?}"
+        );
+        assert!(msgs.len() < 3, "oldest non-system message should be dropped");
+    }
+
+    #[tokio::test]
+    async fn test_apply_respects_custom_compress_threshold() {
+        // window=1000 tokens, threshold=0.5 => L1 fires above 500 tokens.
+        let cfg = ContextConfig {
+            window_tokens: 1000,
+            compress_threshold: 0.5,
+            max_agent_iterations: 120,
+        };
+        let mut pipeline = CompressionPipeline::new(cfg);
+        // 1300 chars ≈ 520 tokens → ratio ≈ 0.52, between L1(0.5) and L2(0.55).
+        let mut msgs = vec![
+            make_msg(Role::System, "sys"),
+            make_msg(Role::User, &"a".repeat(650)),
+            make_msg(Role::Assistant, &"b".repeat(650)),
+        ];
+        let provider = StubProvider;
+        let action = pipeline.apply(&mut msgs, &provider, None).await;
+        assert!(
+            matches!(action, CompressionAction::Truncated { .. }),
+            "custom threshold 0.5 should trigger L1, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_noop_below_threshold() {
+        let cfg = ContextConfig {
+            window_tokens: 100_000,
+            compress_threshold: 0.8,
+            max_agent_iterations: 120,
+        };
+        let mut pipeline = CompressionPipeline::new(cfg);
+        let mut msgs = vec![
+            make_msg(Role::System, "sys"),
+            make_msg(Role::User, "hello"),
+            make_msg(Role::Assistant, "hi"),
+        ];
+        let provider = StubProvider;
+        let action = pipeline.apply(&mut msgs, &provider, None).await;
+        assert_eq!(action, CompressionAction::None);
+        assert_eq!(msgs.len(), 3);
     }
 }
