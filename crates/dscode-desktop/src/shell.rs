@@ -285,9 +285,9 @@ pub async fn get_config(
 #[tauri::command]
 pub async fn update_config(
     state: tauri::State<'_, Arc<AppState>>,
-    cfg: dscode_core::config::settings::Config,
+    config: dscode_core::config::settings::Config,
 ) -> Result<(), String> {
-    config::update_config(state.inner().clone(), cfg).await
+    config::update_config(state.inner().clone(), config).await
 }
 
 #[tauri::command]
