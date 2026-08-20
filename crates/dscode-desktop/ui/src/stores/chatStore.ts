@@ -434,6 +434,8 @@ export interface ChatStore {
   messages: Message[]; activeSessionId: string | null;
   isStreaming: boolean; streamError: string | null;
   _stream: ActiveStream | null;
+  /** Latest auto-compression result (token count after compression). */
+  contextUsage: { tokens: number; window: number } | null;
   /** Last assistant msg of current turn — Teams often emit after stream complete */
   _teamHostMsgId: string | null;
   /** Cached UI state per session (background streams keep updating) */
@@ -503,6 +505,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
   const teamsModeBySession = loadTeamsModeMap();
   return {
     messages: [], activeSessionId: null, isStreaming: false, streamError: null, _stream: null,
+    contextUsage: null,
     _teamHostMsgId: null,
     sessionBuffers: {},
     teamsMode: false,
@@ -1081,6 +1084,28 @@ export const useChatStore = create<ChatStore>((set, get) => {
               _stream: { ...st, facts },
               messages,
               sessionBuffers: { ...s.sessionBuffers, [sessionId]: { ...snapshotActive({ ...s, messages, _stream: { ...st, facts } }), isStreaming: true } },
+            };
+          });
+          break;
+        }
+
+        case 'context_compressed': {
+          const { before_tokens, after_tokens, window } = event;
+          const pct = window > 0 ? ((after_tokens / window) * 100).toFixed(1) : '0';
+          set((s) => {
+            const sysMsg: Message = {
+              id: genId(),
+              session_id: sessionId,
+              role: 'system',
+              content: `⚠️ 上下文已达阈值，已自动压缩：${before_tokens} → ${after_tokens} tokens（约占窗口 ${pct}%）`,
+              created_at: Math.floor(Date.now() / 1000),
+            };
+            const messages = [...s.messages, sysMsg];
+            const next = { ...s, messages };
+            return {
+              contextUsage: { tokens: after_tokens, window },
+              messages,
+              sessionBuffers: { ...s.sessionBuffers, [sessionId]: snapshotActive(next) },
             };
           });
           break;

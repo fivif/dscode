@@ -180,6 +180,9 @@ impl Monitor {
             StreamEvent::Fact { .. } => {
                 // Facts are informational; don't change status.
             }
+            StreamEvent::ContextCompressed { .. } => {
+                // Informational; don't change status.
+            }
             StreamEvent::TeamAgentStart { .. }
             | StreamEvent::TeamAgentOutput { .. }
             | StreamEvent::TeamAgentEnd { .. }

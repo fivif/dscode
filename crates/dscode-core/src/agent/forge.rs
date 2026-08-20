@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::compression::{CompressionAction, CompressionPipeline};
-use super::context::{build_context, ContextPacket};
+use super::context::{build_context, count_message_tokens, ContextPacket};
 use super::error_withholding::ErrorWithholder;
 use super::stream::{StreamEvent, ToolStatus};
 use crate::auto::runner::AutoRunner;
@@ -602,15 +602,30 @@ impl Forge {
             // (a.0) Multi-level context compression (L0-L4) via the shared
             // CompressionPipeline. At most one compression pass per user turn.
             if !self.compressed.load(Ordering::Relaxed) {
+                let token_count = |msgs: &Vec<Message>| -> u64 {
+                    let sys: Vec<&Message> = msgs.iter().filter(|m| m.role == Role::System).collect();
+                    let hist: Vec<&Message> = msgs.iter().filter(|m| m.role != Role::System).collect();
+                    count_message_tokens(&sys) + count_message_tokens(&hist)
+                };
+                let before_tok = token_count(&messages);
+
                 let mut pipeline = CompressionPipeline::new(self.context_config.clone());
                 let action = pipeline
                     .apply(&mut messages, &*self.provider, None)
                     .await;
                 if !matches!(action, CompressionAction::None) {
+                    let after_tok = token_count(&messages);
+                    let _ = event_tx.send(StreamEvent::ContextCompressed {
+                        before_tokens: before_tok,
+                        after_tokens: after_tok,
+                        window: self.context_config.window_tokens,
+                    });
                     info!(
                         session = %session_id,
                         iteration,
                         action = ?action,
+                        before_tok,
+                        after_tok,
                         "context compression applied"
                     );
                     self.compressed.store(true, Ordering::Relaxed);

@@ -127,6 +127,7 @@ export default function InputBox() {
   const teamsMode = useChatStore((s) => s.teamsMode);
   const toggleTeams = useChatStore((s) => s.toggleTeams);
   const messages = useChatStore((s) => s.messages);
+  const contextUsage = useChatStore((s) => s.contextUsage);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const savedInputRef = useRef('');
 
@@ -335,25 +336,31 @@ export default function InputBox() {
   }, [activeSessionId, addPathAttachment]);
 
   // Context usage
-  const contextWindow = Math.max(1, config.context_window_tokens || 1_000_000);
+  const contextWindow = Math.max(1, contextUsage?.window || config.context_window_tokens || 1_000_000);
   const { ctxPct, ctxTokens, ctxLabel } = useMemo(() => {
-    let chars = 0;
-    for (const m of messages) {
-      chars += (m.content || '').length;
-      if (m.thinking_blocks) {
-        for (const t of m.thinking_blocks) chars += (t.content || '').length;
-      }
-      if (m.tool_calls) {
-        for (const tc of m.tool_calls) {
-          chars += (tc.name || '').length + (tc.description || '').length + (tc.result || '').length;
+    let tokens: number;
+    if (contextUsage) {
+      // 后端已压缩：直接使用压缩后的占用
+      tokens = contextUsage.tokens;
+    } else {
+      let chars = 0;
+      for (const m of messages) {
+        chars += (m.content || '').length;
+        if (m.thinking_blocks) {
+          for (const t of m.thinking_blocks) chars += (t.content || '').length;
+        }
+        if (m.tool_calls) {
+          for (const tc of m.tool_calls) {
+            chars += (tc.name || '').length + (tc.description || '').length + (tc.result || '').length;
+          }
+        }
+        if (m.stream_state) {
+          chars += (m.stream_state.text || '').length;
+          for (const t of m.stream_state.thinking || []) chars += (t.content || '').length;
         }
       }
-      if (m.stream_state) {
-        chars += (m.stream_state.text || '').length;
-        for (const t of m.stream_state.thinking || []) chars += (t.content || '').length;
-      }
+      tokens = Math.max(0, Math.ceil(chars / 2.5));
     }
-    const tokens = Math.max(0, Math.ceil(chars / 2.5));
     const pct = Math.min(100, (tokens / contextWindow) * 100);
     let label: string;
     if (tokens === 0) label = '0';
@@ -361,7 +368,7 @@ export default function InputBox() {
     else if (pct < 10) label = pct.toFixed(1);
     else label = String(Math.round(pct));
     return { ctxPct: pct, ctxTokens: tokens, ctxLabel: label };
-  }, [messages, contextWindow]);
+  }, [messages, contextWindow, contextUsage]);
   const ctxColor = ctxPct > 80 ? '#ef4444' : ctxPct > 50 ? '#f59e0b' : '#10b981';
   const circumference = 2 * Math.PI * 7;
   const ringPct = ctxTokens === 0 ? 0 : Math.max(ctxPct, 2);

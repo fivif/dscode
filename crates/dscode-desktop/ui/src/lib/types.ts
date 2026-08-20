@@ -115,6 +115,12 @@ export type StreamEvent =
   | { type: 'tool_progress'; id: string; chunk: string }
   | { type: 'tool_end'; id: string; status: 'success' | 'error'; result: string }
   | { type: 'fact'; id: string; subject: string; predicate: string; object: string }
+  | {
+      type: 'context_compressed';
+      before_tokens: number;
+      after_tokens: number;
+      window: number;
+    }
   | { type: 'error'; content: string }
   | { type: 'complete'; usage?: { input_tokens: number; output_tokens: number } }
   | { type: 'team_agent_start'; agent_id: string; task: string }

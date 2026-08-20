@@ -46,6 +46,12 @@ pub enum StreamEvent {
         predicate: String,
         object: String,
     },
+    /// Context was automatically compressed (threshold reached).
+    ContextCompressed {
+        before_tokens: u64,
+        after_tokens: u64,
+        window: u64,
+    },
     /// An error occurred.
     Error {
         content: String,
