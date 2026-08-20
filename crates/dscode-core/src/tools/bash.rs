@@ -172,8 +172,6 @@ fn run_with_conpty(
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("spawn into pty failed: {e}"))?;
-    // Drop our slave handle so the master sees EOF once the child exits.
-    drop(pair.slave);
 
     let mut reader = pair
         .master
@@ -224,6 +222,11 @@ fn run_with_conpty(
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
+
+    // CRITICAL: the child has now exited. Drop the ConPTY (master/pair) so
+    // ClosePseudoConsole runs and closes the output pipe's write end; only
+    // then does the detached reader see EOF and flush the captured output.
+    drop(pair);
 
     // Bounded flush: collect whatever the reader managed to send, then return.
     let output = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
