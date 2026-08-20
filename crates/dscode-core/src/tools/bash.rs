@@ -133,6 +133,104 @@ pub(crate) fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi:
 #[cfg(windows)]
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Run a command through a ConPTY (pseudo-terminal) on Windows.
+///
+/// Plain stdout/stderr pipes miss two classes of Windows output:
+/// 1. programs that write via the Console API (`WriteConsole`) — `ver`,
+///    `systeminfo`, `color`, `tree`, etc.
+/// 2. PowerShell's formatted-object pipeline when there is no interactive
+///    console to render through `Out-Default`.
+///
+/// A ConPTY makes the child believe it is attached to a real terminal, so
+/// those writes become readable text on the master end. This is blocking and
+/// is meant to be called from `spawn_blocking`.
+#[cfg(windows)]
+fn run_with_conpty(
+    shell: &std::ffi::OsStr,
+    shell_args: &[std::ffi::OsString],
+    working_dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<(String, Option<u32>), String> {
+    use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
+    use std::io::Read;
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty failed: {e}"))?;
+
+    let mut cmd = CommandBuilder::new(shell);
+    cmd.args(shell_args);
+    cmd.cwd(working_dir);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn into pty failed: {e}"))?;
+    // Drop our slave handle so the master sees EOF once the child exits.
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("pty reader failed: {e}"))?;
+
+    // Drain the merged stdout/stderr in a dedicated thread.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let reader_thread = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(out);
+    });
+
+    // Poll the child so we can enforce a timeout, then reap it.
+    let start = std::time::Instant::now();
+    let mut exit_code: Option<u32> = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = Some(status.exit_code());
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if start.elapsed() >= timeout {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    // Give the reader a bounded window to flush (pty may not EOF after kill).
+    let output = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    };
+    let _ = reader_thread.join();
+
+    if timed_out {
+        Ok((output, None))
+    } else {
+        Ok((output, exit_code))
+    }
+}
+
 /// Check whether a command string contains any blocked dangerous pattern.
 fn is_dangerous(command: &str) -> Option<&'static str> {
     let normalized = command.trim();
@@ -313,6 +411,39 @@ impl Tool for DoBash {
 
         // Build the command with process group support
         let (shell, shell_args) = shell_command(command);
+
+        // Windows: run through a ConPTY so Console-API writes (ver/systeminfo/
+        // color) and PowerShell formatted-object output are captured, not just
+        // what arrives on the stdout/stderr pipes.
+        #[cfg(windows)]
+        {
+            let working_dir = ctx.working_dir.clone();
+            let shell = shell.clone();
+            let shell_args = shell_args.clone();
+            let timeout = Duration::from_secs(timeout_secs);
+            let (output, exit_code) = tokio::task::spawn_blocking(move || {
+                run_with_conpty(&shell, &shell_args, &working_dir, timeout)
+            })
+            .await
+            .map_err(|e| ToolError::Internal(format!("pty task failed: {e}")))?
+            .map_err(ToolError::Internal)?;
+
+            return Ok(match exit_code {
+                Some(0) => ToolResult::ok(output),
+                Some(code) => {
+                    let mut msg = format!("Command exited with code {code}");
+                    if output.trim().is_empty() {
+                        msg.push_str(" (no output captured)");
+                    }
+                    ToolResult::err(output, msg)
+                }
+                None => ToolResult::err(
+                    output,
+                    format!("Command timed out after {timeout_secs}s"),
+                ),
+            });
+        }
+
         let mut cmd = Command::new(&shell);
         cmd.args(&shell_args)
             .current_dir(&ctx.working_dir)
