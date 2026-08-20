@@ -180,9 +180,11 @@ fn run_with_conpty(
         .try_clone_reader()
         .map_err(|e| format!("pty reader failed: {e}"))?;
 
-    // Drain the merged stdout/stderr in a dedicated thread.
+    // Drain the merged stdout/stderr in a detached thread. We intentionally do
+    // NOT join it: if the pty never delivers EOF (orphaned grandchild holding
+    // the pipe), the read blocks forever and joining would hang do_bash.
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let reader_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -211,24 +213,25 @@ fn run_with_conpty(
         if start.elapsed() >= timeout {
             timed_out = true;
             let _ = child.kill();
-            let _ = child.wait();
+            // Bounded wait for the kill to take effect; never block forever.
+            for _ in 0..20 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
 
-    // Give the reader a bounded window to flush (pty may not EOF after kill).
-    let output = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+    // Bounded flush: collect whatever the reader managed to send, then return.
+    let output = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => String::new(),
     };
-    let _ = reader_thread.join();
 
-    if timed_out {
-        Ok((output, None))
-    } else {
-        Ok((output, exit_code))
-    }
+    Ok((output, if timed_out { None } else { exit_code }))
 }
 
 /// Check whether a command string contains any blocked dangerous pattern.
