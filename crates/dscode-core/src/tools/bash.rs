@@ -110,8 +110,14 @@ pub(crate) fn shell_command(command: &str) -> (std::ffi::OsString, Vec<std::ffi:
             }
         }
         // 3. Fall back to PowerShell (Claude Code's native-Windows behavior).
+        //    -NonInteractive avoids prompts hanging the tool; -OutputFormat Text
+        //    forces Format-* / objects to render as text (otherwise piped,
+        //    non-interactive PowerShell drops formatted-object output).
         let mut args: Vec<std::ffi::OsString> = Vec::new();
         args.push("-NoProfile".into());
+        args.push("-NonInteractive".into());
+        args.push("-OutputFormat".into());
+        args.push("Text".into());
         args.push("-Command".into());
         args.push(command.into());
         (std::ffi::OsString::from("powershell.exe"), args)
@@ -451,10 +457,17 @@ impl Tool for DoBash {
                 let result = if success {
                     ToolResult::ok(output)
                 } else {
-                    ToolResult::err(
-                        output,
-                        format!("Command exited with code {}", exit_code),
-                    )
+                    let mut msg = format!("Command exited with code {exit_code}");
+                    if output.trim().is_empty() {
+                        // Windows: some commands write via the console API
+                        // (WriteConsole) instead of stdout/stderr, so pipes see
+                        // nothing. Flag it instead of failing silently.
+                        msg.push_str(
+                            " (no stdout/stderr captured — the command may have \
+                             written via the console API rather than pipes)",
+                        );
+                    }
+                    ToolResult::err(output, msg)
                 };
 
                 Ok(result)
