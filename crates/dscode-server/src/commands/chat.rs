@@ -256,6 +256,7 @@ pub async fn send_message(
                                 | StreamEvent::TeamAgentEnd { .. }
                                 | StreamEvent::TeamComplete { .. }
                                 | StreamEvent::Fact { .. }
+                                | StreamEvent::ContextCompressed { .. }
                                 | StreamEvent::Error { .. }
                                 | StreamEvent::Complete { .. }
                                 | StreamEvent::PlanQuestion { .. }

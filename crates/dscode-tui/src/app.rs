@@ -471,6 +471,18 @@ impl AppState {
                     object,
                 });
             }
+            StreamEvent::ContextCompressed {
+                before_tokens,
+                after_tokens,
+                window: _,
+            } => {
+                self.messages.push(UiMessage::Assistant {
+                    content: format!(
+                        "⚠️ 上下文已自动压缩：{before_tokens} → {after_tokens} tokens"
+                    ),
+                    timestamp: Utc::now().timestamp(),
+                });
+            }
             StreamEvent::TeamAgentStart { agent_id, task } => {
                 self.messages.push(UiMessage::Assistant {
                     content: format!("▶ Agent `{agent_id}` started: {task}"),
