@@ -1,0 +1,102 @@
+name: Build macOS Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.4.1)'
+        required: true
+        default: '0.4.1'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            suffix: aarch64
+          - target: x86_64-apple-darwin
+            suffix: x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ''
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: crates/dscode-desktop/ui
+
+      - name: Install tauri-cli (prebuilt binary)
+        run: npm install -g @tauri-apps/cli@^2
+
+      # Unsigned: with no APPLE_SIGNING_IDENTITY and no certificate in the
+      # keychain, tauri falls back to ad-hoc signing ("-"). That is what the
+      # README documents — Gatekeeper will still quarantine the app on first
+      # launch. Notarisation would need an Apple Developer certificate.
+      - name: Build Tauri (macOS dmg)
+        run: tauri build --target ${{ matrix.target }} --bundles dmg
+        working-directory: crates/dscode-desktop
+
+      # The workspace shares one target dir at the repo root, so the bundle
+      # lands under target/<triple>/release/bundle/dmg, not inside the crate.
+      - name: Collect dmg
+        run: |
+          set -euo pipefail
+          src="target/${{ matrix.target }}/release/bundle/dmg"
+          mkdir -p dist-macos
+          found=$(find "$src" -maxdepth 1 -name '*.dmg' -type f | head -n1)
+          if [ -z "$found" ]; then
+            echo "::error::no dmg produced under $src"
+            find target -name '*.dmg' -type f || true
+            exit 1
+          fi
+          dest="dist-macos/DS.Code_${{ inputs.version }}_${{ matrix.suffix }}.dmg"
+          mv "$found" "$dest"
+          ls -la dist-macos
+
+      - name: Upload dmg as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.suffix }}
+          path: dist-macos/*.dmg
+          if-no-files-found: error
+
+  publish:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download both dmgs
+        uses: actions/download-artifact@v4
+        with:
+          path: dmgs
+          merge-multiple: true
+
+      - name: List collected dmgs
+        run: ls -la dmgs
+
+      # Single uploader for both arches: two matrix jobs pushing to the same
+      # release concurrently can race.
+      - name: Upload dmgs to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ inputs.version }}
+          files: dmgs/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
