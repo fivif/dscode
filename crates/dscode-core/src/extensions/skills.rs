@@ -319,9 +319,9 @@ impl SkillLoader {
         }
 
         // Detect symlink cycles by tracking inode numbers
-        if let Ok(_meta) = std::fs::metadata(dir) {
-            #[cfg(unix)]
-            {
+        #[cfg(unix)]
+        {
+            if let Ok(meta) = std::fs::metadata(dir) {
                 use std::os::unix::fs::MetadataExt;
                 let ino = meta.ino();
                 if !visited.insert(ino) {
@@ -329,24 +329,24 @@ impl SkillLoader {
                     return Ok(0);
                 }
             }
-            #[cfg(not(unix))]
-            {
-                // On non-Unix, fall back to canonical path tracking
-                if let Ok(canon) = std::fs::canonicalize(dir) {
-                    use std::hash::{Hash, Hasher};
-                    let path_key = {
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        canon.hash(&mut h);
-                        h.finish()
-                    };
-                    if !visited.insert(path_key) {
-                        tracing::warn!("Symlink cycle detected at {:?}, skipping", dir);
-                        return Ok(0);
-                    }
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, fall back to canonical path tracking. canonicalize
+            // failing covers the does-not-exist case the old metadata guard caught.
+            if let Ok(canon) = std::fs::canonicalize(dir) {
+                use std::hash::{Hash, Hasher};
+                let path_key = {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    canon.hash(&mut h);
+                    h.finish()
+                };
+                if !visited.insert(path_key) {
+                    tracing::warn!("Symlink cycle detected at {:?}, skipping", dir);
+                    return Ok(0);
                 }
             }
         }
-
         let mut count = 0;
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -1925,13 +1925,16 @@ fn push_resource(path: &Path, root: &Path, kind: SkillResourceKind, out: &mut Ve
         .unwrap_or_else(|_| path.display().to_string());
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let executable = looks_like_script(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    // Shadowed under cfg so the Windows build does not see a binding that is
+    // never reassigned.
     #[cfg(unix)]
-    {
+    let executable = {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            executable = executable || (meta.permissions().mode() & 0o111) != 0;
-        }
-    }
+        executable
+            || std::fs::metadata(path)
+                .map(|m| (m.permissions().mode() & 0o111) != 0)
+                .unwrap_or(false)
+    };
     // For non-script folders, don't mark as executable
     let executable = if kind == SkillResourceKind::Script {
         executable
