@@ -2,7 +2,10 @@
 //! Agent-Reach style "installed & usable" platform tool.
 
 use super::trait_def::{Tool, ToolContext, ToolError, ToolResult};
-use super::web::{proxy_note, proxy_configured_url, web_client_for_args};
+use super::web::{
+    decode_body, proxy_note, read_body_capped, validate_target,
+    web_client_for_args, MAX_FETCH_BYTES,
+};
 use crate::agent::stream::StreamEvent;
 use async_trait::async_trait;
 use regex::Regex;
@@ -181,6 +184,14 @@ impl Tool for DoRssRead {
             .min(30) as usize;
 
         let (client, proxy) = web_client_for_args(&args)?;
+        // Same URL policy as do_web_fetch — the blocklist lives in the shared
+        // client layer, not per tool, so RSS inherits it automatically.
+        if let Err(reason) = validate_target(&url, proxy.is_some()).await {
+            return Err(ToolError::InvalidParameter {
+                name: "url".into(),
+                reason,
+            });
+        }
         let _ = ctx.sender.send(StreamEvent::ToolProgress {
             id: ctx.tool_call_id.clone(),
             chunk: format!("  ▸ RSS 抓取 {url} …\n"),
@@ -192,10 +203,18 @@ impl Tool for DoRssRead {
             .await
             .map_err(|e| ToolError::Internal(format!("RSS fetch: {e}")))?;
         let status = resp.status();
-        let body = resp
-            .text()
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        // Bounded read — a feed endpoint streaming endlessly must not be
+        // buffered whole before the cap is applied.
+        let (bytes, truncated) = read_body_capped(resp, MAX_FETCH_BYTES)
             .await
             .map_err(|e| ToolError::Internal(format!("RSS body: {e}")))?;
+        let body = decode_body(&bytes, &ctype);
         if !status.is_success() {
             return Ok(ToolResult::err(
                 format!("RSS HTTP {status}"),
@@ -223,13 +242,19 @@ impl Tool for DoRssRead {
         }
 
         let head = if feed_title.is_empty() { url.clone() } else { feed_title };
-        let out = format!(
+        let mut out = format!(
             "Feed: {head}\nNetwork: {}\nSources:\n✓ RSS/Atom: {} items\nItems ({}):\n{}\n[rss]",
             proxy_note(&proxy, args.get("use_proxy").and_then(|p| p.as_bool())),
             lines.len(),
             lines.len(),
             lines.join("\n\n")
         );
+        if truncated {
+            out.push_str(&format!(
+                "\n[body truncated at {} bytes — later items may be missing]",
+                MAX_FETCH_BYTES
+            ));
+        }
         Ok(ToolResult::ok(out))
     }
 }
@@ -237,6 +262,11 @@ impl Tool for DoRssRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the production path resolves the proxy inside
+    // `web_client_for_args`, so this import belongs here rather than at file
+    // scope (a file-scope import is "unused" to the lib build and gets removed
+    // by `cargo fix`, which then breaks this test module).
+    use crate::tools::web::proxy_configured_url;
     use crate::safety::guard::SafetyGuard;
     use std::sync::Arc;
 

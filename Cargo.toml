@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT"
 authors = ["ZAY"]
@@ -23,7 +23,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 # Config
+# `toml_edit` backs the comment/unknown-key preserving config overlay
+# (`dscode-core/src/config/patch.rs`). `toml` is built on top of it, but does not
+# re-export the editing API, so this is a direct dependency rather than a
+# transitive one. Kept in step with the version `toml` itself resolves to.
 toml = "0.8"
+toml_edit = "0.20"
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # SQLite
@@ -46,6 +51,8 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 # Regex
 regex = "1"
+# Text encoding (Windows console output is CP936/GBK on Chinese systems, not UTF-8)
+encoding_rs = "0.8"
 # Random
 rand = "0.8"
 # Base64

@@ -60,10 +60,11 @@ pub async fn set_global_prompt(
     config.agent = AgentConfig {
         global_prompt: global_prompt.clone(),
         replace_system_prompt,
-        memory_enabled: config.agent.memory_enabled,
-        read_before_edit: config.agent.read_before_edit,
-        memory_auto_ingest: config.agent.memory_auto_ingest,
-        git_bash_path: config.agent.git_bash_path.clone(),
+        // The rest of the section is preserved rather than reconstructed: adding
+        // a field to `AgentConfig` used to require remembering to add it here
+        // too, and forgetting silently reset it to the default on every prompt
+        // save.
+        ..config.agent.clone()
     };
     config
         .save()
@@ -107,9 +108,22 @@ pub async fn update_config(
     }
 
     // BUG10: Re-initialize the session manager only if retention_days changed.
+    // Dropping the live manager while a turn is in flight used to be a silent
+    // data loss: that turn keeps calling `add_message` through the shared slot
+    // and either hits a fresh connection or, if re-init fails, `None`.
+    // Defer instead, and apply it from `ensure_session_manager` once no turn is
+    // running.
     if retention_changed {
-        let mut guard = state.session_manager.lock().await;
-        *guard = None;
+        state
+            .retention_reset_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let busy = !state.active_forges.lock().await.is_empty();
+        if busy {
+            info!("config: retention_days changed mid-turn; session manager reset deferred");
+        } else if let Err(e) = state.ensure_session_manager().await {
+            // Flag stays set, so the next turn retries the re-init.
+            info!(error = %e, "config: retention re-init failed; will retry on next turn");
+        }
     }
 
     info!("config: updated successfully");

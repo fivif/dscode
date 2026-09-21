@@ -41,7 +41,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let lines = build_message_lines(state);
     let visible_height = inner.height as usize;
 
-    let start = state.chat_scroll_offset.min(lines.len().saturating_sub(1));
+    // `chat_scroll_offset` counts lines hidden *below* the viewport (0 = pinned
+    // to the newest line), so the bottom-most window starts here.
+    let max_start = lines.len().saturating_sub(visible_height);
+    let start = max_start.saturating_sub(state.chat_scroll_offset.min(max_start));
     let end = (start + visible_height).min(lines.len());
     let visible_lines: Vec<Line> = lines[start..end].to_vec();
 

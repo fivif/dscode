@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import * as tauri from '@/lib/tauri';
+import { IconChevronRight16, IconClose16, IconPencil16 } from '@/components/icons';
 
 interface Props {
   onClose: () => void;
@@ -69,74 +70,57 @@ export default function GlobalPromptModal({ onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/55 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
       onClick={onClose}
     >
       <div
-        className="bg-card border border-border rounded-xl w-full max-w-2xl shadow-2xl flex flex-col max-h-[90vh]"
+        className="menu w-full max-w-2xl shadow-modal flex flex-col max-h-[90vh]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-5 py-4 border-b border-border shrink-0">
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="text-sky-400/90 shrink-0"
-            aria-hidden
-          >
-            <path d="M12 20h9" />
-            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
-          </svg>
+          <IconPencil16 size={18} className="text-accent shrink-0" />
           <div className="min-w-0 flex-1">
-            <h3 className="text-base font-medium text-gray-200">全局提示词</h3>
-            <p className="text-[11px] text-gray-500 mt-0.5">
+            <h3 className="text-[15px] font-semibold text-primary">全局提示词</h3>
+            <p className="text-[11px] text-muted mt-0.5">
               作用于所有会话的系统提示词；可追加到内置说明，或完全替换
             </p>
           </div>
           <button
-            className="text-gray-500 hover:text-gray-300 p-1"
+            className="icon-btn"
             onClick={onClose}
             title="关闭"
           >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
+            <IconClose16 size={18} />
           </button>
         </div>
 
         <div className="px-5 py-4 overflow-y-auto flex-1 space-y-4">
           {loading ? (
-            <div className="text-sm text-gray-500 py-8 text-center">加载中…</div>
+            <div className="text-[13px] text-muted py-8 text-center">加载中…</div>
           ) : (
             <>
               {error && (
-                <div className="p-2.5 bg-red-900/15 border border-red-900/30 rounded text-red-400 text-xs">
+                <div className="p-2.5 bg-danger/10 border border-danger/40 rounded-control text-danger text-[13px]">
                   {error}
                 </div>
               )}
               {success && (
-                <div className="p-2.5 bg-emerald-900/15 border border-emerald-900/30 rounded text-emerald-400 text-xs">
+                <div className="p-2.5 bg-success/10 border border-success/40 rounded-control text-success text-[13px]">
                   {success}
                 </div>
               )}
 
               <div className="flex flex-wrap items-center gap-3">
-                <label className="inline-flex items-center gap-2 text-xs text-gray-300 cursor-pointer select-none">
+                <label className="inline-flex items-center gap-2 text-[13px] text-secondary cursor-pointer select-none">
                   <input
                     type="checkbox"
-                    className="rounded border-border bg-input"
+                    className="rounded border-border bg-input focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
                     checked={replace}
                     onChange={(e) => setReplace(e.target.checked)}
                   />
                   替换内置系统提示词
                 </label>
-                <span className="text-[11px] text-gray-600">
+                <span className="text-[11px] text-faint">
                   {replace
                     ? '仅使用下方内容作为 system prompt'
                     : '下方内容会追加在内置提示词之后'}
@@ -145,13 +129,13 @@ export default function GlobalPromptModal({ onClose }: Props) {
 
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-xs text-gray-400">
+                  <label className="text-[13px] text-secondary">
                     {replace ? '系统提示词' : '自定义指令（追加）'}
                   </label>
-                  <span className="text-[10px] text-gray-600">{text.length} 字符</span>
+                  <span className="text-[11px] text-faint">{text.length} 字符</span>
                 </div>
                 <textarea
-                  className="w-full min-h-[180px] max-h-[40vh] bg-input border border-border rounded-lg px-3 py-2.5 text-sm text-gray-200 font-mono leading-relaxed resize-y focus:outline-none focus:border-gray-500"
+                  className="field min-h-[180px] max-h-[40vh] font-mono leading-relaxed resize-y"
                   placeholder={
                     replace
                       ? '完整系统提示词…\n例如：You are a careful coding agent. Always…'
@@ -163,52 +147,42 @@ export default function GlobalPromptModal({ onClose }: Props) {
                 />
               </div>
 
-              <div className="border border-border/60 rounded-lg overflow-hidden">
+              <div className="panel overflow-hidden">
                 <button
                   type="button"
-                  className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs text-gray-400 hover:bg-white/[0.02]"
+                  className="w-full flex items-center gap-2 px-3 py-2 text-left text-[13px] text-secondary hover:bg-hover transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
                   onClick={() => setShowDefault((v) => !v)}
                 >
-                  <svg
-                    className={`w-3 h-3 transition-transform ${showDefault ? 'rotate-90' : ''}`}
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                  >
-                    <polyline points="9 18 15 12 9 6" />
-                  </svg>
+                  <IconChevronRight16
+                    size={12}
+                    className={`transition-transform ${showDefault ? 'rotate-90' : ''}`}
+                  />
                   内置默认提示词（只读）
                 </button>
                 {showDefault && (
-                  <pre className="px-3 pb-3 text-[11px] text-gray-500 font-mono whitespace-pre-wrap max-h-40 overflow-y-auto border-t border-border/40 pt-2">
+                  <pre className="px-3 pb-3 text-[11px] text-muted font-mono whitespace-pre-wrap max-h-40 overflow-y-auto border-t border-border/40 pt-2">
                     {defaultPrompt || '（无）'}
                   </pre>
                 )}
               </div>
 
-              <div className="border border-border/60 rounded-lg overflow-hidden">
+              <div className="panel overflow-hidden">
                 <button
                   type="button"
-                  className="w-full flex items-center gap-2 px-3 py-2 text-left text-xs text-gray-400 hover:bg-white/[0.02]"
+                  className="w-full flex items-center gap-2 px-3 py-2 text-left text-[13px] text-secondary hover:bg-hover transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
                   onClick={() => setShowPreview((v) => !v)}
                 >
-                  <svg
-                    className={`w-3 h-3 transition-transform ${showPreview ? 'rotate-90' : ''}`}
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                  >
-                    <polyline points="9 18 15 12 9 6" />
-                  </svg>
+                  <IconChevronRight16
+                    size={12}
+                    className={`transition-transform ${showPreview ? 'rotate-90' : ''}`}
+                  />
                   生效预览
-                  <span className="text-[10px] text-gray-600 ml-auto">
+                  <span className="text-[11px] text-faint ml-auto">
                     {effectivePreview.length} 字符
                   </span>
                 </button>
                 {showPreview && (
-                  <pre className="px-3 pb-3 text-[11px] text-gray-500 font-mono whitespace-pre-wrap max-h-48 overflow-y-auto border-t border-border/40 pt-2">
+                  <pre className="px-3 pb-3 text-[11px] text-muted font-mono whitespace-pre-wrap max-h-48 overflow-y-auto border-t border-border/40 pt-2">
                     {effectivePreview}
                   </pre>
                 )}
@@ -220,7 +194,7 @@ export default function GlobalPromptModal({ onClose }: Props) {
         <div className="flex items-center gap-2 px-5 py-3.5 border-t border-border shrink-0">
           <button
             type="button"
-            className="text-xs text-gray-500 hover:text-red-400 px-2 py-1.5 disabled:opacity-40"
+            className="btn btn-danger disabled:opacity-40"
             onClick={handleClear}
             disabled={loading || saving || !text.trim()}
           >
@@ -229,7 +203,7 @@ export default function GlobalPromptModal({ onClose }: Props) {
           <div className="flex-1" />
           <button
             type="button"
-            className="px-3 py-1.5 text-sm text-gray-400 hover:text-gray-200"
+            className="btn btn-ghost"
             onClick={onClose}
             disabled={saving}
           >
@@ -237,7 +211,7 @@ export default function GlobalPromptModal({ onClose }: Props) {
           </button>
           <button
             type="button"
-            className="px-4 py-1.5 text-sm text-white bg-gray-600 hover:bg-gray-500 rounded-lg transition-colors disabled:opacity-40"
+            className="btn btn-primary px-4 disabled:opacity-40"
             onClick={handleSave}
             disabled={loading || saving}
           >

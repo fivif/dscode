@@ -10,6 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing::warn;
 
 use crate::plan::phases::PlanPhase;
 
@@ -226,29 +227,35 @@ impl InterviewEngine {
     pub async fn next_action(&mut self) -> InterviewAction {
         // First, iterate pending questions looking for ones we can answer by
         // inspecting the codebase.
+        //
+        // NOTE: this deliberately does not move `cursor`. `find_codebase_answerable`
+        // may return an index *past* an earlier unrestricted question, and any
+        // cursor movement here would jump over that question — it would never be
+        // asked, `remaining_count()` would report it forever, and it could never
+        // reach `answer_summary()` (so it could never reach the PRD either).
+        // The scan below re-derives the cursor from the first unanswered question.
         while let Some(idx) = self.find_codebase_answerable() {
-            if let Some(answer) = self.explore_codebase_for(&self.questions[idx]).await {
-                self.questions[idx].auto_answer(answer);
-                self.cursor += 1;
-            } else {
+            let Some(answer) = self.explore_codebase_for(&self.questions[idx]).await else {
                 break;
-            }
+            };
+            self.questions[idx].auto_answer(answer);
         }
 
-        // Find the next unanswered question.
-        while self.cursor < self.questions.len() {
-            let q = &self.questions[self.cursor];
-            if !q.is_answered() {
-                let remaining = self.questions[self.cursor..]
+        // Find the first unanswered question. Scan from the start rather than
+        // from `cursor` for the same reason, and make `cursor` point at the
+        // question being offered so `answer_current` answers the right one.
+        for idx in 0..self.questions.len() {
+            if !self.questions[idx].is_answered() {
+                self.cursor = idx;
+                let remaining = self.questions[idx..]
                     .iter()
                     .filter(|q| !q.is_answered())
                     .count() as u32;
                 return InterviewAction::AskQuestion {
-                    question: q.clone(),
+                    question: self.questions[idx].clone(),
                     remaining,
                 };
             }
-            self.cursor += 1;
         }
 
         // No more questions in this phase.
@@ -282,7 +289,19 @@ impl InterviewEngine {
                 // If we found a next node in the decision tree, look up its
                 // question and insert it right after the current position.
                 if let Some(next_id) = matched_next {
-                    if let Some(next_node) = self.decision_tree.get(&next_id) {
+                    // Cycle guard: a node whose branch points back at an
+                    // already-queued question would otherwise re-insert its own
+                    // question at `cursor + 1` forever, with each round trip
+                    // costing a user message and the interview having no exit
+                    // short of exhausting turns. Node ids are unique and come
+                    // from `decision_tree`, so skipping an id that is already
+                    // queued bounds the queue at |questions| + |decision_tree|.
+                    if self.questions.iter().any(|q| q.id == next_id) {
+                        warn!(
+                            node = %next_id,
+                            "plan decision tree branch points at an already-queued question — skipping to break the cycle"
+                        );
+                    } else if let Some(next_node) = self.decision_tree.get(&next_id) {
                         let insert_pos = self.cursor + 1;
                         if insert_pos <= self.questions.len() {
                             self.questions.insert(insert_pos, next_node.question.clone());
@@ -746,6 +765,75 @@ mod tests {
             }
             _ => panic!("Expected AskQuestion, got {:?}", action),
         }
+    }
+
+    #[tokio::test]
+    async fn test_codebase_auto_answer_does_not_skip_an_earlier_question() {
+        // q1 is a plain question, q2 is answerable from the codebase. The
+        // auto-answer used to advance the cursor past q1, which meant q1 was
+        // never asked, `remaining_count()` reported it forever, and it could
+        // never reach `answer_summary()`.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"t\"").unwrap();
+
+        let mut engine = InterviewEngine::new(tmp.path().to_path_buf());
+        engine.add_question(Question::new(
+            "q1",
+            "What is the primary goal?",
+            "ship it",
+            PlanPhase::Scope,
+        ));
+        engine.add_question(Question::new(
+            "q2",
+            "What language is used?",
+            "unknown",
+            PlanPhase::Scope,
+        ));
+
+        // q2 is explorable ("what language" + a Cargo.toml), so it is answered
+        // from the codebase before the interview returns anything.
+        let action = engine.next_action().await;
+        match action {
+            InterviewAction::AskQuestion { question, .. } => {
+                // q1 must come first even though q2 can be explored.
+                assert_eq!(question.id, "q1");
+            }
+            other => panic!("expected the first unanswered question, got {other:?}"),
+        }
+        assert!(
+            engine.questions[1].is_answered(),
+            "the explorable question should have been answered from the codebase"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decision_tree_cycle_does_not_grow_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = InterviewEngine::new(tmp.path().to_path_buf());
+        // n1 branches back to itself: without a cycle guard its own question is
+        // re-inserted at cursor+1 on every answer, forever.
+        engine.add_question(Question::new("n1", "Loop?", "yes", PlanPhase::Scope));
+        engine.add_decision_node(
+            DecisionNode::new(Question::new("n1", "Loop?", "yes", PlanPhase::Scope))
+                .branch("yes", "n1"),
+        );
+
+        for _ in 0..5 {
+            match engine.next_action().await {
+                InterviewAction::AskQuestion { .. } => engine.answer_current("yes"),
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            engine.questions.len(),
+            1,
+            "a self-referencing branch must not queue the same question repeatedly"
+        );
+        assert!(matches!(
+            engine.next_action().await,
+            InterviewAction::PhaseComplete { .. }
+        ));
     }
 
     #[test]

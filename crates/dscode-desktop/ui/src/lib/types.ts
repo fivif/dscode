@@ -30,9 +30,27 @@ export interface FileAttachment {
 
 // ── Message ──
 export interface Message {
+  /**
+   * Client-side row id. NOTE: this is **not** the backend field — Rust's
+   * `Message` (`dscode-core/src/providers/trait_def.rs`) has no `id`, and
+   * `load_messages` does not select the DB id column, so rows returned by
+   * `get_session` arrive without one. `chatStore.loadSessionMessages` synthesises
+   * `h<index>-<created_at>` for them; never assume a backend id round-trips.
+   */
   id: string;
   session_id?: string;
+  /**
+   * Rust's `Role` enum only has system/user/assistant/tool — `'fact'` never
+   * arrives from the backend today (the `role === 'fact'` branch in
+   * `loadSessionMessages` is dead code kept for the legacy DB shape).
+   */
   role: 'user' | 'assistant' | 'tool' | 'system' | 'fact';
+  /**
+   * Rust's `MessageContent` is `#[serde(untagged)]` over `Text(String)` /
+   * `Parts(Vec<ContentPart>)`, so this can be an array of parts on the wire.
+   * Every current writer stores `Text`, so it is typed as a string here — a
+   * parts message would need normalising before it reaches the renderer.
+   */
   content: string;
   created_at: number; // Unix seconds
   /** User-visible attachment list (UI); full paths also embedded in content for agent */
@@ -238,6 +256,18 @@ export interface AppConfig {
   skills_use_proxy: boolean;
   /** Absolute trust: skip confirm for dangerous commands (hard blocks still apply) */
   absolute_trust: boolean;
+  /**
+   * Registered `do_image_generate` tool (Rust `generation.image_enabled`).
+   * Flat here like the other generation fields — Rust keeps them under
+   * `[generation]`, `configStore` maps between the two shapes.
+   */
+  image_enabled: boolean;
+  /** Model id **as the channel lists it**; empty falls back to the tool's default. */
+  image_model: string;
+  /** WxH, e.g. `1024x1024`. Not validated here — the tool rejects bad values. */
+  image_size: string;
+  /** Channel key for image calls; empty = follow `active_provider`. */
+  image_provider: string;
 }
 
 /** Valid non-empty proxy URL with supported scheme */

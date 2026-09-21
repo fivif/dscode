@@ -16,6 +16,13 @@ use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 
 const MAX_LOG_BYTES: usize = 512 * 1024;
 
+/// Upper bound on retained task *records* (each holding up to `MAX_LOG_BYTES`
+/// of log). Nothing used to remove a finished task, so a long-lived session
+/// (the manager is process-global) accumulated every command it had ever run —
+/// hundreds of MB of dead logs, plus an ever-growing `do_task_status` listing.
+/// Running tasks are never evicted, so this is a soft cap under heavy churn.
+const MAX_TASKS: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct BackgroundTask {
     pub id: String,
@@ -104,6 +111,8 @@ impl TaskManager {
         let tid = id.clone();
         let notify = self.notify_tx.clone();
 
+        prune_tasks(&tasks).await;
+
         {
             let mut guard = tasks.lock().await;
             guard.insert(
@@ -128,7 +137,10 @@ impl TaskManager {
 
         tokio::spawn(async move {
             // Shared shell selection (Unix: bash -c; Windows: Git Bash if
-            // available, otherwise cmd.exe /C) — same behavior as do_bash.
+            // available, otherwise PowerShell with a UTF-8 output prefix) —
+            // exactly what do_bash uses, so the same command resolves to the
+            // same shell in both tools. This is *not* a ConPTY though: output
+            // written through the Windows Console API is still invisible here.
             let (shell, shell_args) = crate::tools::bash::shell_command(&command);
             let mut builder = Command::new(&shell);
             builder
@@ -322,36 +334,34 @@ impl TaskManager {
         };
 
         if let Some(ref mut lc) = taken {
-            let _ = lc.child.start_kill();
+            // On Unix the pid to signal is the process *group* id, set equal to
+            // the child's pid by `process_group(0)`; on Windows it is the pid.
             #[cfg(unix)]
-            {
-                let pg = if lc.pgid > 1 {
-                    lc.pgid
-                } else {
-                    pid.unwrap_or(0)
-                };
-                if pg > 1 {
-                    kill_pg(pg);
-                }
-            }
+            let signal_pid = if lc.pgid > 1 { Some(lc.pgid) } else { pid };
+            #[cfg(not(unix))]
+            let signal_pid = pid;
+
+            // Kill the whole tree *while the parent is still alive*. On Windows
+            // `taskkill /T` follows parent→child links, and an orphaned msys
+            // grandchild (the `sleep` behind Git Bash's `bash.exe` wrapper) is
+            // reparented the moment its parent dies — it would then survive,
+            // holding the stdout/stderr pipes the log readers are waiting on.
+            crate::tools::bash::kill_process_tree(signal_pid);
+
+            let _ = lc.child.start_kill();
             // Brief wait so process actually dies; never hang the tool.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(800),
                 lc.child.wait(),
             )
             .await;
-            // If still not reaped, SIGKILL group again and drop (kill_on_drop).
+            // If still not reaped, SIGKILL the group again and drop (kill_on_drop).
             #[cfg(unix)]
-            if let Some(p) = pid.filter(|&p| p > 1) {
-                kill_pg(p);
-            }
+            crate::tools::bash::kill_process_tree(signal_pid);
             let _ = lc.child.start_kill();
         } else {
-            // Child not yet registered or already reaped — still signal by pid/pgid.
-            #[cfg(unix)]
-            if let Some(p) = pid.filter(|&p| p > 1) {
-                kill_pg(p);
-            }
+            // Child not yet registered or already reaped — still signal by pid.
+            crate::tools::bash::kill_process_tree(pid);
         }
         drop(taken);
 
@@ -388,6 +398,33 @@ impl TaskManager {
     }
 }
 
+/// Evict the oldest *finished* task records once the map exceeds `MAX_TASKS`.
+///
+/// Runs under the tasks lock and is called before every insert. Running tasks
+/// are never touched: their entry is the only place `do_task_status` can find
+/// them, and `kill` looks the pid up there.
+async fn prune_tasks(tasks: &Arc<Mutex<HashMap<String, BackgroundTask>>>) {
+    let mut guard = tasks.lock().await;
+    // +1 because the caller is about to insert one more.
+    let mut over = guard.len().saturating_add(1).saturating_sub(MAX_TASKS);
+    if over == 0 {
+        return;
+    }
+    let mut finished: Vec<(Instant, String)> = guard
+        .iter()
+        .filter(|(_, t)| t.status != TaskStatus::Running)
+        .map(|(id, t)| (t.started_at, id.clone()))
+        .collect();
+    finished.sort_by_key(|(started_at, _)| *started_at); // oldest first
+    for (_, id) in finished {
+        if over == 0 {
+            break;
+        }
+        guard.remove(&id);
+        over -= 1;
+    }
+}
+
 async fn fail_task(
     tasks: &Arc<Mutex<HashMap<String, BackgroundTask>>>,
     notify: &broadcast::Sender<TaskNotification>,
@@ -414,36 +451,25 @@ async fn pipe_to_log(
     tid: &str,
 ) {
     let Some(pipe) = pipe else { return };
-    let mut reader = BufReader::new(pipe).lines();
+    // Byte-oriented reads: `BufReader::lines()` returns `Err` on the first
+    // invalid UTF-8 byte and the loop simply `break`s on it, so the log froze
+    // at that point (Windows CP936 output tripped this immediately). Read the
+    // raw bytes and decode per line with the same cascade `do_bash` uses.
+    let mut reader = BufReader::new(pipe);
+    let mut buf: Vec<u8> = Vec::new();
     loop {
         // Timed read so kill can end the task without readers blocking forever on a stuck pipe.
-        let line_res =
-            tokio::time::timeout(std::time::Duration::from_secs(1), reader.next_line()).await;
-        match line_res {
-            Ok(Ok(Some(line))) => {
-                let chunk = if is_stderr {
-                    format!("[stderr] {line}\n")
-                } else {
-                    format!("{line}\n")
-                };
-                {
-                    let mut guard = tasks.lock().await;
-                    if let Some(task) = guard.get_mut(tid) {
-                        task.output.push_str(&chunk);
-                        if task.output.len() > MAX_LOG_BYTES {
-                            let drain = task.output.len() - MAX_LOG_BYTES;
-                            task.output.drain(..drain);
-                            task.output.insert_str(0, "…[log truncated]…\n");
-                        }
-                    }
-                }
-                let _ = notify.send(TaskNotification {
-                    task_id: tid.to_string(),
-                    status: TaskNotificationStatus::Progress,
-                    output: chunk,
-                });
-            }
-            Ok(Ok(None)) | Ok(Err(_)) => break,
+        let read_res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_until(b'\n', &mut buf),
+        )
+        .await;
+        // On timeout `buf` keeps what was read so far — it is only cleared once a
+        // full line has been forwarded, so a slow line is not chopped up.
+        let eof = match read_res {
+            Ok(Ok(0)) => true,
+            Ok(Ok(_)) => false,
+            Ok(Err(_)) => break,
             Err(_) => {
                 // Timeout: if task is no longer Running, stop reading.
                 let done = {
@@ -456,22 +482,63 @@ async fn pipe_to_log(
                 if done {
                     break;
                 }
+                continue;
+            }
+        };
+        if eof && buf.is_empty() {
+            break;
+        }
+
+        // Decode first, then strip: escape sequences are pure ASCII, so decoding
+        // cannot disturb them, whereas stripping runs over a `&str` and would be
+        // fed replacement characters if the two were reversed (the contract on
+        // `decode_output`).
+        //
+        // The strip is not optional here. A background task is usually a dev
+        // server or a test runner, and those colour their output whenever they
+        // think a terminal is attached: `cargo test`, `npm run dev`, `pytest` and
+        // `vite` all do. Without this, every one of those writes `ESC[32m`-style
+        // sequences straight into the task log the model reads back via
+        // `do_task_output`.
+        let line = crate::tools::bash::strip_ansi(&crate::tools::bash::decode_output(&buf));
+        buf.clear();
+        let chunk = if is_stderr {
+            format!("[stderr] {line}")
+        } else {
+            line
+        };
+
+        {
+            let mut guard = tasks.lock().await;
+            if let Some(task) = guard.get_mut(tid) {
+                task.output.push_str(&chunk);
+                if task.output.len() > MAX_LOG_BYTES {
+                    // `String::drain` takes a *byte* index and panics unless it
+                    // lands on a char boundary. With multi-byte log text
+                    // (Chinese, emoji, box-drawing from vite/npm) the byte cut
+                    // almost never does, and the panic was swallowed by
+                    // `let _ = handle.await` — the log silently froze at 512 KB.
+                    // Round the cut up to the next char boundary instead.
+                    let cut = task
+                        .output
+                        .ceil_char_boundary(task.output.len() - MAX_LOG_BYTES);
+                    task.output.drain(..cut);
+                    task.output.insert_str(0, "…[log truncated]…\n");
+                }
             }
         }
-    }
-}
+        let _ = notify.send(TaskNotification {
+            task_id: tid.to_string(),
+            status: TaskNotificationStatus::Progress,
+            output: chunk,
+        });
 
-#[cfg(unix)]
-fn kill_pg(pgid: u32) {
-    extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
+        // EOF with a trailing, unterminated line still in `buf`: forward it,
+        // then stop.
+        if eof {
+            break;
+        }
     }
-    const SIGTERM: i32 = 15;
-    const SIGKILL: i32 = 9;
-    let p = pgid as i32;
-    let _ = unsafe { kill(-p, SIGTERM) };
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let _ = unsafe { kill(-p, SIGKILL) };
 }
 
 // ── Tools ──────────────────────────────────────────────────────────────────
@@ -814,5 +881,60 @@ mod tests {
 
         let g = mgr.tasks.lock().await;
         assert_eq!(g.get(&id).unwrap().status, TaskStatus::Killed);
+    }
+
+    /// A background log must not carry the escape sequences a coloured program
+    /// writes.
+    ///
+    /// This is the half of the ANSI problem `do_bash` does not cover: the piped
+    /// reader had no strip at all, so `cargo test`, `npm run dev`, `vite` and
+    /// `pytest` — the commands `do_background` exists for — put `ESC[32m` and
+    /// friends straight into `task.output`, which `do_task_output` hands to the
+    /// model verbatim.
+    #[tokio::test]
+    async fn background_log_carries_no_ansi_escapes() {
+        let mgr = TaskManager::new();
+        let id = "bg_ansi".to_string();
+        mgr.spawn(
+            id.clone(),
+            "colour check".into(),
+            // bash's printf interprets \033; the byte is emitted literally, the
+            // same way a colouring program emits it.
+            r"printf '\033[32mgreen\033[0m plain\n'".into(),
+            std::env::temp_dir(),
+        )
+        .await;
+
+        let mut output = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let g = mgr.tasks.lock().await;
+            if let Some(t) = g.get(&id) {
+                output = t.output.clone();
+            }
+            if output.contains("plain") {
+                break;
+            }
+        }
+
+        // `printf` is a POSIX shell builtin. Where `shell_command` resolves to
+        // PowerShell (no Git Bash installed) the command never runs, and this
+        // test has nothing to say — skip rather than fail on a shell it does not
+        // target.
+        if output.is_empty() {
+            eprintln!("skipping background_log_carries_no_ansi_escapes: shell did not run the probe");
+            return;
+        }
+
+        // The defect first, so a failure names what actually went wrong rather
+        // than reporting the symptom the escapes cause.
+        assert!(
+            !output.contains('\u{1b}'),
+            "escape sequence reached the task log: {output:?}"
+        );
+        assert!(
+            output.contains("green plain"),
+            "stripping took the text with it: {output:?}"
+        );
     }
 }

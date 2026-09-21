@@ -11,8 +11,8 @@ use dscode_core::tools::registry::ToolRegistry;
 #[test]
 fn end_to_end_board_dag_schedule() {
     let mut board = TaskBoard::new("sess-1");
-    let mut t1 = TaskSpec::new("r1", "Research A", "find auth", AgentRole::Explore);
-    let mut t2 = TaskSpec::new("r2", "Research B", "find db", AgentRole::Explore);
+    let t1 = TaskSpec::new("r1", "Research A", "find auth", AgentRole::Explore);
+    let t2 = TaskSpec::new("r2", "Research B", "find db", AgentRole::Explore);
     let mut t3 = TaskSpec::new("i1", "Implement", "wire auth", AgentRole::Implement);
     t3.dependencies = vec!["r1".into(), "r2".into()];
     t3.owned_paths = vec!["src/auth.rs".into()];

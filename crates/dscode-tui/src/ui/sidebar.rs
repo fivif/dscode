@@ -18,6 +18,9 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
 use crate::app::AppState;
 use crate::theme::Theme;
 
+/// Maximum rendered title width, in chars (the `…` is included).
+const MAX_TITLE_CHARS: usize = 30;
+
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -97,8 +100,11 @@ fn build_session_list(state: &AppState) -> Vec<ListItem<'static>> {
         )));
 
         for session in *sessions {
-            let title = if session.title.len() > 30 {
-                format!("{}…", &session.title[..29])
+            // Truncate on a char boundary: byte slicing panics on CJK titles
+            // (10 Chinese chars = 30 bytes). `…` counts toward the 30 width.
+            let title = if session.title.chars().count() > MAX_TITLE_CHARS {
+                let kept: String = session.title.chars().take(MAX_TITLE_CHARS - 1).collect();
+                format!("{}…", kept)
             } else {
                 session.title.clone()
             };

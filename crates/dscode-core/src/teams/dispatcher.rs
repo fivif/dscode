@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::agent::forge::Forge;
 use crate::agent::stream::StreamEvent;
@@ -361,7 +361,6 @@ async fn run_sub_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::forge::Forge;
     use crate::tools::registry::ToolRegistry;
 
     #[test]

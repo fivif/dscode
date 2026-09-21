@@ -29,21 +29,76 @@ const DEFAULT_MAX_STEPS_PER_ROUND: u32 = 12;
 const PHASE_LLM_TIMEOUT_SECS: u64 = 120;
 
 /// Errors that can occur during a MAGI spiral.
+///
+/// Every non-`MaxRounds` variant also carries the rounds that had already
+/// completed, so a failure in a later phase does not discard the scrutiny,
+/// execution and quality history of earlier rounds.
 #[derive(Debug, thiserror::Error)]
 pub enum MagiError {
     /// The underlying LLM provider returned an error.
     #[error("provider error: {0}")]
-    Provider(#[from] ProviderError),
+    Provider(ProviderError, Vec<MagiRound>),
 
     /// Failed to parse a structured response from the LLM.
     #[error("parse error: {0}")]
-    Parse(String),
+    Parse(String, Vec<MagiRound>),
 
     /// The spiral exhausted its round budget without Melchior stopping.
     /// Wraps the max rounds reached and the completed rounds so callers
     /// can access partial results.
     #[error("max rounds ({0}) reached without completion")]
     MaxRounds(u32, Vec<MagiRound>),
+
+    /// The caller's cancellation token was tripped.
+    #[error("cancelled")]
+    Cancelled(Vec<MagiRound>),
+}
+
+impl MagiError {
+    /// Build a parse error with no rounds attached yet.
+    pub fn parse(msg: impl Into<String>) -> Self {
+        MagiError::Parse(msg.into(), Vec::new())
+    }
+
+    /// Build a provider error with no rounds attached yet.
+    pub fn provider(e: ProviderError) -> Self {
+        MagiError::Provider(e, Vec::new())
+    }
+
+    /// Build a cancellation error with no rounds attached yet.
+    pub fn cancelled() -> Self {
+        MagiError::Cancelled(Vec::new())
+    }
+
+    /// Rounds completed before this error (empty when none).
+    pub fn rounds(&self) -> &[MagiRound] {
+        match self {
+            MagiError::Provider(_, r)
+            | MagiError::Parse(_, r)
+            | MagiError::MaxRounds(_, r)
+            | MagiError::Cancelled(r) => r,
+        }
+    }
+
+    /// Attach the rounds completed before the failure (kept if already set).
+    pub fn with_rounds(mut self, rounds: Vec<MagiRound>) -> Self {
+        let slot = match &mut self {
+            MagiError::Provider(_, r)
+            | MagiError::Parse(_, r)
+            | MagiError::MaxRounds(_, r)
+            | MagiError::Cancelled(r) => r,
+        };
+        if slot.is_empty() {
+            *slot = rounds;
+        }
+        self
+    }
+}
+
+impl From<ProviderError> for MagiError {
+    fn from(e: ProviderError) -> Self {
+        MagiError::Provider(e, Vec::new())
+    }
 }
 
 /// A single round of the MAGI spiral.
@@ -100,6 +155,10 @@ pub struct MagiScheduler {
     /// Optional permission hub (usually None in headless /auto — confirm → deny).
     permission_hub: Option<Arc<PermissionHub>>,
     permission_timeout_secs: u64,
+    /// Cooperative cancel, polled between phases and inside Balthasar's loop.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Serializes write-capable tool calls between spirals sharing one checkout.
+    write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl MagiScheduler {
@@ -123,6 +182,8 @@ impl MagiScheduler {
             safety_guard: Arc::new(SafetyGuard::new(&[], false)),
             permission_hub: None,
             permission_timeout_secs: 120,
+            cancel_token: None,
+            write_lock: None,
         }
     }
 
@@ -145,6 +206,8 @@ impl MagiScheduler {
             safety_guard: Arc::new(SafetyGuard::new(&[], false)),
             permission_hub: None,
             permission_timeout_secs: 120,
+            cancel_token: None,
+            write_lock: None,
         }
     }
 
@@ -173,6 +236,26 @@ impl MagiScheduler {
     pub fn with_max_steps_per_round(mut self, n: u32) -> Self {
         self.max_steps_per_round = n;
         self
+    }
+
+    /// Cooperative cancel — polled between phases and inside Balthasar's loop.
+    pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Shared lock serializing write-capable tool calls across concurrent
+    /// spirals that share one working directory.
+    pub fn with_write_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.write_lock = Some(lock);
+        self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false)
     }
 
     /// Attach UI progress (same channel as AutoRunner / Forge).
@@ -211,22 +294,27 @@ impl MagiScheduler {
         session_id: &str,
     ) -> Result<Vec<MagiRound>, MagiError> {
         let mut rounds: Vec<MagiRound> = Vec::new();
+        // A zero round budget would silently do no work at all.
+        let max_rounds = self.max_rounds.max(1);
 
-        for round_num in 1..=self.max_rounds {
+        for round_num in 1..=max_rounds {
+            if self.is_cancelled() {
+                info!(session = %session_id, round = round_num, "MAGI: cancelled before round");
+                return Err(MagiError::Cancelled(rounds));
+            }
             info!(
                 session = %session_id,
                 round = round_num,
-                max_rounds = self.max_rounds,
+                max_rounds,
                 "MAGI: starting round"
             );
             self.emit_phase(format!(
-                "Auto round {round_num}/{} — reviewing…",
-                self.max_rounds
+                "Auto round {round_num}/{max_rounds} — reviewing…"
             ));
 
-            // ---- 1. Casper: scrutinize ----
+            // ---- 1. Casper: scrutinize (idempotent read-only LLM call → retryable) ----
             let previous_scrutiny = rounds.last().map(|r| r.scrutiny.as_str()).unwrap_or("");
-            let scrutiny = retry_with_backoff(
+            let scrutiny_res = retry_with_backoff(
                 || async {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(PHASE_LLM_TIMEOUT_SECS),
@@ -234,19 +322,31 @@ impl MagiScheduler {
                     )
                     .await
                     .map_err(|_| {
-                        MagiError::Parse(format!(
+                        MagiError::parse(format!(
                             "Casper timed out after {PHASE_LLM_TIMEOUT_SECS}s (round {round_num})"
                         ))
                     })?
                 },
                 2,
             )
-            .await?;
+            .await;
+            let scrutiny = match scrutiny_res {
+                Ok(s) => s,
+                Err(e) => return Err(e.with_rounds(rounds)),
+            };
 
             let scr_preview: String = scrutiny.chars().take(280).collect();
             self.emit_phase(format!("Review done — {scr_preview}…"));
 
+            if self.is_cancelled() {
+                return Err(MagiError::Cancelled(rounds));
+            }
+
             // ---- 2. Balthasar: execute ----
+            // Deliberately NOT retried: this phase writes files and runs shell
+            // commands, and a retry restarts from step 1 with a fresh
+            // conversation — the model would repeat Edit/Write/git commit on
+            // work that already landed.
             self.emit_phase(format!(
                 "Round {round_num} — executing (max {} steps)…",
                 self.max_steps_per_round
@@ -255,29 +355,46 @@ impl MagiScheduler {
             let safety = self.safety_guard.clone();
             let hub = self.permission_hub.clone();
             let pto = self.permission_timeout_secs;
-            let execution = retry_with_backoff(
-                || {
-                    execute_subtask(
-                        &**self.provider,
-                        &self.tools,
-                        &self.working_dir,
-                        session_id,
-                        prd,
-                        &scrutiny,
-                        self.max_steps_per_round,
-                        progress.as_ref(),
-                        safety.clone(),
-                        hub.clone(),
-                        pto,
-                    )
-                },
-                2,
+            let execution_res = execute_subtask(
+                &**self.provider,
+                &self.tools,
+                &self.working_dir,
+                session_id,
+                prd,
+                &scrutiny,
+                self.max_steps_per_round,
+                progress.as_ref(),
+                safety,
+                hub,
+                pto,
+                self.cancel_token.as_ref(),
+                self.write_lock.as_ref(),
             )
-            .await?;
+            .await;
+            let execution = match execution_res {
+                Ok(x) => x,
+                Err(e) => {
+                    warn!(
+                        session = %session_id,
+                        round = round_num,
+                        error = %e,
+                        "MAGI: Balthasar failed — not retrying (non-idempotent phase)"
+                    );
+                    self.emit_phase(format!(
+                        "Round {round_num} — execution failed: {e}"
+                    ));
+                    // Preserve completed rounds; also surface how far this round got.
+                    return Err(e.with_rounds(rounds));
+                }
+            };
 
-            // ---- 3. Melchior: promote ----
+            if self.is_cancelled() {
+                return Err(MagiError::Cancelled(rounds));
+            }
+
+            // ---- 3. Melchior: promote (idempotent evaluation → retryable) ----
             self.emit_phase(format!("Round {round_num} — evaluating quality…"));
-            let promotion = retry_with_backoff(
+            let promotion_res = retry_with_backoff(
                 || async {
                     tokio::time::timeout(
                         std::time::Duration::from_secs(PHASE_LLM_TIMEOUT_SECS),
@@ -285,14 +402,18 @@ impl MagiScheduler {
                     )
                     .await
                     .map_err(|_| {
-                        MagiError::Parse(format!(
+                        MagiError::parse(format!(
                             "Melchior timed out after {PHASE_LLM_TIMEOUT_SECS}s (round {round_num})"
                         ))
                     })?
                 },
                 2,
             )
-            .await?;
+            .await;
+            let promotion = match promotion_res {
+                Ok(p) => p,
+                Err(e) => return Err(e.with_rounds(rounds)),
+            };
 
             info!(
                 session = %session_id,
@@ -326,10 +447,10 @@ impl MagiScheduler {
 
         warn!(
             session = %session_id,
-            rounds = self.max_rounds,
+            rounds = max_rounds,
             "MAGI: max rounds reached without completion"
         );
-        Err(MagiError::MaxRounds(self.max_rounds, rounds))
+        Err(MagiError::MaxRounds(max_rounds, rounds))
     }
 }
 
@@ -516,11 +637,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_spiral_max_rounds_exhausted() {
-        // Provider always returns content that causes the spiral to continue
-        // (Melchior never says stop)
+        // Provider always returns a well-formed "continue" verdict
+        // (Melchior never says stop).
         let responses: Vec<ChatResponse> = (0..30)
             .map(|_| ChatResponse {
-                content: "CONTINUE".into(),
+                content: "STOP: false\nREASON: more work\nQUALITY: 40\nFOCUS: keep going".into(),
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None, })

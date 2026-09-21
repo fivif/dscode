@@ -7,7 +7,7 @@ interface Props {
 }
 
 export default function NewSessionModal({ onClose, onCreated }: Props) {
-  const { sessions, createSession, getLastSession } = useSessionStore();
+  const { createSession, getLastSession } = useSessionStore();
   const [lastWorkspace, setLastWorkspace] = useState('');
   const [showInput, setShowInput] = useState(false);
   const [customPath, setCustomPath] = useState('');
@@ -24,10 +24,10 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
     setLoading(true);
     setError('');
     try {
-      // Provisional title from workspace folder; auto-renamed on first message
-      const folder = workspace.split(/[/\\]/).filter(Boolean).pop();
-      const title = folder ? folder : '新对话';
-      const session = await createSession(title, workspace);
+      // Naming is the backend's job: an empty title makes it store a
+      // workspace-derived placeholder, which stays renameable by the first
+      // message (and by the LLM namer that runs after it).
+      const session = await createSession('', workspace);
       if (session) {
         onCreated(session.id);
         onClose();
@@ -54,41 +54,41 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center" onClick={onClose}>
-      <div className="bg-card border border-border rounded-xl w-full max-w-sm p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <h3 className="text-base font-medium text-gray-200 mb-5">新建对话</h3>
+    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center" onClick={onClose}>
+      <div className="menu w-full max-w-sm p-6 shadow-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-[15px] font-semibold text-primary mb-5">新建对话</h3>
 
         {/* Error message */}
         {error && (
-          <div className="mb-3 p-2 bg-red-900/15 border border-red-900/30 rounded text-red-400 text-xs">{error}</div>
+          <div className="mb-3 p-2 bg-danger/10 border border-danger/40 rounded-control text-danger text-[13px]">{error}</div>
         )}
 
         {/* Inherit last workspace */}
         {lastWorkspace && (
           <button
-            className="w-full text-left p-4 rounded-lg border border-border hover:bg-gray-700/50 transition-colors mb-3"
+            className="w-full text-left p-4 rounded-card border border-border hover:bg-hover transition-colors mb-3 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
             onClick={() => handleCreate(lastWorkspace)}
             disabled={loading}
           >
-            <div className="text-sm text-gray-200">沿用上次工作区</div>
-            <div className="text-xs text-gray-500 mt-1 truncate">{lastWorkspace}</div>
+            <div className="text-[13px] text-primary">沿用上次工作区</div>
+            <div className="text-[11px] text-muted mt-1 truncate">{lastWorkspace}</div>
           </button>
         )}
 
         {/* Browse for folder */}
         <button
-          className="w-full text-left p-4 rounded-lg border border-border hover:bg-gray-700/50 transition-colors mb-3"
+          className="w-full text-left p-4 rounded-card border border-border hover:bg-hover transition-colors mb-3 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
           onClick={handleBrowse}
           disabled={loading}
         >
-          <div className="text-sm text-gray-200">浏览选择文件夹</div>
-          <div className="text-xs text-gray-500 mt-1">选择项目根目录作为工作区</div>
+          <div className="text-[13px] text-primary">浏览选择文件夹</div>
+          <div className="text-[11px] text-muted mt-1">选择项目根目录作为工作区</div>
         </button>
 
         {showInput && (
           <div className="mt-3">
             <input
-              className="w-full bg-input border border-border rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-gray-500"
+              className="field font-mono"
               placeholder="/path/to/project"
               value={customPath}
               onChange={(e) => setCustomPath(e.target.value)}
@@ -98,7 +98,7 @@ export default function NewSessionModal({ onClose, onCreated }: Props) {
           </div>
         )}
 
-        <button className="mt-1 text-sm text-gray-400 hover:text-gray-200 transition-colors w-full text-center py-2" onClick={onClose}>
+        <button className="btn btn-ghost w-full mt-1" onClick={onClose}>
           取消
         </button>
       </div>

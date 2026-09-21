@@ -17,6 +17,7 @@ pub mod extensions;
 pub mod magi;
 pub mod memory;
 pub mod plan;
+pub mod platform;
 pub mod providers;
 pub mod safety;
 pub mod session;

@@ -11,16 +11,54 @@ use crate::agent::stream::StreamEvent;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
+type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+
 /// Shared gate: emit `PermissionRequest`, wait for `resolve`.
 #[derive(Debug, Default)]
 pub struct PermissionHub {
-    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pending: PendingMap,
+}
+
+/// Removes its request id from the hub when dropped.
+///
+/// `request_confirm` can be cancelled at any await point: the caller's task is
+/// aborted, the tool future is dropped, or the process tears the session down
+/// mid-prompt. `resolve` is the only other place that removes an entry, so
+/// without this guard a cancelled request would sit in `pending` forever.
+#[derive(Debug)]
+struct PendingGuard {
+    pending: PendingMap,
+    request_id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        // `drop` is synchronous, so the async mutex cannot be awaited here.
+        match self.pending.try_lock() {
+            Ok(mut g) => {
+                g.remove(&self.request_id);
+            }
+            Err(_) => {
+                // Someone holds the lock right now (an insert or a resolve —
+                // both are short and never await while holding it). Hand the
+                // cleanup to the runtime rather than leaking the entry; with no
+                // runtime we are shutting down and the map goes with us.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let pending = Arc::clone(&self.pending);
+                    let id = std::mem::take(&mut self.request_id);
+                    handle.spawn(async move {
+                        pending.lock().await.remove(&id);
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl PermissionHub {
     pub fn new() -> Self {
         Self {
-            pending: Mutex::new(HashMap::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -47,10 +85,16 @@ impl PermissionHub {
                 .collect::<String>()
         );
         let (tx, rx) = oneshot::channel();
-        {
+        // The guard owns a clone of the map handle, not a borrow of `self`, so
+        // it stays valid however this future is dropped.
+        let _pending_guard = {
             let mut g = self.pending.lock().await;
             g.insert(request_id.clone(), tx);
-        }
+            PendingGuard {
+                pending: Arc::clone(&self.pending),
+                request_id: request_id.clone(),
+            }
+        };
 
         let _ = event_tx.send(StreamEvent::PermissionRequest {
             id: request_id.clone(),
@@ -74,12 +118,7 @@ impl PermissionHub {
             Ok(Ok(true)) => true,
             Ok(Ok(false)) => false,
             Ok(Err(_)) => false, // sender dropped
-            Err(_) => {
-                // timeout — drop pending
-                let mut g = self.pending.lock().await;
-                g.remove(&request_id);
-                false
-            }
+            Err(_) => false,     // timeout — dropped guard removes the entry
         }
     }
 
@@ -93,5 +132,80 @@ impl PermissionHub {
             }
             None => Err(format!("Permission request '{request_id}' not found or expired")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn cancelled_request_is_removed_from_pending() {
+        let hub = PermissionHub::shared();
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let task_hub = Arc::clone(&hub);
+        let task = tokio::spawn(async move {
+            task_hub
+                .request_confirm(&tx, "call-1", "rm -rf /", "test", 60)
+                .await
+        });
+
+        let id = match rx.recv().await {
+            Some(StreamEvent::PermissionRequest { id, .. }) => id,
+            _ => panic!("expected a permission request event"),
+        };
+
+        task.abort();
+        let _ = task.await; // the future (and its PendingGuard) is dropped here
+
+        assert!(
+            hub.resolve(&id, true).await.is_err(),
+            "a cancelled request must not stay pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_request_resolves_once() {
+        let hub = PermissionHub::shared();
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let task_hub = Arc::clone(&hub);
+        let task = tokio::spawn(async move {
+            task_hub
+                .request_confirm(&tx, "call-1", "sudo ls", "test", 60)
+                .await
+        });
+
+        let id = match rx.recv().await {
+            Some(StreamEvent::PermissionRequest { id, .. }) => id,
+            _ => panic!("expected a permission request event"),
+        };
+        hub.resolve(&id, true).await.unwrap();
+        assert!(task.await.unwrap());
+        // One-shot: the same id cannot be replayed.
+        assert!(hub.resolve(&id, true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn timeout_fails_closed_and_clears_pending() {
+        let hub = PermissionHub::shared();
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let task_hub = Arc::clone(&hub);
+        let task = tokio::spawn(async move {
+            // Never answered: must fail closed on the timeout, not default to allow.
+            task_hub
+                .request_confirm(&tx, "call-1", "sudo ls", "test", 1)
+                .await
+        });
+
+        let id = match rx.recv().await {
+            Some(StreamEvent::PermissionRequest { id, .. }) => id,
+            _ => panic!("expected a permission request event"),
+        };
+        assert!(!task.await.unwrap());
+        assert!(
+            hub.resolve(&id, true).await.is_err(),
+            "a timed-out request must not stay pending"
+        );
     }
 }

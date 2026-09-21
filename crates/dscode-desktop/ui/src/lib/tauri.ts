@@ -1,7 +1,17 @@
-import { invoke as tauriInvoke } from '@tauri-apps/api/core';
+import { invoke as tauriInvoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen as tauriListen } from '@tauri-apps/api/event';
 import type { StreamEvent, Session, AppConfig } from './types';
 
+/**
+ * Are we inside the Tauri shell (vs. the browser/web shell serving the same UI)?
+ *
+ * `__TAURI_INTERNALS__` is Tauri 2's own IPC bridge and is injected into every
+ * webview it owns; `window.__TAURI__` only exists when `app.withGlobalTauri` is
+ * enabled, which `tauri.conf.json` does not set — probing it here would always
+ * be false and silently send every call down the HTTP branch. Using the same
+ * constant as `invoke`/`listen` also keeps the two transports from disagreeing
+ * within one runtime.
+ */
 const IS_TAURI = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 /** Unified invoke: Tauri IPC in the desktop shell, HTTP `/api/invoke` in the browser. */
@@ -9,9 +19,18 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
   if (IS_TAURI) {
     return tauriInvoke<T>(command, args);
   }
+  // `/api/invoke` sits behind the same bearer middleware as everything else
+  // under `/api`, so without this header every command in the web shell — send,
+  // list sessions, read config — comes back 401. `fetch` can set headers, so it
+  // uses the header form rather than the query parameter (which `EventSource`
+  // and `<img>` are stuck with).
+  const token = webToken();
   const res = await fetch('/api/invoke', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({ command, args: args ?? {} }),
   });
   if (!res.ok) {
@@ -31,9 +50,31 @@ function emitLocal(event: string, payload: unknown) {
   for (const cb of set) cb({ event, payload });
 }
 
+/**
+ * The `?token=` from the page URL, or `null` outside the browser.
+ *
+ * The web shell prints its per-startup token and the user opens the app with
+ * `?token=<t>`. Every `/api/*` route is behind the bearer middleware
+ * (`dscode-web/src/auth.rs`), and neither an `<img>` nor an `EventSource` can
+ * set an `Authorization` header — the query parameter is the only channel both
+ * of them have. Exporting it keeps the two call sites from drifting apart.
+ */
+export function webToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return new URLSearchParams(window.location.search).get('token');
+}
+
 function ensureEventSource(): EventSource {
   if (_es) return _es;
-  _es = new EventSource('/api/events');
+  // The URL is fixed at construction — `EventSource` has no way to change it —
+  // so the token has to be read here rather than lazily like `imageSrc` does.
+  // Without it this connection 401s, and `EventSource` fails **silently**: the
+  // page still loads, but no stream events, title updates or task
+  // notifications ever arrive, which reads as "the app is dead".
+  const token = webToken();
+  _es = new EventSource(
+    token ? `/api/events?token=${encodeURIComponent(token)}` : '/api/events',
+  );
   _es.addEventListener('server-event', (e) => {
     let data: unknown;
     try {
@@ -68,6 +109,47 @@ export async function listen<T>(
   return () => {
     set?.delete(cb);
   };
+}
+
+// ── Assets ──
+
+/**
+ * Turn an absolute path on disk into a URL the webview can load in an `<img>`.
+ *
+ * Only used for images this app generated itself (`do_image_generate` writes
+ * them under `~/.dscode/images/` and reports them as `dscode-image:<path>`) —
+ * never for a URL that came from the model or a fetched page, which must stay
+ * behind the click-to-load gate in `StreamingRenderer`.
+ *
+ * - Desktop: the Tauri asset protocol. `convertFileSrc` yields
+ *   `http://asset.localhost/<encoded path>` on Windows, `asset://localhost/...`
+ *   elsewhere; the protocol is off by default and scoped to the images
+ *   directory in `tauri.conf.json` (`app.security.assetProtocol`). A path
+ *   outside that scope is refused by the webview, not by this function.
+ * - Web shell: `/api/image`, implemented in `dscode-web`. That router sits
+ *   behind the bearer-token middleware (`dscode-web/src/auth.rs`), and an
+ *   `<img>` cannot set an `Authorization` header, so forward the `?token=` the
+ *   page was opened with — the same query transport the server already accepts
+ *   for `EventSource`. Without it every image would 401 and render as broken.
+ *
+ * Returns `null` when there is no usable path (callers show a failure state).
+ */
+export function imageSrc(path: string): string | null {
+  if (!path) return null;
+
+  if (IS_TAURI) {
+    try {
+      return convertFileSrc(path);
+    } catch {
+      // Older/partial `__TAURI_INTERNALS__` without `convertFileSrc`: degrade to
+      // a visible failure instead of throwing out of the whole markdown render.
+      return null;
+    }
+  }
+
+  const query = `path=${encodeURIComponent(path)}`;
+  const token = webToken();
+  return token ? `/api/image?${query}&token=${encodeURIComponent(token)}` : `/api/image?${query}`;
 }
 
 // ── Chat ──
@@ -179,15 +261,26 @@ export async function fetchModels(providerKey: string): Promise<string[]> {
 export function onAnyStreamEvent(
   callback: (sessionId: string, event: StreamEvent) => void
 ): () => void {
-  const unlisten = listen<any>('stream-event', (event) => {
+  let disposed = false;
+  let stop: (() => void) | null = null;
+  void listen<any>('stream-event', (event) => {
+    if (disposed) return;
     const payload = event.payload;
     const sid = payload?.session_id;
     const ev = payload?.event;
     if (!sid || !ev) return;
     callback(sid as string, ev as StreamEvent);
+  }).then((fn) => {
+    // Unmounting before `listen` resolves used to leave the listener registered
+    // forever (StrictMode's double-invoke then stacked two live listeners and
+    // every token was applied twice). Honour the unsubscribe immediately.
+    if (disposed) fn();
+    else stop = fn;
   });
   return () => {
-    unlisten.then((fn) => fn());
+    disposed = true;
+    stop?.();
+    stop = null;
   };
 }
 

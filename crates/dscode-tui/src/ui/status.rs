@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // ── Help: keyboard shortcuts ──
     let shortcuts = Span::styled(
-        " ^N new  ^S settings  ^L sidebar  Esc quit ",
+        " ^N new  ^S settings  ^L sidebar  ^T thinking  ^O tool card  ^D delete session  ^End bottom  Esc quit ",
         Style::default()
             .fg(Theme::TEXT_MUTED)
             .add_modifier(Modifier::DIM),

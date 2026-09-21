@@ -24,40 +24,27 @@ export default function TeamPanel({ agents, kind = 'teams', compact = true }: Pr
   const title = isHybrid ? 'Auto · Teams' : isAuto ? 'Auto' : 'Teams';
   const unit = isAuto || isHybrid ? 'subtask' : 'agent';
 
-  // Hybrid: purple-tinted (teams) + auto; pure auto: neutral; pure teams: purple
-  const shell = isHybrid
-    ? 'border-purple-500/25 bg-purple-500/[0.05]'
-    : isAuto
-      ? 'border-white/[0.1] bg-white/[0.025]'
-      : 'border-purple-500/20 bg-purple-500/[0.04]';
-  const headBorder = isAuto && !isHybrid ? 'border-white/[0.06]' : 'border-purple-500/15';
-  const titleCls = isHybrid
-    ? 'text-purple-200/90'
-    : isAuto
-      ? 'text-gray-300'
-      : 'text-purple-300/90';
-
   return (
     <div
       className={
         compact
-          ? `mt-2 mb-1 rounded-lg border ${shell} overflow-hidden`
+          ? 'mt-2 mb-1 panel overflow-hidden'
           : 'border-t border-border bg-main/80 px-4 py-2'
       }
     >
-      <div className={`flex items-center gap-2 px-3 py-1.5 border-b ${headBorder} text-[11px]`}>
-        <span className={`${titleCls} font-medium tracking-wide`}>{title}</span>
-        <span className="text-gray-500">
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-divider text-[11px]">
+        <span className="text-primary font-medium tracking-wide">{title}</span>
+        <span className="text-muted">
           {agents.length} {unit}
           {agents.length === 1 ? '' : 's'}
         </span>
-        <span className="text-gray-600">·</span>
-        <span className="text-gray-500 normal-case">
-          {running > 0 && <span className="text-gray-300">{running} running</span>}
+        <span className="text-faint">·</span>
+        <span className="text-muted normal-case">
+          {running > 0 && <span className="text-secondary">{running} running</span>}
           {running > 0 && (done > 0 || failed > 0) && ' · '}
-          {done > 0 && <span className="text-emerald-400/80">{done} done</span>}
+          {done > 0 && <span className="text-success">{done} done</span>}
           {failed > 0 && (
-            <span className="text-red-400/80">
+            <span className="text-danger">
               {done > 0 || running > 0 ? ' · ' : ''}
               {failed} failed
             </span>
@@ -65,7 +52,7 @@ export default function TeamPanel({ agents, kind = 'teams', compact = true }: Pr
         </span>
       </div>
 
-      <div className="max-h-64 overflow-y-auto divide-y divide-white/[0.04]">
+      <div className="max-h-64 overflow-y-auto divide-y divide-divider">
         {agents.map((a) => (
           <AgentRow key={a.id} agent={a} />
         ))}
@@ -84,10 +71,19 @@ function AgentRow({ agent }: { agent: TeamAgent }) {
 
   const statusDot =
     agent.status === 'running'
-      ? 'bg-gray-300 animate-pulse'
+      ? 'bg-muted animate-pulse'
       : agent.status === 'done'
-        ? 'bg-emerald-400'
-        : 'bg-red-400';
+        ? 'bg-success'
+        : 'bg-danger';
+
+  const statusChip =
+    agent.status === 'running'
+      ? 'text-muted border-border'
+      : agent.status === 'done'
+        ? 'text-success border-success/40 bg-success/10'
+        : 'text-danger border-danger/40 bg-danger/10';
+
+  const statusLabel = agent.status === 'running' ? 'running' : agent.status === 'done' ? 'done' : 'err';
 
   const displayId = agent.id.includes('#') ? agent.id.replace('#', ' ·') : agent.id;
 
@@ -124,31 +120,31 @@ function AgentRow({ agent }: { agent: TeamAgent }) {
     <div className="group">
       <button
         type="button"
-        className="w-full flex items-start gap-2 px-3 py-1.5 text-left hover:bg-white/[0.03] transition-colors"
+        className="w-full flex items-start gap-2 px-3 py-1.5 text-left hover:bg-hover transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
         onClick={() => setExpanded((v) => !v)}
       >
-        <span className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${statusDot}`} />
+        <span aria-hidden="true" className={`mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 ${statusDot}`} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-[11px] font-mono text-gray-300 shrink-0">{displayId}</span>
-            <span className="text-[10px] text-gray-600 shrink-0">
-              {agent.status === 'running' ? '…' : agent.status === 'done' ? 'done' : 'err'}
+            <span className="text-[13px] font-mono text-primary shrink-0">{displayId}</span>
+            <span className={`text-[11px] px-1.5 py-0.5 rounded-full border shrink-0 ${statusChip}`}>
+              {statusLabel}
             </span>
             {agent.task && !expanded && (
-              <span className="text-[11px] text-gray-500 truncate" title={agent.task}>
+              <span className="text-[13px] text-secondary truncate" title={agent.task}>
                 {agent.task}
               </span>
             )}
           </div>
           {expanded && agent.task && (
-            <div className="text-[11px] text-gray-400 mt-0.5 leading-snug">{agent.task}</div>
+            <div className="text-[13px] text-secondary mt-0.5 leading-snug">{agent.task}</div>
           )}
         </div>
         {agent.status === 'running' && (
           <span className="flex gap-1 shrink-0 mt-0.5">
             <button
               type="button"
-              className="text-[10px] text-sky-400/90 hover:text-sky-300 px-1.5 py-0.5 rounded border border-sky-500/30"
+              className="text-[11px] text-accent hover:bg-accent/10 px-1.5 py-0.5 rounded-control border border-accent/40 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
               onClick={onNudge}
               title="Send mid-run instruction"
             >
@@ -156,7 +152,7 @@ function AgentRow({ agent }: { agent: TeamAgent }) {
             </button>
             <button
               type="button"
-              className="text-[10px] text-red-400/90 hover:text-red-300 px-1.5 py-0.5 rounded border border-red-500/30"
+              className="text-[11px] text-danger hover:bg-danger/10 px-1.5 py-0.5 rounded-control border border-danger/40 transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
               onClick={onStop}
               title="Stop this sub-agent"
             >
@@ -164,13 +160,13 @@ function AgentRow({ agent }: { agent: TeamAgent }) {
             </button>
           </span>
         )}
-        <span className="text-[10px] text-gray-600 shrink-0 mt-0.5 opacity-0 group-hover:opacity-100">
+        <span className="text-[11px] text-muted shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
           {expanded ? '收起' : '展开'}
         </span>
       </button>
       {expanded && (
         <div className="px-3 pb-2 pl-6">
-          <div className="text-[10px] text-gray-500 whitespace-pre-wrap font-mono leading-relaxed max-h-32 overflow-y-auto rounded bg-black/25 px-2 py-1.5 border border-white/[0.05]">
+          <div className="text-[11px] text-secondary whitespace-pre-wrap font-mono leading-relaxed max-h-32 overflow-y-auto rounded-control bg-input px-2 py-1.5 border border-border">
             {agent.output ||
               (agent.status === 'running' ? '执行中…' : '(无输出)')}
           </div>

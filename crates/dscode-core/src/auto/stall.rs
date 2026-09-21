@@ -7,7 +7,8 @@
 ///
 /// Each time a subtask finishes, the auto-runner records its final quality
 /// score. If `stall_rounds` consecutive completions all have a quality score
-/// below 70.0, the detector signals a stall.
+/// below 70.0 — the same bar `AutoRunner` uses to accept a subtask — and the
+/// sequence is not strictly improving, the detector signals a stall.
 pub struct StallDetector {
     /// Number of consecutive no-progress rounds that trigger a stall.
     threshold: usize,
@@ -38,36 +39,28 @@ impl StallDetector {
 
     /// Returns true if the auto-runner should be considered stalled.
     ///
-    /// A stall is detected when we have `threshold` scores and all of them
-    /// are below 70.0 AND there is no upward trend (the last score is not
-    /// higher than the first).
+    /// A stall is detected when we have `threshold` scores, all below
+    /// [`Self::min_quality`], and the sequence is not monotonically improving.
+    /// A strict monotone check (rather than an endpoint ratio) is required:
+    /// `[10, 40, 30]` is not progress even though its endpoints rise 200%,
+    /// because every score is still far below the quality bar.
     pub fn is_stalled(&self) -> bool {
         if self.recent_scores.len() < self.threshold {
             return false;
         }
 
-        // Check if all scores are below the minimum quality threshold.
+        // Any score at/above the bar breaks the stall.
         let all_low = self.recent_scores.iter().all(|&s| s < self.min_quality);
         if !all_low {
             return false;
         }
 
-        // Check for upward trend — if improving, don't stall.
-        // Use a relative threshold: if the latest score is 20% higher than
-        // the earliest score in the window, consider it an upward trend
-        // regardless of absolute value.
-        let first = self.recent_scores.first().copied().unwrap_or(0.0);
-        let last = self.recent_scores.last().copied().unwrap_or(0.0);
-        let upward_trend = if first > 0.0 {
-            // Relative: 20% improvement from first to last.
-            (last - first) / first >= 0.20
-        } else if last > 0.0 {
-            // First was zero, anything positive is an improvement.
-            true
-        } else {
-            false
-        };
-        if upward_trend {
+        // Improving only if every step is strictly better than the last.
+        let monotone_up = self
+            .recent_scores
+            .windows(2)
+            .all(|w| w[1] > w[0]);
+        if monotone_up {
             return false;
         }
 
@@ -122,6 +115,16 @@ mod tests {
         d.record(80.0); // high score breaks the stall
         d.record(30.0);
         assert!(!d.is_stalled());
+    }
+
+    #[test]
+    fn test_stall_on_non_monotone_noise() {
+        // Endpoint ratio rises 200% but the window is not improving.
+        let mut d = StallDetector::new(3);
+        d.record(10.0);
+        d.record(40.0);
+        d.record(30.0);
+        assert!(d.is_stalled());
     }
 
     #[test]

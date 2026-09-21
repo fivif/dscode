@@ -28,13 +28,20 @@ export default function App() {
 
   // Auto-select last session on startup
   useEffect(() => {
+    let cancelled = false;
     getLastSession().then((s) => {
-      if (s?.id) {
-        setActiveSession(s.id);
-        loadSessionMessages(s.id);
-      }
+      if (cancelled || !s?.id) return;
+      // The IPC can land after the user already picked a session (or created a
+      // new chat) — never yank them into a different conversation, or the next
+      // message goes somewhere they did not choose.
+      if (useChatStore.getState().activeSessionId) return;
+      setActiveSession(s.id);
+      loadSessionMessages(s.id);
     });
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [getLastSession, setActiveSession, loadSessionMessages]);
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -53,7 +60,7 @@ export default function App() {
   const toggleCollapse = () => setSidebarCollapsed((v) => !v);
 
   return (
-    <div className="flex h-full w-full bg-main text-gray-100">
+    <div className="flex h-full w-full app-ground text-primary">
       {page === 'chat' && (
         <>
           <Sidebar
@@ -65,10 +72,16 @@ export default function App() {
             onToggleCollapse={toggleCollapse}
           />
           {!sidebarCollapsed && (
+            // A 1px hairline centred in the 6px hit strip: visible enough to say
+            // "this pane resizes", quiet enough not to read as a divider.
             <div
-              className="w-1.5 cursor-col-resize bg-transparent hover:bg-gray-600 active:bg-gray-500 transition-colors shrink-0"
+              role="separator"
+              aria-orientation="vertical"
+              className="group w-1.5 shrink-0 cursor-col-resize flex justify-center"
               onMouseDown={() => { dragging.current = true; }}
-            />
+            >
+              <div className="h-full w-px bg-border transition-[width,background-color] duration-150 ease-ios group-hover:w-[2px] group-hover:bg-accent/50 group-active:bg-accent" />
+            </div>
           )}
         </>
       )}
@@ -84,6 +97,9 @@ export default function App() {
         {page === 'settings' && <SettingsPage onBack={() => setPage('chat')} />}
         {page === 'mcp' && <McpPage onBack={() => setPage('chat')} />}
         {page === 'skills' && <SkillsPage onBack={() => setPage('chat')} />}
+        {/* A pending approval blocks the agent and is auto-denied on timeout —
+            keep it visible (and answerable) outside the chat page too. */}
+        {page !== 'chat' && <PermissionBanner />}
       </main>
     </div>
   );

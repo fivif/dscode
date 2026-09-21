@@ -17,6 +17,91 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+/// Max bytes buffered from a single stderr line; the rest of the line is
+/// consumed and discarded so the stream stays line-framed.
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+
+/// Bytes of stderr kept for diagnostics.
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// Max bytes accepted for one stdout protocol message. NDJSON has no framing,
+/// so without a cap a server that writes a 2 GB line with no newline OOMs us.
+const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default timeout for a `tools/call` round trip. Build/test/database servers
+/// legitimately run for minutes; the old hard-coded 60 s aborted them and then
+/// silently discarded their eventual (already-performed) response as an
+/// unmatched id. Overridable with `DSCODE_MCP_TOOL_TIMEOUT_SECS`.
+const DEFAULT_TOOL_CALL_TIMEOUT_SECS: u64 = 600;
+
+fn resolve_tool_call_timeout() -> Duration {
+    let secs = std::env::var("DSCODE_MCP_TOOL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_TOOL_CALL_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Read one line into `out`, buffering at most `max` bytes; anything past the
+/// cap is consumed and dropped so the stream stays line-framed.
+/// Returns the number of bytes consumed (0 = EOF).
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    out.clear();
+    let mut total = 0usize;
+    let mut full = false;
+    loop {
+        let (chunk_len, done) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(total);
+            }
+            let (chunk_len, done) = match available.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (available.len(), false),
+            };
+            if !full {
+                let room = max.saturating_sub(out.len());
+                let take = chunk_len.min(room);
+                out.extend_from_slice(&available[..take]);
+                if take < chunk_len {
+                    full = true;
+                }
+            }
+            (chunk_len, done)
+        };
+        total += chunk_len;
+        reader.consume(chunk_len);
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+/// Keep at most the last `max` bytes of `s`.
+///
+/// `String::drain` panics when the index is not a char boundary; the old
+/// `g.drain(..g.len() - 4096)` therefore panicked as soon as an MCP server
+/// logged >4 KB of multi-byte text (e.g. Chinese), killing the stderr drain
+/// task and wedging the server forever once the 64 KB pipe filled.
+fn truncate_front(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut n = s.len() - max;
+    while n < s.len() && !s.is_char_boundary(n) {
+        n += 1;
+    }
+    s.drain(..n);
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 Types
 // ---------------------------------------------------------------------------
@@ -52,6 +137,20 @@ struct JsonRpcError {
     message: String,
     #[serde(default)]
     data: Option<serde_json::Value>,
+}
+
+impl JsonRpcError {
+    /// `message`, plus the `data` field when the server supplied one.
+    ///
+    /// MCP servers routinely put the actionable detail (`{ "trace": … }`, the
+    /// offending argument, a stack) in `data` and leave `message` generic;
+    /// parsing the field and then never rendering it threw that away.
+    fn render(&self) -> String {
+        match self.data.as_ref() {
+            Some(d) if !d.is_null() => format!("{} — data: {d}", self.message),
+            _ => self.message.clone(),
+        }
+    }
 }
 
 /// A tool definition returned by an MCP server.
@@ -231,19 +330,16 @@ impl McpClient {
             let tail = Arc::clone(&stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(err);
-                let mut line = String::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
+                    let mut raw: Vec<u8> = Vec::new();
+                    match read_line_bounded(&mut reader, &mut raw, MAX_STDERR_LINE_BYTES).await {
                         Ok(0) => break,
                         Ok(_) => {
+                            let text = String::from_utf8_lossy(&raw);
                             let mut g = tail.lock().await;
-                            g.push_str(&line);
-                            // Keep last ~4KB
-                            if g.len() > 4096 {
-                                let drop_n = g.len() - 4096;
-                                g.drain(..drop_n);
-                            }
+                            g.push_str(&text);
+                            // Keep last ~4KB, on a char boundary.
+                            truncate_front(&mut g, STDERR_TAIL_BYTES);
                         }
                         Err(_) => break,
                     }
@@ -264,6 +360,7 @@ impl McpClient {
             next_id: 1,
             stderr_tail,
             proxy_used: proxy_url.map(|s| s.to_string()),
+            tool_call_timeout: resolve_tool_call_timeout(),
         };
 
         // First handshake can be slow (npx download through proxy)
@@ -334,6 +431,10 @@ pub struct McpConnection {
 
     /// Proxy URL used for this connection, if any.
     proxy_used: Option<String>,
+
+    /// Timeout for a single `tools/call` round trip (see
+    /// [`DEFAULT_TOOL_CALL_TIMEOUT_SECS`]).
+    tool_call_timeout: Duration,
 }
 
 impl McpConnection {
@@ -418,6 +519,8 @@ impl McpConnection {
     /// Call a specific tool on the MCP server.
     ///
     /// Sends a `tools/call` request with the tool name and arguments.
+    /// Long-running tools are allowed up to [`Self::tool_call_timeout`] (10
+    /// minutes by default, `DSCODE_MCP_TOOL_TIMEOUT_SECS` to override).
     pub async fn call_tool(
         &mut self,
         name: &str,
@@ -427,7 +530,19 @@ impl McpConnection {
             "name": name,
             "arguments": arguments
         });
-        self.send_request("tools/call", Some(params)).await
+        let wait = self.tool_call_timeout;
+        self.send_request_timeout("tools/call", Some(params), wait)
+            .await
+    }
+
+    /// Timeout applied to each `tools/call`.
+    pub fn tool_call_timeout(&self) -> Duration {
+        self.tool_call_timeout
+    }
+
+    /// Override the per-`tools/call` timeout for this connection.
+    pub fn set_tool_call_timeout(&mut self, wait: Duration) {
+        self.tool_call_timeout = wait;
     }
 
     /// Check if the child process is still running.
@@ -532,6 +647,24 @@ impl McpConnection {
                 continue;
             }
 
+            // A JSON-RPC error reply with `id: null` (parse error / invalid
+            // request) can never match our request id. The old code fell
+            // through to the id check, logged "other id" and kept waiting until
+            // the full timeout, so the caller burned 60 s for an answer it had
+            // already received.
+            let id_is_null = matches!(&response.id, None | Some(serde_json::Value::Null));
+            if id_is_null {
+                if let Some(err) = response.error {
+                    let hint = self.error_hint_async().await;
+                    return Err(McpError::ServerError {
+                        code: err.code,
+                        message: format!("[response with id=null] {}{hint}", err.render()),
+                    });
+                }
+                tracing::debug!("skip mcp message without id");
+                continue;
+            }
+
             // Match id (number or string form of same number)
             if let Some(ref rid) = response.id {
                 let matches = rid == &id
@@ -542,15 +675,13 @@ impl McpConnection {
                     tracing::debug!(?rid, expected = id_num, "skip mcp message with other id");
                     continue;
                 }
-            } else if response.result.is_none() && response.error.is_none() {
-                continue;
             }
 
             if let Some(err) = response.error {
                 let hint = self.error_hint_async().await;
                 return Err(McpError::ServerError {
                     code: err.code,
-                    message: format!("{}{hint}", err.message),
+                    message: format!("{}{hint}", err.render()),
                 });
             }
 
@@ -587,20 +718,27 @@ impl McpConnection {
     async fn read_message(&mut self) -> Result<String, McpError> {
         let mut skipped = 0u32;
         loop {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line).await {
-                Ok(0) => {
-                    let status = self.child.wait().await;
-                    let hint = self.error_hint_async().await;
-                    return Err(McpError::ProcessExited(format!(
-                        "MCP server '{}' exited with {:?}{hint}",
-                        self.server_name, status
-                    )));
-                }
-                Ok(_) => {}
-                Err(e) => return Err(McpError::SpawnError(e)),
+            let mut raw: Vec<u8> = Vec::new();
+            let n = read_line_bounded(&mut self.reader, &mut raw, MAX_MCP_MESSAGE_BYTES)
+                .await
+                .map_err(McpError::SpawnError)?;
+            if n == 0 {
+                let status = self.child.wait().await;
+                let hint = self.error_hint_async().await;
+                return Err(McpError::ProcessExited(format!(
+                    "MCP server '{}' exited with {:?}{hint}",
+                    self.server_name, status
+                )));
+            }
+            if n > MAX_MCP_MESSAGE_BYTES {
+                let hint = self.error_hint_async().await;
+                return Err(McpError::Protocol(format!(
+                    "MCP message exceeded {MAX_MCP_MESSAGE_BYTES} bytes without a newline; \
+                     refusing to buffer more (server may be stuck){hint}"
+                )));
             }
 
+            let line = String::from_utf8_lossy(&raw);
             let trimmed = line.trim().trim_start_matches('\u{feff}');
             if trimmed.is_empty() {
                 continue;
@@ -618,11 +756,18 @@ impl McpConnection {
                 let length: usize = length_str.parse().map_err(|_| {
                     McpError::Protocol(format!("Invalid Content-Length: {length_str}"))
                 })?;
+                if length > MAX_MCP_MESSAGE_BYTES {
+                    return Err(McpError::Protocol(format!(
+                        "Content-Length {length} exceeds the {MAX_MCP_MESSAGE_BYTES}-byte limit"
+                    )));
+                }
 
                 loop {
-                    let mut hdr = String::new();
-                    let n = self.reader.read_line(&mut hdr).await?;
-                    if n == 0 || hdr.trim().is_empty() {
+                    let mut hdr: Vec<u8> = Vec::new();
+                    let n = read_line_bounded(&mut self.reader, &mut hdr, 8192)
+                        .await
+                        .map_err(McpError::SpawnError)?;
+                    if n == 0 || hdr.iter().all(|b| b.is_ascii_whitespace()) {
                         break;
                     }
                 }
@@ -650,7 +795,13 @@ impl Drop for McpConnection {
     fn drop(&mut self) {
         // Close stdin first so the process can terminate cleanly
         drop(self.stdin.take());
-        // The child will be killed on drop thanks to kill_on_drop(true)
+        // `kill_on_drop(true)` only signals the *direct* child: `npx -y server`
+        // spawns npx → node, and killing npx leaves node holding ports/files for
+        // the rest of the session (repeated config reloads stack orphans). Kill
+        // the whole tree: taskkill /T on Windows, process group on Unix.
+        if let Some(pid) = self.child.id() {
+            crate::tools::bash::kill_process_tree(Some(pid));
+        }
     }
 }
 
@@ -732,5 +883,30 @@ mod tests {
         let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, -32600);
+    }
+
+    #[test]
+    fn test_truncate_front_does_not_split_codepoints() {
+        // 3000 × 3 bytes = 9000 bytes of multi-byte text; the old
+        // `drain(..len - 4096)` panicked here (4096 is not a char boundary).
+        let mut s = "中".repeat(3000);
+        truncate_front(&mut s, STDERR_TAIL_BYTES);
+        assert!(s.len() <= STDERR_TAIL_BYTES + 3);
+        assert!(s.chars().all(|c| c == '中'));
+    }
+
+    #[tokio::test]
+    async fn test_read_line_bounded_caps_and_keeps_framing() {
+        let data = format!("{}\nnext\n", "あ".repeat(10)).into_bytes();
+        let mut reader = BufReader::new(&data[..]);
+        let mut out: Vec<u8> = Vec::new();
+        let n = read_line_bounded(&mut reader, &mut out, 8).await.unwrap();
+        assert_eq!(n, 31, "whole over-long line must be consumed");
+        assert!(out.len() <= 8);
+
+        let mut out2: Vec<u8> = Vec::new();
+        let n2 = read_line_bounded(&mut reader, &mut out2, 1024).await.unwrap();
+        assert_eq!(n2, 5);
+        assert_eq!(String::from_utf8(out2).unwrap(), "next\n");
     }
 }

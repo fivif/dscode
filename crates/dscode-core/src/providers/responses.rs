@@ -25,7 +25,10 @@ pub struct ResponsesProvider {
     pub temperature: f64,
     /// Reasoning effort (low/medium/high/max) — sent via `reasoning.effort`
     pub reasoning_effort: Option<String>,
+    /// Unary requests (180 s total timeout).
     client: Client,
+    /// Streaming requests (no total timeout — see [`http_client`]).
+    stream_client: Client,
 }
 
 impl ResponsesProvider {
@@ -41,12 +44,14 @@ impl ResponsesProvider {
             }
         });
 
-        // The Responses endpoint lives at the bare base URL — strip any /v1 suffix.
-        let trimmed = provider_conf.base_url.trim_end_matches('/');
-        let base_url = trimmed
-            .strip_suffix("/v1")
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| trimmed.to_string());
+        // The Responses endpoint lives at the bare base URL — strip any /v1
+        // suffix. An empty base_url (hand-edited config) falls back to the
+        // channel default instead of producing a relative request URL.
+        let base_url = if provider_conf.base_url.trim().is_empty() {
+            "https://api.deepseek.com".to_string()
+        } else {
+            normalize_api_base_url(&provider_conf.base_url)
+        };
 
         // Strip provider prefix (deepseek/deepseek-v4-flash -> deepseek-v4-flash)
         let actual_model = match model.split_once('/') {
@@ -54,9 +59,7 @@ impl ResponsesProvider {
             None => model.to_string(),
         };
 
-        let client = crate::config::settings::build_http_client(conf.proxy_for_model(model))
-            .expect("Failed to build HTTP client");
-
+        let proxy = conf.proxy_for_model(model);
         Self {
             api_key: provider_conf.api_key,
             base_url,
@@ -64,7 +67,8 @@ impl ResponsesProvider {
             max_tokens: conf.generation.max_tokens,
             temperature: conf.generation.temperature,
             reasoning_effort: Some(conf.generation.reasoning_effort.clone()),
-            client,
+            client: http_client(proxy, false),
+            stream_client: http_client(proxy, true),
         }
     }
 
@@ -77,12 +81,16 @@ impl ResponsesProvider {
     ) -> serde_json::Value {
         let (instructions, items) = messages_to_responses_input(&messages);
 
+        // Reasoning models (o-series / gpt-5) reject `temperature`; every other
+        // model keeps it, including the deterministic 0.0.
         let mut body = serde_json::json!({
             "model": self.model,
             "input": items,
             "stream": stream,
-            "temperature": self.temperature,
         });
+        if !is_responses_reasoning_model(&self.model) {
+            body["temperature"] = serde_json::json!(self.temperature);
+        }
         if self.max_tokens > 0 {
             body["max_output_tokens"] =
                 serde_json::Value::Number(serde_json::Number::from(self.max_tokens));
@@ -97,9 +105,17 @@ impl ResponsesProvider {
                 tools.iter().map(responses_tool_def).collect();
             body["tools"] = serde_json::Value::Array(tools_value);
         }
-        // Reasoning effort → reasoning.effort (supported by DeepSeek responses).
+        // Reasoning effort → reasoning.effort (DeepSeek responses accepts it;
+        // plain OpenAI models such as gpt-4o reject the field).
         if let Some(effort) = self.effective_reasoning_effort() {
-            body["reasoning"] = serde_json::json!({ "effort": effort });
+            if accepts_reasoning_effort(&self.model, self.reasoning_channel()) {
+                body["reasoning"] = serde_json::json!({ "effort": effort });
+            } else {
+                tracing::debug!(
+                    model = %self.model,
+                    "model does not accept `reasoning.effort` — omitting it"
+                );
+            }
         }
         body
     }
@@ -162,14 +178,7 @@ impl LlmProvider for ResponsesProvider {
         let raw_body = resp.text().await?;
 
         if !status.is_success() {
-            let error_msg = serde_json::from_str::<serde_json::Value>(&raw_body)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
-                .unwrap_or(raw_body);
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: error_msg,
-            });
+            return Err(api_error_from_body(status.as_u16(), &raw_body, &self.model));
         }
 
         let body: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
@@ -194,7 +203,7 @@ impl LlmProvider for ResponsesProvider {
 
         let request_body = self.build_request_body(messages, tools, true);
         let resp = self
-            .client
+            .stream_client
             .post(format!("{}/responses", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -205,14 +214,7 @@ impl LlmProvider for ResponsesProvider {
         let status = resp.status();
         if !status.is_success() {
             let raw_body = resp.text().await?;
-            let error_msg = serde_json::from_str::<serde_json::Value>(&raw_body)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
-                .unwrap_or(raw_body);
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                message: error_msg,
-            });
+            return Err(api_error_from_body(status.as_u16(), &raw_body, &self.model));
         }
 
         // Byte-buffer SSE reader with per-chunk timeout (same pattern as openai.rs).
@@ -230,9 +232,10 @@ impl LlmProvider for ResponsesProvider {
                         buf.extend_from_slice(&bytes);
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line_bytes = buf.drain(..=pos).collect::<Vec<_>>();
-                            let line =
-                                String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-                            if line.starts_with("data: ") {
+                            let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1])
+                                .trim_end_matches('\r')
+                                .to_string();
+                            if sse_field(&line, "data").is_some() {
                                 if tx.send(Ok(line.to_string())).await.is_err() {
                                     return;
                                 }
@@ -253,7 +256,7 @@ impl LlmProvider for ResponsesProvider {
             }
             if !buf.is_empty() {
                 let line = String::from_utf8_lossy(&buf);
-                if line.starts_with("data: ") {
+                if sse_field(&line, "data").is_some() {
                     let _ = tx.send(Ok(line.to_string())).await;
                 }
             }
@@ -277,6 +280,7 @@ impl LlmProvider for ResponsesProvider {
             temperature: self.temperature,
             reasoning_effort: self.reasoning_effort.clone(),
             client: self.client.clone(),
+            stream_client: self.stream_client.clone(),
         })
     }
 }
@@ -286,6 +290,36 @@ impl LlmProvider for ResponsesProvider {
 enum ReasoningChannel {
     DeepSeek,
     OpenAiCompat,
+}
+
+/// Whether this model accepts the `reasoning` object. Sending it to a plain
+/// model (e.g. `gpt-4o`) is `400 Unsupported parameter: 'reasoning'`.
+fn accepts_reasoning_effort(model: &str, channel: ReasoningChannel) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    match channel {
+        ReasoningChannel::DeepSeek => m.contains("deepseek"),
+        ReasoningChannel::OpenAiCompat => {
+            m.starts_with("o1")
+                || m.starts_with("o3")
+                || m.starts_with("o4")
+                || m.starts_with("gpt-5")
+                || m.contains("reasoner")
+                || m.contains("thinking")
+        }
+    }
+}
+
+/// OpenAI reasoning models reject `temperature` on the Responses API too.
+///
+/// Limited to OpenAI's own families on purpose: DeepSeek (this provider's
+/// default channel) has always accepted `temperature` here.
+fn is_responses_reasoning_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("gpt-5")
+        || m.starts_with("gpt-oss")
 }
 
 fn content_text(content: &MessageContent) -> String {
@@ -311,6 +345,17 @@ fn content_text(content: &MessageContent) -> String {
 fn messages_to_responses_input(msgs: &[Message]) -> (Option<String>, Vec<serde_json::Value>) {
     let mut instructions: Option<String> = None;
     let mut items: Vec<serde_json::Value> = Vec::new();
+
+    // A `function_call` without a matching `function_call_output` makes the API
+    // reject the whole request ("No tool output found for function call …"), so
+    // calls whose output is missing (or whose id is unusable) are dropped along
+    // with it — the input stays internally consistent either way.
+    let answered: std::collections::HashSet<&str> = msgs
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .filter(|id| !id.is_empty())
+        .collect();
 
     for m in msgs {
         match m.role {
@@ -356,6 +401,13 @@ fn messages_to_responses_input(msgs: &[Message]) -> (Option<String>, Vec<serde_j
                 }
                 if let Some(calls) = &m.tool_calls {
                     for tc in calls {
+                        if !answered.contains(tc.id.as_str()) {
+                            tracing::warn!(
+                                call_id = %tc.id,
+                                "dropping function_call with no matching tool result"
+                            );
+                            continue;
+                        }
                         items.push(serde_json::json!({
                             "type": "function_call",
                             "call_id": tc.id,
@@ -370,12 +422,17 @@ fn messages_to_responses_input(msgs: &[Message]) -> (Option<String>, Vec<serde_j
             }
             Role::Tool => {
                 let text = content_text(&m.content);
-                if let Some(tc_id) = &m.tool_call_id {
-                    items.push(serde_json::json!({
+                match m.tool_call_id.as_deref().filter(|id| !id.is_empty()) {
+                    Some(tc_id) => items.push(serde_json::json!({
                         "type": "function_call_output",
                         "call_id": tc_id,
                         "output": text,
-                    }));
+                    })),
+                    // `call_id: ""` is rejected; the output is dropped rather
+                    // than emitted with an id nothing refers to.
+                    None => tracing::warn!(
+                        "dropping tool result without a call_id — the API cannot match it"
+                    ),
                 }
             }
         }
@@ -424,7 +481,16 @@ fn parse_responses_body(body: &serde_json::Value) -> Result<ChatResponse, Provid
                 }
             }
             Some("function_call") => {
-                let id = item["call_id"].as_str().unwrap_or("").to_string();
+                // `call_id` is what a later `function_call_output` must
+                // reference; when the endpoint omits it (or sends an empty
+                // string) the call would be unusable in the history, so give it
+                // one we control.
+                let id = item["call_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| item["id"].as_str().filter(|s| !s.is_empty()))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
                 let name = item["name"].as_str().unwrap_or("").to_string();
                 if name.is_empty() {
                     continue;
@@ -498,17 +564,19 @@ fn parse_responses_sse_event(text: &str) -> Result<StreamChunk, ProviderError> {
     };
 
     for line in text.lines() {
-        let data = match line.strip_prefix("data: ") {
+        let data = match sse_field(line, "data") {
             Some(d) => d.trim(),
             None => continue,
         };
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
-        let ev: serde_json::Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let ev: serde_json::Value = serde_json::from_str(data).map_err(|e| {
+            // Silently dropping the frame used to lose whole output deltas and
+            // function-call fragments with no warning and no retry.
+            tracing::warn!(data = %data, "Responses SSE frame is not valid JSON");
+            ProviderError::Parse(format!("SSE JSON parse error: {}. Data: {}", e, data))
+        })?;
         let Some(etype) = ev["type"].as_str() else {
             continue;
         };
@@ -559,12 +627,35 @@ fn parse_responses_sse_event(text: &str) -> Result<StreamChunk, ProviderError> {
                 result.finish_reason = Some(reason.into());
             }
             "response.failed" => {
-                let msg = ev["error"]["message"]
+                // `status: 0` used to make a failed response indistinguishable
+                // from a client error; use the code/status the API reports.
+                let code = ev["response"]["error"]["code"]
                     .as_str()
+                    .or_else(|| ev["error"]["code"].as_str())
+                    .unwrap_or("");
+                let msg = ev["response"]["error"]["message"]
+                    .as_str()
+                    .or_else(|| ev["error"]["message"].as_str())
                     .unwrap_or("response failed")
                     .to_string();
-                return Err(ProviderError::Api {
-                    status: 0,
+                let status = match code {
+                    "rate_limit_exceeded" => 429,
+                    "invalid_request_error" | "invalid_prompt" => 400,
+                    "authentication_error" | "invalid_api_key" => 401,
+                    "insufficient_quota" => 402,
+                    "server_error" | "" => 500,
+                    _ => 500,
+                };
+                tracing::warn!(kind = %code, status, "Responses stream failed: {msg}");
+                return Err(ProviderError::ApiDetail {
+                    status,
+                    kind: code.to_string(),
+                    code: if code.is_empty() {
+                        None
+                    } else {
+                        Some(code.to_string())
+                    },
+                    param: None,
                     message: msg,
                 });
             }
@@ -710,6 +801,92 @@ mod tests {
         let failed = parse_responses_sse_event(
             r#"data: {"type":"response.failed","error":{"message":"boom"}}"#,
         );
-        assert!(failed.is_err());
+        let err = failed.unwrap_err();
+        assert_eq!(err.status(), Some(500));
+    }
+
+    #[test]
+    fn failed_event_status_is_meaningful() {
+        let err = parse_responses_sse_event(
+            r#"data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"slow down"}}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), Some(429));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn unparseable_frame_is_reported_not_dropped() {
+        let err = parse_responses_sse_event("data: {\"type\":").unwrap_err();
+        assert!(matches!(err, ProviderError::Parse(_)));
+    }
+
+    #[test]
+    fn function_call_without_output_is_dropped() {
+        let mut asst = msg(Role::Assistant, "");
+        asst.tool_calls = Some(vec![ToolCall {
+            id: "call_orphan".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        let (_, items) = messages_to_responses_input(&[asst]);
+        // Emitting the call alone would make the API reject the request.
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn tool_result_without_call_id_is_dropped() {
+        let tool = Message {
+            role: Role::Tool,
+            content: MessageContent::Text("sunny".into()),
+            tool_call_id: Some(String::new()),
+            ..Default::default()
+        };
+        let (_, items) = messages_to_responses_input(&[tool]);
+        assert!(items.is_empty());
+    }
+
+    fn provider_at(base: &str, model: &str, effort: &str) -> ResponsesProvider {
+        ResponsesProvider {
+            api_key: "k".into(),
+            base_url: base.into(),
+            model: model.into(),
+            max_tokens: 1024,
+            temperature: 0.0,
+            reasoning_effort: Some(effort.into()),
+            client: Client::new(),
+            stream_client: Client::new(),
+        }
+    }
+
+    fn provider(model: &str, effort: &str) -> ResponsesProvider {
+        provider_at("https://api.deepseek.com", model, effort)
+    }
+
+    #[test]
+    fn non_reasoning_model_gets_no_temperature_or_reasoning() {
+        let p = provider_at("https://api.openai.com/v1", "gpt-4o", "max");
+        let body = p.build_request_body(vec![], vec![], false);
+        assert!(body.get("reasoning").is_none());
+        // ... but 0.0 is still a real setting for a model that accepts it.
+        assert_eq!(body["temperature"], 0.0);
+    }
+
+    #[test]
+    fn reasoning_model_gets_effort_and_no_temperature() {
+        let p = provider_at("https://api.openai.com/v1", "o3-mini", "max");
+        let body = p.build_request_body(vec![], vec![], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn deepseek_channel_keeps_effort() {
+        let p = provider("deepseek-reasoner", "max");
+        let body = p.build_request_body(vec![], vec![], false);
+        assert_eq!(body["reasoning"]["effort"], "max");
     }
 }

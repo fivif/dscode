@@ -8,7 +8,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // PRD Document
@@ -57,13 +59,16 @@ pub struct PrdDocument {
     /// Constraints or non-functional requirements.
     pub constraints: Vec<String>,
 
-    /// When the PRD was created.
+    /// When the PRD was created. Preserved across regeneration for the same
+    /// task id (see [`PrdGenerator::persist`]).
     pub created_at: DateTime<Utc>,
 
-    /// When the PRD was last modified.
+    /// When the PRD was last modified. Equal to `created_at` for a freshly
+    /// generated PRD; refreshed when an existing PRD is regenerated.
     pub updated_at: DateTime<Utc>,
 
-    /// The version of this PRD (incremented on significant updates).
+    /// Version of this PRD: `1` for a new document, incremented each time a PRD
+    /// is regenerated for the same task id.
     pub version: u32,
 }
 
@@ -299,6 +304,9 @@ pub enum PrdError {
 
     #[error("PRD generation requires at least one goal")]
     NoGoals,
+
+    #[error("plan interview finished without producing a PRD")]
+    NoPrd,
 }
 
 /// Generates a [`PrdDocument`] from the answers gathered during the interview.
@@ -343,32 +351,44 @@ impl PrdGenerator {
         let dependencies = self.extract_dependencies(answers);
         let description = self.build_description(answers, &goals);
 
-        let _estimate: u32 = steps.iter().map(|s| s.estimated_minutes).sum();
-
-        let prd = PrdBuilder::new(task_id, title)
+        let mut prd = PrdBuilder::new(task_id, title)
             .description(description)
             .goals(goals)
             .success_criteria_list(success_criteria)
             .architecture_decisions(arch_decisions)
-            .test_plan(test_plan)
-            .constraint(constraints.join("; "))
-            .dependency(dependencies.join(", "));
+            .test_plan(test_plan);
+
+        // Only carry entries that actually matched. Joining an empty list used
+        // to push a single `""` element, so every PRD's machine-readable lists
+        // contained a meaningless blank string.
+        for constraint in constraints {
+            if !constraint.trim().is_empty() {
+                prd = prd.constraint(constraint);
+            }
+        }
+        for dependency in dependencies {
+            if !dependency.trim().is_empty() {
+                prd = prd.dependency(dependency);
+            }
+        }
 
         // Add files and steps individually
-        let mut prd = prd;
         for f in files {
             prd.files_to_modify.push(f);
         }
         for s in steps {
             prd.implementation_steps.push(s);
         }
-        // Recalculate estimate
         prd.estimate_minutes = prd.implementation_steps.iter().map(|s| s.estimated_minutes).sum();
 
         Ok(prd.build())
     }
 
     /// Persist a PRD to `~/.dscode/tasks/<task_id>/prd.json`.
+    ///
+    /// Regenerating a PRD for a task id that already has one keeps the original
+    /// `created_at` and bumps `version`, so the "last modified"/"version" fields
+    /// mean what their docs say instead of resetting to `1`/now on every write.
     pub fn persist(
         &self,
         prd: &PrdDocument,
@@ -379,9 +399,32 @@ impl PrdGenerator {
         let task_dir = config_dir.join("tasks").join(task_id);
         std::fs::create_dir_all(&task_dir)?;
 
+        let mut prd = prd.clone();
+        if Self::exists(task_id) {
+            match Self::load(task_id) {
+                Ok(previous) => {
+                    prd.created_at = previous.created_at;
+                    prd.version = previous.version.saturating_add(1);
+                    prd.updated_at = Utc::now();
+                }
+                Err(e) => warn!(
+                    %e,
+                    task = %task_id,
+                    "existing prd.json could not be read — regenerating it from scratch"
+                ),
+            }
+        }
+
         let prd_path = task_dir.join("prd.json");
-        let json = serde_json::to_string_pretty(prd)?;
-        std::fs::write(&prd_path, json)?;
+        let json = serde_json::to_string_pretty(&prd)?;
+        // Temp file + rename, like the interview state: a torn `fs::write` here
+        // would leave an unparseable prd.json behind.
+        let tmp = prd_path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &prd_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e
+        })?;
 
         Ok(prd_path)
     }
@@ -432,25 +475,15 @@ impl PrdGenerator {
     }
 
     fn extract_constraints(&self, answers: &[(String, String)]) -> Vec<String> {
-        answers
-            .iter()
-            .filter(|(q, _)| {
-                let ql = q.to_lowercase();
-                ql.contains("constraint") || ql.contains("requirement")
-            })
-            .map(|(_, a)| a.clone())
-            .collect()
+        split_answer_items_for(answers, |ql| {
+            ql.contains("constraint") || ql.contains("requirement")
+        })
     }
 
     fn extract_dependencies(&self, answers: &[(String, String)]) -> Vec<String> {
-        answers
-            .iter()
-            .filter(|(q, _)| {
-                let ql = q.to_lowercase();
-                ql.contains("dependenc") || ql.contains("crate") || ql.contains("library")
-            })
-            .map(|(_, a)| a.clone())
-            .collect()
+        split_answer_items_for(answers, |ql| {
+            ql.contains("dependenc") || ql.contains("crate") || ql.contains("library")
+        })
     }
 
     fn build_description(&self, answers: &[(String, String)], goals: &[String]) -> String {
@@ -466,48 +499,115 @@ impl PrdGenerator {
         parts.join("\n")
     }
 
+    /// Derive the files this task touches from what the interview established.
+    ///
+    /// This deliberately does **not** walk the working directory. Doing so
+    /// turned the *deliverable* of plan mode into a directory listing: every
+    /// `.rs`/`.toml`/`.md` file in the repo became a "Modify" step (~200 steps,
+    /// `estimate_minutes ≈ 3000` in this workspace) for a request like
+    /// `/plan add a --verbose flag`, none of which the interview ever asked for.
+    /// Only paths a participant actually named are considered, deduped by path.
     fn infer_files(&self, answers: &[(String, String)], _goals: &[String]) -> Vec<FileAction> {
-        // Recursively walk the working directory for existing source files
-        // (Rust, TOML configs, Markdown docs). Directories like target/,
-        // node_modules/, .git/ are excluded for performance.
-        let mut files = Vec::new();
-        self.collect_files_recursive(&self.working_dir, &mut files, 0);
-        // Also check answers for explicitly mentioned paths
+        let mut found: BTreeMap<String, FileAction> = BTreeMap::new();
         for (_, answer) in answers {
-            for word in answer.split_whitespace() {
-                if word.ends_with(".rs") || word.ends_with(".toml") {
-                    files.push(FileAction {
-                        path: self.working_dir.join(word).display().to_string(),
-                        action: FileActionType::Modify,
-                        description: "Mentioned in interview".into(),
-                        estimated_lines: 50,
-                    });
+            for raw in answer.split_whitespace() {
+                let token = raw.trim_matches(|c: char| {
+                    c == '`'
+                        || c == '"'
+                        || c == '\''
+                        || c == ','
+                        || c == ';'
+                        || c == ':'
+                        || c == '('
+                        || c == ')'
+                        || c == '['
+                        || c == ']'
+                        || c == '<'
+                        || c == '>'
+                });
+                if !(token.ends_with(".rs") || token.ends_with(".toml") || token.ends_with(".md")) {
+                    continue;
                 }
+                let Some(path) = self.resolve_mentioned_path(token) else {
+                    continue;
+                };
+                let key = path.display().to_string();
+                found.entry(key.clone()).or_insert(FileAction {
+                    path: key,
+                    action: FileActionType::Modify,
+                    description: "Mentioned in interview".into(),
+                    estimated_lines: 50,
+                });
             }
         }
-        files
+        found.into_values().collect()
     }
 
-    fn infer_architecture(&self, _answers: &[(String, String)]) -> Vec<ArchitectureDecision> {
-        let mut decisions = Vec::new();
-        decisions.push(ArchitectureDecision {
-            decision: "Use thiserror for library error types".into(),
-            rationale: "Consistent with the existing codebase (forge.rs, config/settings.rs)"
-                .into(),
-            alternatives: vec!["anyhow throughout".into(), "custom Error enums without derive".into()],
-        });
-        decisions.push(ArchitectureDecision {
-            decision: "Use async Rust with Tokio runtime".into(),
-            rationale: "The agent loop is async; all I/O is Tokio-based".into(),
-            alternatives: vec!["sync with threads".into(), "async-std".into()],
-        });
-        decisions
+    /// Resolve a path token mentioned in an answer against the working dir.
+    ///
+    /// Rejects tokens that would replace the working directory outright (the old
+    /// `working_dir.join("/etc/hosts.rs")` produced exactly that), anything
+    /// containing `..`, and URL-ish text. Backtick/quotes around a path are
+    /// stripped by the caller, so `` `main.rs` `` resolves instead of being
+    /// missed because of a trailing backtick.
+    fn resolve_mentioned_path(&self, token: &str) -> Option<PathBuf> {
+        if token.contains("://") || token.is_empty() {
+            return None;
+        }
+        let path = std::path::Path::new(token);
+        // Checked before the absolute branch, which would otherwise let an
+        // in-project `sub/../../etc` style token through.
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        if path.has_root() {
+            // `has_root`, not `is_absolute`: on Windows `is_absolute()` is false
+            // for a root-only path such as `/etc/hosts.rs` (it has a root but no
+            // drive prefix), so it fell through to `working_dir.join(..)` and was
+            // accepted as an in-project file at `C:\etc\hosts.rs`.
+            return if path.starts_with(&self.working_dir) {
+                Some(path.to_path_buf())
+            } else {
+                None
+            };
+        }
+        Some(self.working_dir.join(path))
     }
 
+    /// Derive architecture decisions from what the interview actually settled.
+    ///
+    /// The previous implementation hardcoded *this repository's* conventions —
+    /// "Use thiserror for library error types … Consistent with the existing
+    /// codebase (forge.rs, config/settings.rs)" and "Use async Rust with Tokio
+    /// runtime" — and emitted them as the **user's** architecture decisions for
+    /// every project. When the interview never covered architecture, the
+    /// honest answer is an empty list (the PRD then simply has no Architecture
+    /// Decisions section) rather than an invented one.
+    fn infer_architecture(&self, answers: &[(String, String)]) -> Vec<ArchitectureDecision> {
+        answers
+            .iter()
+            .filter(|(q, a)| is_architecture_question(q) && !a.trim().is_empty())
+            .map(|(q, a)| ArchitectureDecision {
+                decision: q.trim().trim_end_matches(|c: char| c == '?' || c == '？').trim().to_string(),
+                rationale: a.trim().to_string(),
+                alternatives: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Turn inferred files into ordered steps, capped so a chatty answer cannot
+    /// produce a plan with hundreds of steps (and a meaningless estimate).
     fn infer_steps(&self, files: &[FileAction], _answers: &[(String, String)]) -> Vec<ImplementationStep> {
-        let mut steps = Vec::new();
-        for (i, f) in files.iter().enumerate() {
-            steps.push(ImplementationStep {
+        const MAX_INFERRED_STEPS: usize = 20;
+
+        let mut steps: Vec<ImplementationStep> = files
+            .iter()
+            .take(MAX_INFERRED_STEPS)
+            .enumerate()
+            .map(|(i, f)| ImplementationStep {
                 step_number: (i + 1) as u32,
                 description: match f.action {
                     FileActionType::Create => format!("Create {}", f.path),
@@ -517,64 +617,22 @@ impl PrdGenerator {
                 files: vec![f.path.clone()],
                 estimated_minutes: 15,
                 completed: false,
+            })
+            .collect();
+
+        // A test step only makes sense when the plan touches Rust sources —
+        // "cargo test" was previously emitted unconditionally, including for
+        // projects that do not use Cargo at all.
+        if files.iter().any(|f| f.path.ends_with(".rs")) {
+            steps.push(ImplementationStep {
+                step_number: (steps.len() + 1) as u32,
+                description: "Run all tests and verify they pass".into(),
+                files: vec!["cargo test".into()],
+                estimated_minutes: 10,
+                completed: false,
             });
         }
-        // Add a testing step
-        steps.push(ImplementationStep {
-            step_number: (steps.len() + 1) as u32,
-            description: "Run all tests and verify they pass".into(),
-            files: vec!["cargo test".into()],
-            estimated_minutes: 10,
-            completed: false,
-        });
         steps
-    }
-
-    /// Recursively collect source files from `dir`, skipping noise directories.
-    /// Limits recursion depth to `max_depth` (0-based; 0 = root only) to
-    /// avoid runaway traversal in large repositories.
-    fn collect_files_recursive(
-        &self,
-        dir: &std::path::Path,
-        files: &mut Vec<FileAction>,
-        depth: usize,
-    ) {
-        // Skip common build / dependency directories.
-        const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".direnv", "dist", "build"];
-        const MAX_DEPTH: usize = 10;
-
-        if depth > MAX_DEPTH {
-            return;
-        }
-
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-
-            if path.is_dir() {
-                if SKIP_DIRS.contains(&file_name) || file_name.starts_with('.') {
-                    continue;
-                }
-                self.collect_files_recursive(&path, files, depth + 1);
-            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext == "rs" || ext == "toml" || ext == "md" {
-                    files.push(FileAction {
-                        path: path.display().to_string(),
-                        action: FileActionType::Modify,
-                        description: format!("Existing {} file", ext),
-                        estimated_lines: 0,
-                    });
-                }
-            }
-        }
     }
 
     fn infer_test_plan(&self, files: &[FileAction], _answers: &[(String, String)]) -> TestPlan {
@@ -598,6 +656,90 @@ impl PrdGenerator {
             manual_checks: vec!["Code compiles with `cargo build`".into()],
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Answer text helpers
+// ---------------------------------------------------------------------------
+
+/// Whether an interview question is about architecture / design.
+fn is_architecture_question(question: &str) -> bool {
+    const PHRASES: &[&str] = &["error handling", "data flow", "data model", "data structure"];
+    let ql = question.to_lowercase();
+    if PHRASES.iter().any(|phrase| ql.contains(phrase)) {
+        return true;
+    }
+    ql.split(|c: char| !c.is_alphanumeric()).any(|token| {
+        token.starts_with("architect")
+            || token.starts_with("design")
+            || token == "module"
+            || token == "modules"
+            || token == "api"
+            || token == "apis"
+            || token == "schema"
+            || token == "persistence"
+            || token == "storage"
+            || token == "database"
+    })
+}
+
+/// Collect the answers to questions matching `matches`, split into items.
+fn split_answer_items_for(
+    answers: &[(String, String)],
+    matches: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (q, a) in answers {
+        if !matches(&q.to_lowercase()) {
+            continue;
+        }
+        for item in split_answer_items(a) {
+            if !out.iter().any(|existing| existing == &item) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+/// Split one interview answer into discrete items.
+///
+/// Interview answers are prose ("Use existing workspace dependencies where
+/// possible. No new external services."), not lists. Storing the whole
+/// paragraph as a single "dependency" produced a bogus crate name; splitting on
+/// line/separator boundaries at least yields the individual claims. A
+/// comma-separated segment is only treated as a list when every part is short
+/// enough to be a name, so prose commas are not chopped into fragments.
+fn split_answer_items(answer: &str) -> Vec<String> {
+    let mut items: Vec<String> = Vec::new();
+    for line in answer.split(|c: char| c == '\n' || c == ';' || c == '；' || c == '•' || c == '·') {
+        let line = line
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '•' || c.is_whitespace())
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(|c: char| c == ',' || c == '，').map(str::trim).collect();
+        let looks_like_a_list = parts.len() > 1
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().count() <= 40);
+        if looks_like_a_list {
+            items.extend(parts.into_iter().map(str::to_string));
+        } else {
+            items.push(line.to_string());
+        }
+    }
+    items
+        .into_iter()
+        .map(|s| {
+            s.trim()
+                .trim_end_matches(|c: char| c == '.' || c == '。')
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +823,10 @@ mod tests {
             ("Acceptance criteria?".into(), "All tests pass, code compiles".into()),
             ("Constraints?".into(), "Must use thiserror".into()),
             ("Dependencies?".into(), "tokio, serde, chrono".into()),
+            (
+                "What modules or files need to be created or modified?".into(),
+                "Edit `src/plan.rs` and notes.md".into(),
+            ),
         ];
         let prd = gen.generate(&answers, "task-1", "Plan Engine").unwrap();
 
@@ -688,14 +834,81 @@ mod tests {
         assert_eq!(prd.id, "task-1");
         assert_eq!(prd.goals, vec!["Implement the Plan engine"]);
         assert_eq!(prd.success_criteria, vec!["All tests pass, code compiles"]);
+        assert_eq!(prd.constraints, vec!["Must use thiserror"]);
+        assert_eq!(prd.dependencies, vec!["tokio", "serde", "chrono"]);
+        // Only the files the interview named — not the repo's file listing.
+        assert_eq!(prd.files_to_modify.len(), 2);
+        assert!(prd
+            .files_to_modify
+            .iter()
+            .any(|f| f.path.ends_with("plan.rs")));
+        assert!(prd
+            .files_to_modify
+            .iter()
+            .any(|f| f.path.ends_with("notes.md")));
         assert!(!prd.implementation_steps.is_empty());
+        // Architecture comes from the interview, not from hardcoded defaults.
+        assert_eq!(prd.architecture_decisions.len(), 1);
+        assert!(prd.architecture_decisions[0].decision.contains("modules or files"));
+    }
+
+    #[test]
+    fn test_infer_files_ignores_directory_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for name in ["a.rs", "b.rs", "c.toml", "d.md"] {
+            std::fs::write(src.join(name), "fn main() {}").unwrap();
+        }
+
+        let gen = PrdGenerator::new(tmp.path().to_path_buf());
+        let answers: Vec<(String, String)> =
+            vec![("What is the goal?".into(), "Add a --verbose flag".into())];
+        let prd = gen.generate(&answers, "task-x", "Add flag").unwrap();
+
+        // A directory walk would have listed all four files as "Modify" steps.
+        assert!(prd.files_to_modify.is_empty());
+        assert!(prd.implementation_steps.is_empty());
+        assert_eq!(prd.estimate_minutes, 0);
+    }
+
+    #[test]
+    fn test_mentioned_paths_are_validated_and_deduped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gen = PrdGenerator::new(tmp.path().to_path_buf());
+        let answers: Vec<(String, String)> = vec![
+            ("What is the goal?".into(), "Add a flag".into()),
+            (
+                "Which files?".into(),
+                "Edit /etc/hosts.rs and src/main.rs and ../escape.rs and src/main.rs again".into(),
+            ),
+        ];
+        let prd = gen.generate(&answers, "task-y", "Paths").unwrap();
+
+        // Absolute outside the project and `..` paths are rejected; the repeated
+        // mention is stored once.
+        assert_eq!(prd.files_to_modify.len(), 1);
+        assert!(prd.files_to_modify[0].path.ends_with("main.rs"));
+    }
+
+    #[test]
+    fn test_architecture_decisions_empty_when_not_discussed() {
+        let gen = PrdGenerator::new(PathBuf::from("/tmp"));
+        let answers: Vec<(String, String)> = vec![
+            ("What is the goal?".into(), "Ship the feature".into()),
+            ("What is the timeline?".into(), "Two weeks".into()),
+        ];
+        let prd = gen.generate(&answers, "task-z", "Feature").unwrap();
+        assert!(
+            prd.architecture_decisions.is_empty(),
+            "no architecture was discussed, so none may be invented"
+        );
+        assert!(prd.constraints.is_empty(), "unmatched constraints must not become \"\"");
+        assert!(prd.dependencies.is_empty());
     }
 
     #[test]
     fn test_prd_persist_and_load() {
-        let tmp = tempfile::tempdir().unwrap();
-        let gen = PrdGenerator::new(tmp.path().to_path_buf());
-
         let prd = PrdBuilder::new("test-task-id", "Test PRD")
             .description("A PRD for testing persistence")
             .goal("Verify save and load")

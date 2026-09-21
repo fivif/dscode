@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::compression::{CompressionAction, CompressionPipeline};
-use super::context::{build_context, count_message_tokens, ContextPacket};
+use super::context::{build_context, count_message_tokens, count_tool_def_tokens, ContextPacket};
 use super::error_withholding::ErrorWithholder;
 use super::stream::{StreamEvent, ToolStatus};
 use crate::auto::runner::AutoRunner;
@@ -77,6 +77,18 @@ const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 
 /// Start tool-loop detection after this many ReAct turns.
 const LOOP_DETECT_FROM_ITERATION: u32 = 5;
+
+/// How many times one turn may answer a provider "over context window"
+/// rejection by force-compressing and re-sending the same round.
+///
+/// One. [`CompressionPipeline::force_apply`] already applies the deepest level
+/// that can run, so a second rejection means the irreducible core (system
+/// prompt + live instruction + tool definitions) is itself larger than the
+/// model's real window: compressing again cannot help, and every re-send of a
+/// body the provider just rejected bills another generation. The counter is
+/// per `execute()` call — i.e. per user turn — and a retry also requires that
+/// the compression actually changed something, so this loop cannot spin.
+const MAX_CONTEXT_OVERFLOW_RETRIES: u32 = 1;
 
 /// Tool-call fingerprint: (tool name, hash of name + arguments).
 ///
@@ -165,9 +177,6 @@ pub struct Forge {
     /// Context window configuration.
     context_config: ContextConfig,
 
-    /// Whether compression has been applied in this session.
-    compressed: AtomicBool,
-
     /// Whether /teams multi-agent mode is active.
     teams_mode: AtomicBool,
 
@@ -206,7 +215,6 @@ impl Forge {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             max_history_messages: DEFAULT_MAX_HISTORY_MESSAGES,
             context_config: ContextConfig::default(),
-            compressed: AtomicBool::new(false),
             teams_mode: AtomicBool::new(false),
             // Safe defaults: no write-outside, no absolute trust
             safety_guard: Arc::new(SafetyGuard::new(&[], false)),
@@ -302,6 +310,18 @@ impl Forge {
     ///       appends the results to the conversation, then loops.
     ///    e. If the assistant produced a final answer, emits `Complete` and
     ///       returns.
+    ///
+    /// # Terminal events
+    ///
+    /// Every exit from `execute()` — success **and** every error path — emits
+    /// exactly one terminal event. Failing paths emit an
+    /// [`StreamEvent::Error`] with the reason, followed by
+    /// [`StreamEvent::Complete`] so UIs that key their streaming state off
+    /// `Complete` (rather than off `Error`) are not left spinning forever.
+    ///
+    /// The one exception is a **truncated stream** (`StreamedTurn::truncated`):
+    /// it emits `Error` and deliberately **no** `Complete`, because "the reply
+    /// is a prefix" must never be reported as a finished turn.
     pub async fn execute(
         &self,
         user_message: &str,
@@ -309,8 +329,15 @@ impl Forge {
         history: Vec<Message>,
         event_tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), ForgeError> {
-        // F4: Reset compression flag for each new execution so re-use works.
-        self.compressed.store(false, Ordering::Relaxed);
+        // F4: Compression is tracked per execution (a local, not Forge state),
+        // so two concurrent `execute()` calls on the same Forge instance can
+        // never reset each other's compression bookkeeping.
+        let mut compression_passes: u32 = 0;
+
+        // Per-turn budget for "the provider says we are over its context
+        // window" → force-compress → re-send. See
+        // `MAX_CONTEXT_OVERFLOW_RETRIES` for why it is one.
+        let mut overflow_retries: u32 = 0;
 
         let trimmed = user_message.trim();
 
@@ -332,11 +359,28 @@ impl Forge {
             return Ok(());
         }
 
+        // ── /compact — manual context compression ──
+        //
+        // Handled *before* the plan-interview guard below, so an active
+        // interview cannot swallow it as an answer (that guard treats every
+        // non-command input as the user's answer). Matched on a command
+        // boundary, not with `starts_with`: `/compacter` must not hit it.
+        // The `/plan`, `/auto` and `/teams` checks below keep their historical
+        // `starts_with` — deliberately untouched.
+        if invokes_command(trimmed, "/compact") {
+            return self.compact_now(session_id, history, &event_tx).await;
+        }
+
         // ── Active multi-turn /plan interview (user answers) ──
         if ActivePlanSession::is_active(session_id)
             && !trimmed.starts_with("/plan")
             && !trimmed.starts_with("/auto")
             && !trimmed.starts_with("/teams")
+            // `/compact` is a command, never an interview answer. Belt and
+            // braces: the short-circuit above already returns before this
+            // guard, but the exclusion keeps the guard honest if that order
+            // ever changes.
+            && !invokes_command(trimmed, "/compact")
         {
             return self
                 .continue_plan_interview(session_id, trimmed, &event_tx)
@@ -460,7 +504,10 @@ impl Forge {
             name: None,
             tool_calls: None,
             tool_call_id: None,
-            reasoning_content: None, created_at: 0 });
+            reasoning_content: None,
+            created_at: 0,
+            ..Default::default()
+        });
 
         info!(
             session = %session_id,
@@ -472,6 +519,9 @@ impl Forge {
 
         // F5: Track message count at start of this execute() so stall
         // detection only examines messages added during the current run.
+        // NOTE: compression (`*messages = work`) and validation can both shrink
+        // the vector afterwards, so every slice built from this must be clamped
+        // (see the `base` clamp in the loop).
         let initial_msg_count = messages.len();
 
         // F2: Sliding window of tool-call fingerprints (name + args hash) from
@@ -510,6 +560,10 @@ impl Forge {
                 let _ = event_tx.send(StreamEvent::Error {
                     content: "Agent cancelled.".into(),
                 });
+                // Terminal-event contract: every exit from `execute()` emits
+                // exactly one `Complete`, so a UI that keys off it always
+                // leaves the streaming state — `Error` alone is informational.
+                let _ = event_tx.send(StreamEvent::Complete { usage: None });
                 return Err(ForgeError::Cancelled);
             }
 
@@ -534,9 +588,78 @@ impl Forge {
                         tool_call_id: None,
                         reasoning_content: None,
                         created_at: 0,
+                        ..Default::default()
                     });
                 }
             }
+
+            // =============================================================
+            // (a.0) Context compression (L0-L4)
+            // =============================================================
+            //
+            // Runs *before* the provider call and before stall detection, on
+            // `provider_view` — the validated vector that is actually sent to
+            // the provider (orphan tool rows dropped, unpaired tool_calls
+            // stripped, duplicate rows merged). Metering, thresholds and the
+            // stall detector therefore all describe the request the model
+            // really receives, not the raw history.
+            //
+            // This is deliberately not a one-pass-per-turn latch: a long tool
+            // loop refills the window between iterations (up to 24k chars of
+            // tool output each time), and a turn that stopped compressing
+            // after its first pass used to die on the provider's non-retryable
+            // HTTP 400 around iteration 40 — after dozens of successful tool
+            // calls. Repeat passes run with `cheap_only` so they never pay for
+            // another LLM summarisation.
+            let passes = compression_passes;
+            let tool_tok = count_tool_def_tokens(&tools);
+            let token_count = |msgs: &Vec<Message>| -> u64 {
+                let sys: Vec<&Message> = msgs.iter().filter(|m| m.role == Role::System).collect();
+                let hist: Vec<&Message> = msgs.iter().filter(|m| m.role != Role::System).collect();
+                count_message_tokens(&sys) + count_message_tokens(&hist) + tool_tok
+            };
+            let mut provider_view = validate_tool_chain_for_provider(messages.clone());
+            {
+                let mut pipeline = CompressionPipeline::new(self.context_config.clone())
+                    .with_tools(&tools);
+                pipeline.cheap_only = passes > 0;
+                let before_tok = token_count(&provider_view);
+                // Compress the validated view in place (no extra clone): the
+                // pipeline may also apply L0, which mutates even when it
+                // reports no level action.
+                let action = pipeline
+                    .apply(&mut provider_view, &*self.provider, None)
+                    .await;
+                let after_tok = token_count(&provider_view);
+                // A level action, or L0's irreversible snip (which mutates
+                // without reporting a level): either way the prompt changed.
+                if !matches!(action, CompressionAction::None) || after_tok != before_tok {
+                    // Keep the working history in sync with the compressed,
+                    // validated view: the provider will see `provider_view`, so
+                    // anything else would make the next iteration reason about
+                    // a different history than the model did.
+                    provider_view = validate_tool_chain_for_provider(provider_view);
+                    messages = provider_view.clone();
+                    let _ = event_tx.send(StreamEvent::ContextCompressed {
+                        before_tokens: before_tok,
+                        after_tokens: after_tok,
+                        window: self.context_config.window_tokens,
+                    });
+                    info!(
+                        session = %session_id,
+                        iteration,
+                        action = ?action,
+                        before_tok,
+                        after_tok,
+                        "context compression applied"
+                    );
+                    compression_passes += 1;
+                }
+            }
+
+            // F10: Clean orphaned tool_calls on the original vec so the
+            // fix persists across iterations (new messages appended to original).
+            clean_orphaned_tool_calls(&mut messages);
 
             debug!(
                 session = %session_id,
@@ -548,7 +671,15 @@ impl Forge {
             // Stall detection — sliding window of tool-call sets (from early on).
             if iteration >= LOOP_DETECT_FROM_ITERATION {
                 // Only scan messages added during this execute() call (F5).
-                let run_messages = &messages[initial_msg_count..];
+                //
+                // `initial_msg_count` was measured on `messages`, but
+                // compression rewrites the vector and validation drops rows,
+                // so the provider view can be much shorter. Clamp before
+                // slicing: `&messages[initial_msg_count..]` used to panic with
+                // "range start index N out of range" on iteration 5 whenever
+                // compression had shrunk the history.
+                let base = initial_msg_count.min(provider_view.len());
+                let run_messages = &provider_view[base..];
                 // Last assistant tool-call set (most recent turn)
                 let current_set: std::collections::BTreeSet<(String, u64)> = run_messages
                     .iter()
@@ -592,57 +723,25 @@ impl Forge {
                             tool_call_id: None,
                             reasoning_content: None,
                             created_at: 0,
+                            ..Default::default()
                         });
                         // Clear window so we don't re-nudge every turn
                         recent_tool_sets.clear();
+                        // The nudge must reach the provider this iteration,
+                        // so the authoritative view is rebuilt after it.
+                        provider_view = validate_tool_chain_for_provider(messages.clone());
                     }
                 }
             }
 
-            // (a.0) Multi-level context compression (L0-L4) via the shared
-            // CompressionPipeline. At most one compression pass per user turn.
-            if !self.compressed.load(Ordering::Relaxed) {
-                let token_count = |msgs: &Vec<Message>| -> u64 {
-                    let sys: Vec<&Message> = msgs.iter().filter(|m| m.role == Role::System).collect();
-                    let hist: Vec<&Message> = msgs.iter().filter(|m| m.role != Role::System).collect();
-                    count_message_tokens(&sys) + count_message_tokens(&hist)
-                };
-                let before_tok = token_count(&messages);
-
-                let mut pipeline = CompressionPipeline::new(self.context_config.clone());
-                let action = pipeline
-                    .apply(&mut messages, &*self.provider, None)
-                    .await;
-                if !matches!(action, CompressionAction::None) {
-                    let after_tok = token_count(&messages);
-                    let _ = event_tx.send(StreamEvent::ContextCompressed {
-                        before_tokens: before_tok,
-                        after_tokens: after_tok,
-                        window: self.context_config.window_tokens,
-                    });
-                    info!(
-                        session = %session_id,
-                        iteration,
-                        action = ?action,
-                        before_tok,
-                        after_tok,
-                        "context compression applied"
-                    );
-                    self.compressed.store(true, Ordering::Relaxed);
-                }
-            }
-
-            // F10: Clean orphaned tool_calls on the original vec so the
-            // fix persists across iterations (new messages appended to original).
-            clean_orphaned_tool_calls(&mut messages);
-
             // (a) Call the LLM provider — SSE stream first, fall back to chat()
-            let snapshot = messages.clone();
-            let validated = validate_tool_chain_for_provider(snapshot);
-
-            let response = match stream_provider_turn(
+            //
+            // `provider_view` (built above, before compression) is the
+            // authoritative history for this iteration: it is what the
+            // provider actually receives.
+            let turn = match stream_provider_turn(
                 &*self.provider,
-                validated,
+                provider_view,
                 tools.clone(),
                 &event_tx,
                 iteration,
@@ -651,6 +750,98 @@ impl Forge {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    // ── Context overflow: the one provider 400 worth
+                    // re-sending ─────────────────────────────────────────
+                    //
+                    // `error_withholding` classifies every 400 as permanent
+                    // (correctly: re-sending the *same body* cannot succeed),
+                    // so this has to be intercepted before it. But the body is
+                    // not immutable — shrink it and the same call goes
+                    // through. This is also the only signal that reflects the
+                    // real model's window instead of the user-typed
+                    // `window_tokens`, which is why it beats the estimate.
+                    if e.is_context_overflow() {
+                        if overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
+                            // `provider_view` was moved into the failed call;
+                            // rebuild it from the working history (the same
+                            // derivation the loop uses to build it).
+                            let mut view =
+                                validate_tool_chain_for_provider(messages.clone());
+                            let before_tok = token_count(&view);
+                            let mut pipeline = CompressionPipeline::new(
+                                self.context_config.clone(),
+                            )
+                            .with_tools(&tools);
+                            // Bypasses `cheap_only` on purpose: the provider
+                            // has already rejected this prompt, so a dead turn
+                            // is the expensive outcome, not the summary call.
+                            let action =
+                                pipeline.force_apply(&mut view, &*self.provider).await;
+
+                            if !matches!(action, CompressionAction::None) {
+                                overflow_retries += 1;
+                                compression_passes += 1;
+                                let after_tok = token_count(&view);
+                                view = validate_tool_chain_for_provider(view);
+                                // Keep the working history in sync with what
+                                // will be sent, exactly like the proactive
+                                // pass above.
+                                messages = view;
+                                let _ = event_tx.send(StreamEvent::ContextCompressed {
+                                    before_tokens: before_tok,
+                                    after_tokens: after_tok,
+                                    window: self.context_config.window_tokens,
+                                });
+                                let _ = event_tx.send(StreamEvent::Token {
+                                    content: format!(
+                                        "\n_⚠️ 模型报告上下文超过其上限,已强制压缩\
+                                         ({}:{before_tok} → {after_tok} tokens)并重试本回合。\
+                                         要根治请把设置里的上下文窗口改成该模型的真实大小。_\n",
+                                        action_label(&action)
+                                    ),
+                                });
+                                warn!(
+                                    session = %session_id,
+                                    iteration,
+                                    action = ?action,
+                                    before_tok,
+                                    after_tok,
+                                    "provider rejected the prompt as over-window — force-compressed, retrying the round"
+                                );
+                                continue;
+                            }
+                            warn!(
+                                session = %session_id,
+                                iteration,
+                                "provider rejected the prompt as over-window but no level could compress further"
+                            );
+                        }
+                        // Retry budget spent (or nothing left to cut): this is
+                        // fatal, and the generic "Provider error: …" text
+                        // would hide the one thing the user can act on.
+                        error!(
+                            session = %session_id,
+                            iteration,
+                            %e,
+                            overflow_retries,
+                            "context overflow persists after compression — failing the turn"
+                        );
+                        let what = if overflow_retries > 0 {
+                            "压缩后仍然超过模型的上下文上限"
+                        } else {
+                            "上下文超过模型的上限,且已无可安全压缩的内容"
+                        };
+                        let _ = event_tx.send(StreamEvent::Error {
+                            content: format!(
+                                "{what},provider 原文:{e}\n\
+                                 把设置里的上下文窗口(context.window_tokens)改成该模型的真实大小,\
+                                 或开一个新会话后重试。"
+                            ),
+                        });
+                        let _ = event_tx.send(StreamEvent::Complete { usage: None });
+                        return Err(ForgeError::Provider(e));
+                    }
+
                     match withholder.tolerate(e) {
                         Ok(()) => {
                             let attempt = withholder.attempts_used();
@@ -677,11 +868,50 @@ impl Forge {
                             let _ = event_tx.send(StreamEvent::Error {
                                 content: format!("Provider error: {}", e),
                             });
+                            let _ = event_tx.send(StreamEvent::Complete { usage: None });
                             return Err(ForgeError::Provider(e));
                         }
                     }
                 }
             };
+
+            // A stream that ended without the provider's own completion marker
+            // is not a success: the accumulated text and tool-call arguments
+            // are a prefix. Executing a half-parsed tool call — or reporting
+            // `Complete` on half a reply — is worse than failing the turn, so
+            // this terminates here with the ONE deliberate exception to the
+            // terminal-event contract: an `Error` and no `Complete`, because a
+            // `Complete` is exactly the "report an incomplete reply as a
+            // finished one" bug this path exists to stop. (`ChatResponse`
+            // cannot carry the flag, so it travels in `StreamedTurn`.)
+            if let Some(reason) = turn.truncated.as_ref() {
+                let msg = format!(
+                    "Response stream was interrupted ({reason}); the reply is incomplete \
+                     and was not executed. Please retry the request."
+                );
+                error!(session = %session_id, iteration, %reason, "Forge: truncated stream");
+                let _ = event_tx.send(StreamEvent::Error {
+                    content: msg.clone(),
+                });
+                return Err(ForgeError::Provider(ProviderError::StreamInterrupted(msg)));
+            }
+            let response = turn.response;
+
+            // `finish_reason` is the provider's own account of *why* it stopped.
+            // `length` (max_tokens) and `content_filter` both used to be
+            // swallowed and reported as a normal, successful answer.
+            let finish_note = finish_reason_note(turn.finish_reason.as_deref());
+            if let Some(note) = finish_note {
+                warn!(
+                    session = %session_id,
+                    iteration,
+                    finish_reason = ?turn.finish_reason,
+                    "Forge: provider ended the turn abnormally"
+                );
+                let _ = event_tx.send(StreamEvent::Token {
+                    content: format!("\n\n_⚠️ {note}_\n"),
+                });
+            }
 
             let has_tool_calls = !response.tool_calls.is_empty();
             let has_content = !response.content.trim().is_empty();
@@ -702,6 +932,7 @@ impl Forge {
                 tool_call_id: None,
                 reasoning_content: response.reasoning_content.clone(),
                 created_at: 0,
+                ..Default::default()
             };
 
             // (d) Execute tool calls if present
@@ -720,6 +951,13 @@ impl Forge {
 
                 // Same-turn tool calls run concurrently (e.g. multiple do_web_fetch).
                 // Results are appended in the original tool_call order for the LLM.
+                //
+                // The batch races the cancel token: the token was previously
+                // only checked at the top of each iteration, so one tool that
+                // never returns (a hung `do_bash`) pinned the whole turn
+                // forever. We only race here — `ToolContext` deliberately has
+                // no cancel field, so tools stay cancellable by dropping the
+                // future, not by threading a token through every call site.
                 let tool_results = {
                     let futs: Vec<_> = response
                         .tool_calls
@@ -737,9 +975,36 @@ impl Forge {
                             )
                         })
                         .collect();
-                    futures::future::join_all(futs).await
+                    let batch = futures::future::join_all(futs);
+                    match self.cancel_token.as_ref() {
+                        Some(token) => {
+                            tokio::select! {
+                                results = batch => results,
+                                _ = token.cancelled() => {
+                                    info!(
+                                        session = %session_id,
+                                        iteration,
+                                        "Forge: cancelled while tools were running"
+                                    );
+                                    let _ = event_tx.send(StreamEvent::Error {
+                                        content: "Agent cancelled.".into(),
+                                    });
+                                    let _ = event_tx.send(StreamEvent::Complete { usage: None });
+                                    return Err(ForgeError::Cancelled);
+                                }
+                            }
+                        }
+                        None => batch.await,
+                    }
                 };
-                for msg in tool_results {
+                for mut msg in tool_results {
+                    if let Some(note) = finish_note {
+                        // Attach the truncation warning to the tool result the
+                        // model reads back, so it knows to split the call next
+                        // time instead of silently trusting a cut-off payload.
+                        let text = msg.content.as_text().unwrap_or("").to_string();
+                        msg.content = MessageContent::Text(format!("{text}\n\n[note: {note}]"));
+                    }
                     messages.push(msg);
                 }
 
@@ -800,6 +1065,7 @@ impl Forge {
                             tool_call_id: None,
                             reasoning_content: None,
                             created_at: 0,
+                            ..Default::default()
                         });
                     }
                     withholder.sleep_backoff().await;
@@ -818,6 +1084,7 @@ impl Forge {
                             withholder.max_attempts
                         ),
                     });
+                    let _ = event_tx.send(StreamEvent::Complete { usage: None });
                     return Err(ForgeError::EmptyResponse);
                 }
             }
@@ -837,7 +1104,89 @@ impl Forge {
                 self.max_iterations
             ),
         });
+        let _ = event_tx.send(StreamEvent::Complete { usage: None });
         Err(ForgeError::MaxIterations(self.max_iterations))
+    }
+
+    /// `/compact` — compress the current context on demand and report the
+    /// result.
+    ///
+    /// Short-circuits the ReAct loop entirely: the user asked to shrink the
+    /// context, not to run a turn.
+    /// [`CompressionPipeline::force_apply`] ignores the configured thresholds,
+    /// so this works even when `window_tokens` is much larger than the model's
+    /// real window — the situation the automatic ladder cannot see.
+    ///
+    /// Persistence caveat: `execute()` receives `history` by value and Forge
+    /// owns no storage handle, so the compressed vector cannot be written back
+    /// from here. The report below therefore describes what a request would
+    /// cost now; making the compression stick across turns needs the
+    /// session/desktop layer.
+    async fn compact_now(
+        &self,
+        session_id: &str,
+        history: Vec<Message>,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<(), ForgeError> {
+        // Same metering as the ReAct loop, tool definitions included: they are
+        // sent on every request and can be a large part of the prompt.
+        let tool_defs = self.tools.to_openai_tools();
+        let tool_tok = count_tool_def_tokens(&tool_defs);
+        let count = |msgs: &Vec<Message>| -> u64 {
+            let sys: Vec<&Message> = msgs.iter().filter(|m| m.role == Role::System).collect();
+            let hist: Vec<&Message> = msgs.iter().filter(|m| m.role != Role::System).collect();
+            count_message_tokens(&sys) + count_message_tokens(&hist) + tool_tok
+        };
+
+        let mut view = validate_tool_chain_for_provider(history);
+        let before_tok = count(&view);
+        let mut pipeline =
+            CompressionPipeline::new(self.context_config.clone()).with_tools(&tool_defs);
+        let action = pipeline.force_apply(&mut view, &*self.provider).await;
+        let after_tok = count(&view);
+        let window = self.context_config.window_tokens;
+
+        // `force_apply` reports L0 with its own action (see `CompressionAction`),
+        // but the token delta is the belt-and-braces check: a pass that reports
+        // nothing yet changed the prompt must not be called a no-op.
+        let changed = !matches!(action, CompressionAction::None) || after_tok < before_tok;
+        info!(
+            session = %session_id,
+            action = ?action,
+            before_tok,
+            after_tok,
+            "Forge: /compact"
+        );
+
+        // Emit the usage event whether or not anything changed, so the UI can
+        // refresh its context meter and the user always gets an answer.
+        let _ = event_tx.send(StreamEvent::ContextCompressed {
+            before_tokens: before_tok,
+            after_tokens: after_tok,
+            window,
+        });
+        let text = if changed {
+            let pct = if window > 0 {
+                after_tok as f64 / window as f64 * 100.0
+            } else {
+                0.0
+            };
+            format!(
+                "已压缩({}):{} → {} tokens(窗口 {},约占 {:.1}%)。\n",
+                action_label(&action),
+                before_tok,
+                after_tok,
+                window,
+                pct
+            )
+        } else {
+            format!(
+                "当前上下文无需压缩:{before_tok} tokens(窗口 {window}),已无可安全压缩的内容。\n"
+            )
+        };
+        let _ = event_tx.send(StreamEvent::Token { content: text });
+        let _ = event_tx.send(StreamEvent::Complete { usage: None });
+        Ok(())
     }
 
     /// Execute in /teams mode via TeamRuntime (v2 only — v1 path retired).
@@ -904,6 +1253,7 @@ impl Forge {
                 let _ = event_tx.send(StreamEvent::Error {
                     content: format!("Failed to start plan: {e}"),
                 });
+                let _ = event_tx.send(StreamEvent::Complete { usage: None });
                 Err(ForgeError::EmptyResponse)
             }
         }
@@ -939,6 +1289,7 @@ impl Forge {
                 let _ = event_tx.send(StreamEvent::Error {
                     content: format!("Plan error: {e}"),
                 });
+                let _ = event_tx.send(StreamEvent::Complete { usage: None });
                 Err(ForgeError::EmptyResponse)
             }
         }
@@ -1003,6 +1354,7 @@ impl Forge {
                 let _ = event_tx.send(StreamEvent::Error {
                     content: format!("/auto failed: {e}"),
                 });
+                let _ = event_tx.send(StreamEvent::Complete { usage: None });
                 Err(ForgeError::EmptyResponse)
             }
         }
@@ -1034,6 +1386,101 @@ async fn emit_plan_turn(
     let _ = event_tx.send(StreamEvent::Complete { usage: None });
 }
 
+/// Overall SSE stream budget (seconds): a hard ceiling on one provider turn.
+const STREAM_TOTAL_BUDGET_SECS: u64 = 300;
+/// SSE idle timeout (seconds): no chunk at all for this long means the
+/// connection is dead even if it was never closed.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// One provider turn plus the facts the ReAct loop needs that
+/// [`ChatResponse`] cannot carry.
+///
+/// `ChatResponse` is shared with `providers/**` and its shape is not ours to
+/// change, so the stream-level signals travel alongside it.
+struct StreamedTurn {
+    response: ChatResponse,
+    /// `Some(reason)` when the stream was cut **before** the provider
+    /// signalled completion: `response` holds a prefix, and any tool-call
+    /// arguments in it may be half a JSON document. The caller must not
+    /// execute those tools or report `Complete`.
+    truncated: Option<String>,
+    /// The provider's `finish_reason` ("stop", "length", "content_filter", …).
+    /// Previously computed and then discarded with `let _ = finish_reason;`,
+    /// which made a max_tokens cut look like a normal answer.
+    finish_reason: Option<String>,
+}
+
+/// Emit a non-streamed response's thinking/text and wrap it as a complete
+/// turn. Every `chat()` fallback path in [`stream_provider_turn`] ends here.
+fn completed_turn(
+    response: ChatResponse,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    iteration: u32,
+) -> StreamedTurn {
+    if let Some(ref reasoning) = response.reasoning_content {
+        if !reasoning.is_empty() {
+            let _ = event_tx.send(StreamEvent::Thinking {
+                content: reasoning.clone(),
+                step: iteration,
+            });
+        }
+    }
+    if !response.content.is_empty() {
+        let _ = event_tx.send(StreamEvent::Token {
+            content: response.content.clone(),
+        });
+    }
+    StreamedTurn {
+        response,
+        truncated: None,
+        finish_reason: None,
+    }
+}
+
+/// Whether `input` invokes the built-in command `cmd`.
+///
+/// Matches `cmd` exactly, or `cmd` followed by a separator (whitespace or
+/// `:`), so `/compact` matches while `/compacter` does not. Used for
+/// `/compact` only: the `/plan`, `/auto` and `/teams` checks keep their
+/// historical `starts_with`, where `/planet` still hits `/plan`.
+fn invokes_command(input: &str, cmd: &str) -> bool {
+    match input.strip_prefix(cmd) {
+        Some(rest) => {
+            rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with(':')
+        }
+        None => false,
+    }
+}
+
+/// Short user-facing name for the level a compression action came from.
+fn action_label(action: &CompressionAction) -> &'static str {
+    match action {
+        CompressionAction::None => "无",
+        CompressionAction::Snipped { .. } => "L0 工具输出剪裁",
+        CompressionAction::Truncated { .. } => "L1 截断",
+        CompressionAction::TagCompressed { .. } => "L2 工具输出压缩",
+        CompressionAction::LlmSummarized { .. } => "L3 LLM 摘要",
+        CompressionAction::Chunked { .. } => "L4 分块",
+    }
+}
+
+/// Turn an abnormal `finish_reason` into a user-visible note.
+///
+/// Returns `None` for a normal stop (and for providers that omit the field).
+fn finish_reason_note(finish_reason: Option<&str>) -> Option<&'static str> {
+    match finish_reason.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("length") | Some("max_tokens") => Some(
+            "the model hit its max_tokens limit — the reply was cut off and any tool \
+             arguments may be incomplete; re-issue the call split into smaller pieces",
+        ),
+        Some("content_filter") => Some(
+            "the provider filtered part of the reply (content_filter); treat the \
+             result as incomplete",
+        ),
+        _ => None,
+    }
+}
+
 /// Call the provider with **SSE streaming**, emit Thinking/Token deltas live,
 /// and assemble a final [`ChatResponse`]. Falls back to non-stream `chat()` if
 /// the stream cannot be opened or yields no usable content before error.
@@ -1043,7 +1490,7 @@ async fn stream_provider_turn(
     tools: Vec<ToolDef>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     iteration: u32,
-) -> Result<ChatResponse, ProviderError> {
+) -> Result<StreamedTurn, ProviderError> {
     use std::collections::BTreeMap;
 
     let stream_result = provider.chat_stream(messages.clone(), tools.clone()).await;
@@ -1051,22 +1498,18 @@ async fn stream_provider_turn(
     let mut stream = match stream_result {
         Ok(s) => s,
         Err(e) => {
+            // An over-window rejection answers a question about the *body*:
+            // the unary call would carry the same history and be rejected the
+            // same way, for another billed generation. Surface it so the
+            // caller can compress and re-send instead of paying for a
+            // guaranteed failure.
+            if e.is_context_overflow() {
+                warn!(%e, "SSE stream open rejected as over-window — not falling back to chat()");
+                return Err(e);
+            }
             warn!(%e, "SSE stream open failed — falling back to chat()");
             let r = provider.chat(messages, tools).await?;
-            if let Some(ref reasoning) = r.reasoning_content {
-                if !reasoning.is_empty() {
-                    let _ = event_tx.send(StreamEvent::Thinking {
-                        content: reasoning.clone(),
-                        step: iteration,
-                    });
-                }
-            }
-            if !r.content.is_empty() {
-                let _ = event_tx.send(StreamEvent::Token {
-                    content: r.content.clone(),
-                });
-            }
-            return Ok(r);
+            return Ok(completed_turn(r, event_tx, iteration));
         }
     };
 
@@ -1076,22 +1519,44 @@ async fn stream_provider_turn(
     let mut tool_acc: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut usage = None;
     let mut finish_reason: Option<String> = None;
-    let mut got_any = false;
+    // True only when a chunk carried an actual payload. A provider that sends
+    // heartbeat/keep-alive frames (`data: ` with all-None fields) must not
+    // count as "we got something", or a stream that then stalls returns an
+    // empty response instead of falling back to `chat()`.
+    let mut got_payload = false;
+    // Why the stream ended early, when it did.
+    let mut truncated: Option<String> = None;
 
     // Overall stream budget: prevent infinite hang
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(STREAM_TOTAL_BUDGET_SECS);
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             warn!("SSE stream overall timeout — using partial response");
+            truncated = Some(format!(
+                "no completion after {STREAM_TOTAL_BUDGET_SECS}s"
+            ));
             break;
         }
 
-        let next = tokio::time::timeout(std::time::Duration::from_secs(90), stream.next()).await;
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+            stream.next(),
+        )
+        .await;
         match next {
             Ok(Some(Ok(chunk))) => {
-                got_any = true;
+                let had_payload = chunk
+                    .reasoning_content
+                    .as_deref()
+                    .map_or(false, |s| !s.is_empty())
+                    || chunk.content.as_deref().map_or(false, |s| !s.is_empty())
+                    || chunk.tool_calls.as_ref().map_or(false, |d| !d.is_empty());
+                if had_payload {
+                    got_payload = true;
+                }
                 if let Some(rc) = chunk.reasoning_content {
                     if !rc.is_empty() {
                         reasoning.push_str(&rc);
@@ -1119,7 +1584,12 @@ async fn stream_provider_turn(
                         }
                         if let Some(f) = d.function {
                             if let Some(name) = f.name {
-                                entry.1.push_str(&name);
+                                // Set once, never append: gateways repeat the
+                                // full function name on every delta, and
+                                // `push_str` turned that into `do_readdo_bash`.
+                                if entry.1.is_empty() {
+                                    entry.1 = name;
+                                }
                             }
                             if let Some(args) = f.arguments {
                                 entry.2.push_str(&args);
@@ -1137,76 +1607,49 @@ async fn stream_provider_turn(
             }
             Ok(Some(Err(e))) => {
                 error!(%e, "SSE chunk error");
-                if got_any && (!content.is_empty() || !tool_acc.is_empty()) {
+                if got_payload && (!content.is_empty() || !tool_acc.is_empty()) {
                     warn!("using partial SSE response after chunk error");
+                    truncated = Some(format!("stream error mid-response: {e}"));
                     break;
+                }
+                // Some gateways report an over-window prompt as an error frame
+                // on a 200 stream; the unary retry would send the same body.
+                if e.is_context_overflow() {
+                    warn!(%e, "SSE error frame is an over-window rejection — not falling back to chat()");
+                    return Err(e);
                 }
                 // Fall back to non-stream
                 warn!(%e, "SSE failed with no content — falling back to chat()");
                 let r = provider.chat(messages, tools).await?;
-                if let Some(ref reasoning) = r.reasoning_content {
-                    if !reasoning.is_empty() {
-                        let _ = event_tx.send(StreamEvent::Thinking {
-                            content: reasoning.clone(),
-                            step: iteration,
-                        });
-                    }
-                }
-                if !r.content.is_empty() {
-                    let _ = event_tx.send(StreamEvent::Token {
-                        content: r.content.clone(),
-                    });
-                }
-                return Ok(r);
+                return Ok(completed_turn(r, event_tx, iteration));
             }
             Ok(None) => break,
             Err(_timeout) => {
-                warn!("SSE idle timeout (90s)");
-                if got_any {
+                warn!("SSE idle timeout ({}s)", STREAM_IDLE_TIMEOUT_SECS);
+                if got_payload {
+                    truncated =
+                        Some(format!("no data for {STREAM_IDLE_TIMEOUT_SECS}s"));
                     break;
                 }
                 warn!("SSE idle with no data — falling back to chat()");
                 let r = provider.chat(messages, tools).await?;
-                if let Some(ref reasoning) = r.reasoning_content {
-                    if !reasoning.is_empty() {
-                        let _ = event_tx.send(StreamEvent::Thinking {
-                            content: reasoning.clone(),
-                            step: iteration,
-                        });
-                    }
-                }
-                if !r.content.is_empty() {
-                    let _ = event_tx.send(StreamEvent::Token {
-                        content: r.content.clone(),
-                    });
-                }
-                return Ok(r);
+                return Ok(completed_turn(r, event_tx, iteration));
             }
         }
+    }
 
-        // If finish_reason is tool_calls or stop and we already have content/tools, we can end early
-        // once the stream also closed — handled by Ok(None).
-        let _ = finish_reason;
+    // If the provider told us *why* it stopped, the message itself is
+    // complete — a stream that ends right after `finish_reason` is only
+    // missing trailing usage frames, not content.
+    if finish_reason.is_some() {
+        truncated = None;
     }
 
     // If stream produced nothing useful, fall back
-    if !got_any && content.is_empty() && tool_acc.is_empty() {
+    if !got_payload && content.is_empty() && tool_acc.is_empty() {
         warn!("SSE produced empty response — falling back to chat()");
         let r = provider.chat(messages, tools).await?;
-        if let Some(ref reasoning) = r.reasoning_content {
-            if !reasoning.is_empty() {
-                let _ = event_tx.send(StreamEvent::Thinking {
-                    content: reasoning.clone(),
-                    step: iteration,
-                });
-            }
-        }
-        if !r.content.is_empty() {
-            let _ = event_tx.send(StreamEvent::Token {
-                content: r.content.clone(),
-            });
-        }
-        return Ok(r);
+        return Ok(completed_turn(r, event_tx, iteration));
     }
 
     let tool_calls: Vec<ToolCall> = tool_acc
@@ -1223,29 +1666,47 @@ async fn stream_provider_turn(
         .filter(|tc| !tc.function.name.is_empty())
         .collect();
 
-    Ok(ChatResponse {
-        content,
-        tool_calls,
-        usage,
-        reasoning_content: if reasoning.is_empty() {
-            None
-        } else {
-            Some(reasoning)
+    Ok(StreamedTurn {
+        response: ChatResponse {
+            content,
+            tool_calls,
+            usage,
+            reasoning_content: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
         },
+        truncated,
+        finish_reason,
     })
 }
 
-/// Remove tool_calls from messages that have no matching tool response.
 /// Validate that messages sent to the provider have intact tool chains.
-/// Returns cloned+fixed messages, logging any issues found.
+///
+/// Returns the **authoritative provider view**: cloned messages with orphaned
+/// tool rows dropped, unpaired `tool_calls` stripped, duplicated rows merged
+/// and ghost assistants removed, plus any issues logged. Callers should meter
+/// tokens, apply compression and run stall detection on this vector rather
+/// than on the raw history — a history that still contains orphan tool rows
+/// describes a request the model will never see.
 pub fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Message> {
     clean_orphaned_tool_calls(&mut messages);
-    // Remove consecutive duplicates
+    // Remove consecutive duplicates — Tool/Assistant rows only.
+    //
+    // This exists to clean up rows the storage layer wrote twice (the same
+    // assistant persisted more than once). Applying it to `User` messages is
+    // wrong: a user who sends the same text twice really did ask twice, and
+    // `[User(X), User(X)]` (which is exactly what a failed turn that persisted
+    // no assistant reply produces when the user resends) was collapsed into a
+    // single request, so two explicit instructions produced one action.
     let mut i = 1;
     while i < messages.len() {
+        let dedupable_role = matches!(messages[i].role, Role::Tool | Role::Assistant)
+            && messages[i - 1].role == messages[i].role;
         let same_tc_ids = messages[i-1].tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>())
             == messages[i].tool_calls.as_ref().map(|tc| tc.iter().map(|t| &t.id).collect::<Vec<_>>());
-        if messages[i-1].role == messages[i].role
+        if dedupable_role
             && messages[i-1].content == messages[i].content
             && same_tc_ids
             && messages[i-1].tool_call_id == messages[i].tool_call_id
@@ -1296,10 +1757,15 @@ pub fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Messa
                             .iter()
                             .find(|&&p| p > i && !used_resp.contains(&p))
                         {
-                            // Do not pair across a User/System boundary (new turn).
+                            // Do not pair across anything that is not a Tool
+                            // message: a User/System turn boundary, or another
+                            // Assistant (whose own tool_calls and results sit
+                            // in between). `[A(tc=[a,b]), T(a), A(tc=[c]), T(b)]`
+                            // used to pair `b` with a response that belongs to
+                            // a later assistant, which the provider rejects.
                             let crossing = messages[i + 1..p]
                                 .iter()
-                                .any(|mm| mm.role == Role::User || mm.role == Role::System);
+                                .any(|mm| mm.role != Role::Tool);
                             if !crossing {
                                 used_resp.insert(p);
                                 kept.insert((i, t.id.clone()));
@@ -1317,7 +1783,13 @@ pub fn validate_tool_chain_for_provider(mut messages: Vec<Message>) -> Vec<Messa
         if m.role == Role::Assistant {
             let mut m = m;
             if let Some(ref mut tc) = m.tool_calls {
-                tc.retain(|t| kept.contains(&(i, t.id.clone())));
+                // `kept` is keyed by `(index, id)`, so a duplicated tool_call
+                // id inside one assistant would survive it while only a single
+                // response was paired — the provider then sees two identical
+                // tool_call ids for one result. De-duplicate by id as well.
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                tc.retain(|t| kept.contains(&(i, t.id.clone())) && seen.insert(t.id.clone()));
                 if tc.is_empty() {
                     m.tool_calls = None;
                 }
@@ -1491,6 +1963,7 @@ async fn execute_one_tool(
                 tool_call_id: Some(tool_call_id.clone()),
                 reasoning_content: None,
                 created_at: 0,
+                ..Default::default()
             };
         }
     };
@@ -1551,6 +2024,7 @@ async fn execute_one_tool(
                 tool_call_id: Some(tool_call_id.clone()),
                 reasoning_content: None,
                 created_at: 0,
+                ..Default::default()
             }
         }
         Err(e) => {
@@ -1576,6 +2050,7 @@ async fn execute_one_tool(
                 tool_call_id: Some(tool_call_id.clone()),
                 reasoning_content: None,
                 created_at: 0,
+                ..Default::default()
             }
         }
     }
@@ -1617,6 +2092,7 @@ mod tool_chain_tests {
             tool_call_id: None,
             reasoning_content: None,
             created_at: 0,
+            ..Default::default()
         }
     }
 
@@ -1629,6 +2105,7 @@ mod tool_chain_tests {
             tool_call_id: Some(id.into()),
             reasoning_content: None,
             created_at: 0,
+            ..Default::default()
         }
     }
 
@@ -1832,6 +2309,130 @@ mod tool_chain_tests {
             1,
             "duplicate response dropped"
         );
+    }
+
+    #[test]
+    fn validate_does_not_pair_across_another_assistant() {
+        // `[A(tc=[a,b]), T(a), A(tc=[c]), T(c), T(b)]` — `b`'s response sits
+        // after a second assistant, so it does not belong to the first one.
+        // Pairing it anyway handed the first assistant a `b` whose matching tool
+        // message was not the one immediately following it (provider 400).
+        //
+        // The second assistant must carry a response of its own: with a bare
+        // `A(tc=[c])`, `clean_orphaned_tool_calls` drops it before pairing runs,
+        // the barrier disappears, and the input collapses to
+        // `[A(tc=[a,b]), T(a), T(b)]` — which is a valid chain.
+        let msgs = vec![
+            assistant_tc(&["a", "b"]),
+            tool_result("a"),
+            assistant_tc(&["c"]),
+            tool_result("c"),
+            tool_result("b"),
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        let tc_assts: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert_eq!(tc_assts.len(), 2, "got {out:#?}");
+        let ids: Vec<&str> = tc_assts[0]
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["a"],
+            "`b` must not be paired across another assistant"
+        );
+        // `c` still pairs with its own response; `b`'s orphaned one is dropped.
+        assert_eq!(out.iter().filter(|m| m.role == Role::Tool).count(), 2);
+    }
+
+    #[test]
+    fn validate_deduplicates_tool_call_ids_within_one_assistant() {
+        // `kept` is keyed by (index, id): the same id declared twice in one
+        // assistant survived while only one response was paired.
+        let msgs = vec![assistant_tc(&["a", "a"]), tool_result("a")];
+        let out = validate_tool_chain_for_provider(msgs);
+        let tc_assts: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .collect();
+        assert_eq!(tc_assts.len(), 1);
+        assert_eq!(
+            tc_assts[0].tool_calls.as_ref().unwrap().len(),
+            1,
+            "duplicate tool_call id must be collapsed"
+        );
+        assert_eq!(out.iter().filter(|m| m.role == Role::Tool).count(), 1);
+    }
+
+    #[test]
+    fn validate_keeps_a_user_message_sent_twice() {
+        // A user who resends the same instruction really did ask twice. The
+        // row de-duplication is for duplicated storage rows, and must not touch
+        // User messages — folding them collapsed two explicit requests into one.
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("run the tests".into()),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("run the tests".into()),
+                ..Default::default()
+            },
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        assert_eq!(
+            out.iter().filter(|m| m.role == Role::User).count(),
+            2,
+            "a repeated user instruction must survive"
+        );
+    }
+
+    #[test]
+    fn validate_deduplicates_repeated_assistant_rows() {
+        // Two identical assistant rows (double-persisted turn) still collapse.
+        let msgs = vec![
+            assistant_tc(&["a"]),
+            assistant_tc(&["a"]),
+            tool_result("a"),
+        ];
+        let out = validate_tool_chain_for_provider(msgs);
+        assert_eq!(
+            out.iter().filter(|m| m.role == Role::Assistant).count(),
+            1,
+            "duplicate assistant row must be dropped: {out:#?}"
+        );
+        assert_eq!(out.iter().filter(|m| m.role == Role::Tool).count(), 1);
+    }
+
+    /// A command must match on a token boundary: `/compacter` is not
+    /// `/compact`. The helper accepts an argument or `:` suffix because that
+    /// is how a command with arguments would be written (`/plan: fix it`),
+    /// but never a longer word — which is exactly what the historical
+    /// `starts_with` checks get wrong (`/planet` still hits `/plan`).
+    #[test]
+    fn command_matching_stops_at_a_token_boundary() {
+        assert!(invokes_command("/plan", "/plan"));
+        assert!(invokes_command("/plan build it", "/plan"));
+        assert!(invokes_command("/plan: build it", "/plan"));
+        assert!(!invokes_command("/planet", "/plan"));
+        assert!(!invokes_command("/plans", "/plan"));
+
+        assert!(invokes_command("/auto", "/auto"));
+        assert!(invokes_command("/auto do x", "/auto"));
+        assert!(!invokes_command("/autopilot", "/auto"));
+
+        assert!(invokes_command("/compact", "/compact"));
+        assert!(invokes_command("/compact ", "/compact"));
+        assert!(!invokes_command("/compaction", "/compact"));
+        assert!(!invokes_command("/foo", "/compact"));
     }
 
     #[test]

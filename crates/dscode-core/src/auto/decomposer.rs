@@ -71,20 +71,8 @@ pub fn parse_subtasks(content: &str) -> Result<Vec<Subtask>, AutoError> {
         if line.is_empty() {
             continue;
         }
-        let chars: Vec<char> = line.chars().take(3).collect();
-        if chars.len() < 2
-            || !chars[0].is_numeric()
-            || !(chars[1] == '.' || chars[1] == ')')
-        {
-            // allow multi-digit: "10. foo"
-            if let Some((num, rest)) = split_numbered(line) {
-                let (desc, deps) = split_deps(rest);
-                if !desc.is_empty() {
-                    raw.push((num, desc, deps));
-                }
-            }
-            continue;
-        }
+        // `split_numbered` now requires a `.`/`)` separator, so prose lines
+        // like "12 subtasks total" are not turned into phantom subtasks.
         if let Some((num, rest)) = split_numbered(line) {
             let (desc, deps) = split_deps(rest);
             if !desc.is_empty() {
@@ -135,6 +123,9 @@ pub fn parse_subtasks(content: &str) -> Result<Vec<Subtask>, AutoError> {
     Ok(subtasks)
 }
 
+/// Split `"12. description"` / `"3) description"` into `(12, "description")`.
+/// A `.`/`)` separator is REQUIRED — a bare leading number (e.g. the summary
+/// line `12 subtasks total`) must not parse as a subtask.
 fn split_numbered(line: &str) -> Option<(usize, &str)> {
     let line = line.trim();
     let mut num_end = 0;
@@ -152,8 +143,7 @@ fn split_numbered(line: &str) -> Option<(usize, &str)> {
     let rest = line[num_end..].trim_start();
     let rest = rest
         .strip_prefix('.')
-        .or_else(|| rest.strip_prefix(')'))
-        .unwrap_or(rest)
+        .or_else(|| rest.strip_prefix(')'))?
         .trim_start();
     Some((num, rest))
 }
@@ -183,7 +173,7 @@ fn parse_dep_list(s: &str) -> Vec<usize> {
 }
 
 fn has_cycle(subtasks: &[Subtask]) -> bool {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{HashMap, VecDeque};
     let mut indeg: HashMap<usize, usize> = HashMap::new();
     let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
     for s in subtasks {
@@ -231,6 +221,18 @@ mod tests {
         assert!(tasks[0].dependencies.is_empty());
         assert_eq!(tasks[1].dependencies, vec![1]);
         assert_eq!(tasks[2].dependencies, vec![1, 2]);
+    }
+
+    #[test]
+    fn trailing_summary_line_is_not_a_subtask() {
+        let text = "\
+1. Create model
+2. Migration deps: 1
+12 subtasks total
+";
+        let tasks = parse_subtasks(text).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| !t.description.contains("total")));
     }
 
     #[test]

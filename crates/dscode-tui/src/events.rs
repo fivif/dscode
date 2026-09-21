@@ -5,6 +5,16 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+/// State that changes how a key is interpreted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyContext {
+    /// A session is highlighted in the sidebar.
+    pub sidebar_selected: bool,
+    /// The input buffer is empty, so Enter can act on the sidebar selection
+    /// instead of submitting a message.
+    pub input_empty: bool,
+}
+
 /// Semantic actions produced by user input.
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -77,8 +87,14 @@ pub enum Action {
     /// Toggle the collapse state of a thinking block.
     ToggleThinking(usize),
 
+    /// Toggle the collapse state of the most recent thinking block.
+    ToggleLatestThinking,
+
     /// Toggle the collapse state of a tool card.
     ToggleToolCard(usize),
+
+    /// Toggle the collapse state of the most recent tool card.
+    ToggleLatestToolCard,
 
     /// Go to the previous message in input history.
     HistoryPrevious,
@@ -91,8 +107,21 @@ pub enum Action {
 }
 
 /// Convert a crossterm `KeyEvent` into an `Action`.
-pub fn key_event_to_action(key: KeyEvent) -> Action {
+pub fn key_event_to_action(key: KeyEvent, ctx: KeyContext) -> Action {
     use KeyCode::*;
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Sidebar management (only meaningful when something is selected).
+    if ctrl {
+        match key.code {
+            Char('d') | Char('D') => return Action::SessionDelete,
+            Char('t') | Char('T') => return Action::ToggleLatestThinking,
+            Char('o') | Char('O') => return Action::ToggleLatestToolCard,
+            End => return Action::ScrollBottom,
+            _ => {}
+        }
+    }
 
     // Global shortcuts take priority.
     match key {
@@ -130,9 +159,13 @@ pub fn key_event_to_action(key: KeyEvent) -> Action {
         KeyEvent {
             code: Enter, ..
         } => {
-            // In the TUI, Enter submits the message (Shift+Enter for newline)
+            // Shift+Enter inserts a newline. With an empty input and a session
+            // highlighted in the sidebar, Enter opens that session — otherwise
+            // the session list would be unreachable.
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 Action::InsertNewline
+            } else if ctx.sidebar_selected && ctx.input_empty {
+                Action::SessionSelect
             } else {
                 Action::Submit
             }

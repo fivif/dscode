@@ -6,7 +6,9 @@
     <link rel="icon" type="image/png" href="/ct_logo.png" />
     <title>DS Code</title>
   </head>
-  <body class="bg-gray-950 text-gray-100">
+  <!-- No palette classes here: globals.css sets the body ground and text colour
+       from the tokens, so the app paints before React mounts. -->
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

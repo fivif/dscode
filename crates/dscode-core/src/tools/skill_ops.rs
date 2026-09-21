@@ -180,18 +180,25 @@ impl Tool for DoSkillInstall {
             });
         }
 
-        // Block obviously dangerous specs
-        let lower = package.to_lowercase();
-        if lower.contains("javascript:") || lower.contains("|") || lower.contains(';') {
+        // The spec is handed to `git` as an argv array, so shell metacharacters
+        // (`|`, `;`, `javascript:`) are inert here — the old blacklist only gave
+        // the impression of safety. Path safety belongs in `parse_github_spec` /
+        // `install_skill_spec`, which also covers the non-tool call sites
+        // (dscode-server / dscode-web). Keep just a shape check.
+        if package.chars().any(|c| c.is_control()) {
             return Err(ToolError::InvalidParameter {
                 name: "package".into(),
-                reason: "非法 package 字符串".into(),
+                reason: "package 不能包含控制字符".into(),
             });
         }
 
-        let report = SkillLoader::install_from_spec(package).map_err(|e| {
-            ToolError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-        })?;
+        // `install_from_spec` runs `git` synchronously with a bounded wait; keep
+        // it off the async runtime so a slow clone cannot pin a worker thread.
+        let spec = package.to_string();
+        let report = tokio::task::spawn_blocking(move || SkillLoader::install_from_spec(&spec))
+            .await
+            .map_err(|e| ToolError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+            .map_err(|e| ToolError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(ToolResult::ok(format!(
             "{}\n\nInstalled: {:?}\nSkipped: {:?}\nSource: {}\nTarget: {}\n\n\

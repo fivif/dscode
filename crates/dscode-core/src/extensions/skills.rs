@@ -230,17 +230,32 @@ impl SkillLoader {
                                 Some(&idx) => {
                                     // Same skill name from another search root
                                     // (~/.dscode/skills vs ~/.claude/skills, project
-                                    // dirs…). Old logic kept the FIRST root only,
-                                    // which silently disabled a newer/richer copy
-                                    // installed elsewhere. Now we keep the fresher
-                                    // or richer package so the skill is FULLY
-                                    // enabled (scripts & resources all present).
+                                    // dirs…). Contract: "first wins" unless a later
+                                    // root ships a strictly NEWER package.
+                                    //
+                                    // Resource count is only a tiebreak on equal
+                                    // mtimes: preferring "richer" outright let a
+                                    // stale copy with more files silently replace
+                                    // the user's edited package. `>=` likewise made
+                                    // equal-mtime later roots win, contradicting the
+                                    // documented priority.
                                     let existing = &self.skills[idx];
-                                    let fresher =
-                                        skill_freshness(&s) >= skill_freshness(existing);
-                                    let richer =
-                                        s.resources.len() >= existing.resources.len();
-                                    if fresher || richer {
+                                    let new_mtime = skill_freshness(&s);
+                                    let old_mtime = skill_freshness(existing);
+                                    let take = if new_mtime != old_mtime {
+                                        new_mtime > old_mtime
+                                    } else {
+                                        s.resources.len() > existing.resources.len()
+                                    };
+                                    if take {
+                                        tracing::debug!(
+                                            skill = %s.name,
+                                            from = %existing.root.display(),
+                                            to = %s.root.display(),
+                                            new_mtime,
+                                            old_mtime,
+                                            "skills: replaced same-name package from a later root"
+                                        );
                                         self.skills[idx] = s;
                                     }
                                 }
@@ -304,7 +319,7 @@ impl SkillLoader {
         }
 
         // Detect symlink cycles by tracking inode numbers
-        if let Ok(meta) = std::fs::metadata(dir) {
+        if let Ok(_meta) = std::fs::metadata(dir) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -555,6 +570,14 @@ impl SkillLoader {
 
         if let Some(r) = root.map(str::trim).filter(|s| !s.is_empty()) {
             let p = PathBuf::from(r);
+            // A package path from list_skills is absolute and normalized. `..`
+            // would let `<skills>/x/..` resolve back to the search root and
+            // delete the whole tree.
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!("拒绝删除：路径不能包含 `..`\n{r}"));
+            }
             // Prefer logical path under skills root (keeps symlink packages deletable).
             let logical = canonicalize_preserving_symlink_leaf(&p);
             if !path_present(&logical) && !path_present(&p) {
@@ -597,6 +620,13 @@ impl SkillLoader {
         let mut removed = Vec::new();
         let mut errors = Vec::new();
         for dir in targets {
+            // Never delete anything that is not a real skill package. This is
+            // what stops `root` from pointing at a search root (or any other
+            // directory) and wiping the whole tree with remove_dir_all.
+            if let Err(e) = validate_skill_target(&dir, name) {
+                errors.push(e);
+                continue;
+            }
             match remove_skill_path(&dir) {
                 Ok(()) => removed.push(dir.display().to_string()),
                 Err(e) => errors.push(format!("{}: {e}", dir.display())),
@@ -730,10 +760,28 @@ fn push_unique_target(targets: &mut Vec<PathBuf>, path: PathBuf) {
     targets.push(path);
 }
 
+/// True only when `path` is *strictly inside* `root` (at least one component
+/// deeper). Equality is rejected on purpose: a skills search root is never a
+/// deletable package, and `starts_with` used to return true for the root
+/// itself, which let `delete_skill` recursively delete the whole tree.
+///
+/// A path containing `..` is never accepted — `<root>/x/..` resolves back to
+/// the root once the OS walks it, so it must not count as "inside".
+fn is_strictly_under(path: &Path, root: &Path) -> bool {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    path.components().count() > root.components().count() && path.starts_with(root)
+}
+
 /// Whether `path` is inside any known skills search root.
 ///
 /// Checks logical path (symlink leaf preserved) first so packages that are
 /// symlinks *into* external dirs can still be unlinked from the skills tree.
+/// The root itself is never "under" a root — see [`is_strictly_under`].
 fn is_under_any_skills_root(path: &Path, roots: &[PathBuf]) -> bool {
     let logical = canonicalize_preserving_symlink_leaf(path);
     let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -743,17 +791,74 @@ fn is_under_any_skills_root(path: &Path, roots: &[PathBuf]) -> bool {
         let root_raw = root.clone();
         let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         for c in &candidates {
-            if c.starts_with(&root_canon) || c.starts_with(&root_raw) {
+            if is_strictly_under(c, &root_canon) || is_strictly_under(c, &root_raw) {
                 return true;
-            }
-            if let Some(parent) = c.parent() {
-                if parent == root_canon.as_path() || parent == root_raw.as_path() {
-                    return true;
-                }
             }
         }
     }
     false
+}
+
+/// Reject delete targets that are not a real skill package.
+///
+/// A real directory must contain a `SKILL.md` and its frontmatter `name` (or
+/// the directory name) must agree with the requested name; a symlink package
+/// is only unlinked, so a matching link name is enough. This is the second
+/// half of the guard against `delete_skill(root = <search root>)`:
+/// even if a path slips past the location check it cannot be deleted unless it
+/// actually looks like the package the caller asked for.
+fn validate_skill_target(dir: &Path, requested_name: &str) -> Result<(), String> {
+    if !path_present(dir) {
+        // Already gone — nothing to validate, nothing to delete.
+        return Ok(());
+    }
+    let folder = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let requested = requested_name.trim().to_lowercase();
+    let name_matches_folder = !requested.is_empty() && requested == folder;
+
+    if is_symlink(dir) {
+        // A symlink package is only unlinked, never recursed into, so the
+        // package check is unnecessary — but the link name must still line up
+        // so a wrong `root` cannot unlink an arbitrary entry.
+        return if name_matches_folder {
+            Ok(())
+        } else {
+            Err(format!(
+                "拒绝删除 {}：符号链接名 `{folder}` 与请求的 `{requested_name}` 不一致",
+                dir.display()
+            ))
+        };
+    }
+
+    let md = dir.join("SKILL.md");
+    if !md.is_file() {
+        return Err(format!(
+            "拒绝删除 {}：不是 skill 包（目录中没有 SKILL.md）",
+            dir.display()
+        ));
+    }
+    if name_matches_folder {
+        return Ok(());
+    }
+    let fm_name = std::fs::read_to_string(&md)
+        .ok()
+        .and_then(|c| parse_frontmatter_name(&c))
+        .map(|n| n.trim().to_lowercase());
+    match fm_name {
+        Some(n) if n == requested => Ok(()),
+        Some(n) => Err(format!(
+            "拒绝删除 {}：SKILL.md 的 name `{n}` 与请求的 `{requested_name}` 不一致",
+            dir.display()
+        )),
+        None => Err(format!(
+            "拒绝删除 {}：SKILL.md 缺少 name 字段",
+            dir.display()
+        )),
+    }
 }
 
 /// Recursively find skill packages matching folder name or YAML `name:`.
@@ -818,28 +923,13 @@ fn collect_skill_targets_by_name(
 }
 
 /// Extract `name:` from SKILL.md frontmatter (best-effort).
+///
+/// Delegates to the real parser so it sees the same (BOM-stripped, quote- and
+/// block-scalar-aware) view of the file as [`SkillLoader::parse_file`].
 fn parse_frontmatter_name(content: &str) -> Option<String> {
-    let mut in_fm = false;
-    for line in content.lines() {
-        let t = line.trim();
-        if t == "---" {
-            if in_fm {
-                break;
-            }
-            in_fm = true;
-            continue;
-        }
-        if !in_fm {
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("name:") {
-            let v = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
+    parse_yaml_frontmatter(content)
+        .ok()
+        .and_then(|(fm, _)| get_field(&fm, "name"))
 }
 
 /// Delete a skill package path: unlink symlink packages; otherwise robust tree delete.
@@ -864,8 +954,14 @@ fn remove_dir_all_robust(dir: &Path) -> Result<(), String> {
         std::fs::remove_file(dir).map_err(|e| e.to_string())?;
         return Ok(());
     }
-    if !dir.join("SKILL.md").exists() {
-        tracing::warn!(path = %dir.display(), "delete path has no SKILL.md");
+    if !dir.join("SKILL.md").is_file() {
+        // Hard error, not a warning: this function only ever deletes skill
+        // packages, and the warn-and-continue version is what turned a bad
+        // `root` argument into "recursively delete the skills tree".
+        return Err(format!(
+            "拒绝删除 {}：目标不是 skill 包（缺少 SKILL.md）",
+            dir.display()
+        ));
     }
 
     let mut last_err = String::new();
@@ -966,65 +1062,167 @@ fn clear_readonly(path: &Path) {
     }
 }
 
-/// Parse simple YAML-like frontmatter: `key: value` pairs between `---` delimiters.
+/// Parse simple YAML-like frontmatter: `key: value` pairs between `---` lines.
+///
+/// Supports: plain scalars, single/double quoted scalars, `|` / `>` block
+/// scalars, and `- item` sequences (joined with `, ` so the existing
+/// comma-splitting consumers keep working).
 fn parse_yaml_frontmatter(content: &str) -> Result<(HashMap<String, String>, String), String> {
-    if !content.starts_with("---") {
+    // A UTF-8 BOM (Windows editors add one) made `starts_with("---")` fail and
+    // silently dropped the whole frontmatter — the skill loaded "dead".
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let Some(after_open) = content.strip_prefix("---") else {
+        return Ok((HashMap::new(), content.to_string()));
+    };
+    // The opening `---` must be a line of its own, not e.g. `--- foo`.
+    let (open_rest, rest) = match after_open.find('\n') {
+        Some(i) => (&after_open[..i], &after_open[i + 1..]),
+        None => (after_open, ""),
+    };
+    if !open_rest.trim().is_empty() {
         return Ok((HashMap::new(), content.to_string()));
     }
-    let rest = &content[3..];
-    let end = rest.find("---").ok_or("Unclosed frontmatter")?;
-    let fm_text = &rest[..end];
-    let body = rest[end + 3..].trim().to_string();
 
-    let mut map = HashMap::new();
-    let mut current_key = String::new();
-    let mut current_value = String::new();
-    let mut in_multiline = false;
-
-    for line in fm_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-
-        // If we see a new key: value pattern (not indented), exit multi-line mode
-        // E5: key pattern: ^[a-zA-Z_][a-zA-Z0-9_]*: with optional value
-        let is_new_key = is_key_value_line(trimmed);
-
-        if in_multiline && is_new_key {
-            // Save the accumulated multi-line value and start a new key
-            if !current_key.is_empty() {
-                map.insert(current_key.clone(), current_value.trim().to_string());
+    // The terminator must be a `---` on its own line. `find("---")` matched
+    // anywhere, so `description: a---b` truncated the frontmatter mid-value and
+    // dropped every following field (name/triggers), and a saved skill could
+    // not be reloaded.
+    let (fm_end, body_start) = {
+        let mut offset = 0usize;
+        let mut found = None;
+        for line in rest.split_inclusive('\n') {
+            if line.trim_end_matches(|c| c == '\r' || c == '\n').trim() == "---" {
+                found = Some((offset, offset + line.len()));
+                break;
             }
-            in_multiline = false;
-            current_key.clear();
-            current_value.clear();
+            offset += line.len();
+        }
+        found.ok_or("Unclosed frontmatter")?
+    };
+    let fm_text = &rest[..fm_end];
+    let body = rest[body_start..].trim().to_string();
+
+    let raw_lines: Vec<&str> = fm_text.lines().collect();
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut i = 0usize;
+    while i < raw_lines.len() {
+        let raw = raw_lines[i];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !is_key_value_line(trimmed) {
+            i += 1;
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        let Some(pos) = trimmed.find(':') else {
+            i += 1;
+            continue;
+        };
+        let key = trimmed[..pos].trim().to_string();
+        let val = trimmed[pos + 1..].trim().to_string();
+
+        // Block scalar: `description: |` / `>` (with optional chomping `-`/`+`).
+        let indicator = val.trim_end_matches(|c| c == '-' || c == '+');
+        if indicator == "|" || indicator == ">" {
+            let folded = indicator == ">";
+            let mut block: Vec<String> = Vec::new();
+            let mut block_indent: Option<usize> = None;
+            let mut j = i + 1;
+            while j < raw_lines.len() {
+                let l = raw_lines[j];
+                if l.trim().is_empty() {
+                    block.push(String::new());
+                    j += 1;
+                    continue;
+                }
+                let li = l.len() - l.trim_start().len();
+                if li <= indent {
+                    break;
+                }
+                let bi = *block_indent.get_or_insert(li);
+                let cut = if li >= bi { bi } else { li };
+                block.push(l[cut..].to_string());
+                j += 1;
+            }
+            while block.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                block.pop();
+            }
+            let mut text = if folded {
+                let mut t = String::new();
+                let mut prev_blank = true;
+                for l in &block {
+                    if l.trim().is_empty() {
+                        t.push('\n');
+                        prev_blank = true;
+                    } else {
+                        if !prev_blank && !t.is_empty() {
+                            t.push(' ');
+                        }
+                        t.push_str(l);
+                        prev_blank = false;
+                    }
+                }
+                t
+            } else {
+                block.join("\n")
+            };
+            if !val.ends_with('-') {
+                // `|-` strips the trailing newline; `|` and `|+` keep one.
+                text.push('\n');
+            }
+            map.insert(key, text);
+            i = j;
+            continue;
         }
 
-        if !in_multiline {
-            if let Some(pos) = trimmed.find(':') {
-                // Save previous key if any
-                if !current_key.is_empty() {
-                    map.insert(current_key.clone(), current_value.trim().to_string());
+        if val.is_empty() {
+            // Sequence under this key: `- item` lines (YAML allows them at the
+            // same indentation as the key). Joined with ", " so the existing
+            // `split(',')` consumers see real entries instead of one garbage
+            // string like "- do_file_read\n- do_bash".
+            let mut items: Vec<String> = Vec::new();
+            let mut j = i + 1;
+            while j < raw_lines.len() {
+                let l = raw_lines[j];
+                if l.trim().is_empty() {
+                    j += 1;
+                    continue;
                 }
-                current_key = trimmed[..pos].trim().to_string();
-                let val = trimmed[pos + 1..].trim().to_string();
-                if val.is_empty() {
-                    in_multiline = true;
-                    current_value = String::new();
-                } else {
-                    current_value = val;
-                    map.insert(current_key.clone(), current_value.clone());
-                    current_key.clear();
-                    current_value.clear();
+                let li = l.len() - l.trim_start().len();
+                let lt = l.trim();
+                if li >= indent {
+                    if let Some(item) = lt.strip_prefix("- ") {
+                        items.push(
+                            item.trim()
+                                .trim_matches('"')
+                                .trim_matches('\'')
+                                .to_string(),
+                        );
+                        j += 1;
+                        continue;
+                    }
+                    if !items.is_empty() && li > indent {
+                        if let Some(last) = items.last_mut() {
+                            last.push(' ');
+                            last.push_str(lt);
+                        }
+                        j += 1;
+                        continue;
+                    }
                 }
+                break;
             }
-        } else {
-            // Multi-line value: continue accumulating
-            if !current_value.is_empty() { current_value.push('\n'); }
-            current_value.push_str(trimmed);
+            if !items.is_empty() {
+                map.insert(key, items.join(", "));
+                i = j;
+            } else {
+                map.insert(key, String::new());
+                i += 1;
+            }
+            continue;
         }
-    }
-    if !current_key.is_empty() {
-        map.insert(current_key, current_value.trim().to_string());
+
+        map.insert(key, val);
+        i += 1;
     }
 
     Ok((map, body))
@@ -1054,6 +1252,11 @@ fn is_key_value_line(line: &str) -> bool {
 }
 
 /// Sanitize skill directory / name: lowercase kebab-case.
+///
+/// Unicode letters and digits are kept (`代码审查` is a perfectly good skill
+/// name — the old ASCII-only map turned it into `------`, filtered every empty
+/// segment and errored out, so Chinese-speaking users could not create a skill
+/// at all). Only separators and everything else collapse to `-`.
 fn sanitize_skill_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -1064,13 +1267,12 @@ fn sanitize_skill_name(name: &str) -> Result<String, String> {
     }
     let cleaned: String = name
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c.to_ascii_lowercase()
-            } else if c.is_whitespace() {
-                '-'
+        .flat_map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c.to_lowercase().collect::<Vec<char>>()
             } else {
-                '-'
+                // whitespace and every other separator/punctuation
+                vec!['-']
             }
         })
         .collect();
@@ -1082,8 +1284,10 @@ fn sanitize_skill_name(name: &str) -> Result<String, String> {
     if cleaned.is_empty() {
         return Err("Skill 名称无效".into());
     }
-    if cleaned.len() > 64 {
-        return Err("Skill 名称过长（最多 64）".into());
+    // Count chars, not bytes: 64 CJK characters is a sane name, but 64 *bytes*
+    // is only ~21 of them.
+    if cleaned.chars().count() > 64 {
+        return Err("Skill 名称过长（最多 64 个字符）".into());
     }
     Ok(cleaned)
 }
@@ -1122,6 +1326,7 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
     }
 
     let (owner, repo, subpath) = parse_github_spec(spec)?;
+    let source_desc = format!("github.com/{owner}/{repo}");
     let target_root = SkillLoader::default_skills_dir();
     std::fs::create_dir_all(&target_root)
         .map_err(|e| format!("Cannot create {:?}: {e}", target_root))?;
@@ -1133,49 +1338,63 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
     ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("temp dir: {e}"))?;
+    // Removes the temp clone on every exit path, including `?` — the old code
+    // leaked %TEMP%/dscode-skill-install-* whenever copy_dir_recursive failed.
+    let _tmp_guard = TempDirGuard(tmp.clone());
 
     let url = format!("https://github.com/{owner}/{repo}.git");
+    let repo_dir = tmp.join("repo");
     // Shallow clone only — we never execute remote scripts during install.
-    let mut git = std::process::Command::new("git");
-    git.args([
-        "clone",
-        "--depth",
-        "1",
-        "--quiet",
-        &url,
-        tmp.join("repo").to_str().unwrap_or("repo"),
-    ]);
-    // Hide the console window when the desktop app runs `git` on Windows.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        git.creation_flags(crate::tools::bash::CREATE_NO_WINDOW);
-    }
-    // Optional proxy for skill downloads
-    if let Ok(cfg) = crate::config::settings::Config::load() {
-        crate::config::settings::apply_proxy_env(&mut git, cfg.proxy_for_skills());
-    }
-    let status = git.status().map_err(|e| {
-        format!("无法运行 git（安装第三方 skill 需要本机有 git）: {e}")
-    })?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
+    let (clone_ok, _clone_out, clone_err) = run_git_bounded(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--quiet",
+            &url,
+            repo_dir.to_str().unwrap_or("repo"),
+        ],
+        None,
+        GIT_CLONE_TIMEOUT_SECS,
+    )?;
+    if !clone_ok {
         return Err(format!(
-            "git clone 失败: {url}\n请检查网络与仓库是否存在，或手动: npx skills add {owner}/{repo}"
+            "git clone 失败: {url}{}\n请检查网络与仓库是否存在，或手动: npx skills add {owner}/{repo}",
+            tail_suffix(&clone_err)
         ));
     }
 
-    let repo_root = tmp.join("repo");
+    let repo_root = repo_dir;
     let search_root = if let Some(ref sub) = subpath {
         let p = repo_root.join(sub);
         if !p.exists() {
-            let _ = std::fs::remove_dir_all(&tmp);
             return Err(format!("仓库内找不到路径: {sub}"));
         }
-        p
+        // Second line of defence behind parse_github_spec's `..` check:
+        // resolve symlinks and require the result to stay inside the clone.
+        let root_canon = std::fs::canonicalize(&repo_root)
+            .map_err(|e| format!("无法解析仓库目录: {e}"))?;
+        let canon = std::fs::canonicalize(&p)
+            .map_err(|e| format!("无法解析路径 {sub}: {e}"))?;
+        if !canon.starts_with(&root_canon) {
+            return Err(format!(
+                "拒绝安装：路径 `{sub}` 逃出了仓库目录（{}）",
+                canon.display()
+            ));
+        }
+        canon
     } else {
-        repo_root.clone()
+        std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone())
     };
+
+    // Remote revision of the clone — the anchor for "is a reinstall actually
+    // newer?". Never compare mtimes: the just-cloned SKILL.md is always
+    // "newer" than the installed copy, which silently destroyed local edits.
+    let src_commit = run_git_bounded(&["rev-parse", "HEAD"], Some(&repo_root), GIT_META_TIMEOUT_SECS)
+        .ok()
+        .filter(|(ok, _, _)| *ok)
+        .map(|(_, out, _)| out.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // Find skill packages: any directory containing SKILL.md
     let mut packages: Vec<PathBuf> = Vec::new();
@@ -1187,7 +1406,6 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
         }
     }
     if packages.is_empty() {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!(
             "在 {owner}/{repo}{} 中未找到 SKILL.md 技能包",
             subpath
@@ -1215,26 +1433,51 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
         };
         let dest = target_root.join(&safe);
         if dest.exists() {
-            // Same-name package already present (maybe installed earlier via
-            // skills.sh into ~/.claude/skills, or an older dscode install).
-            // Old logic skipped silently — a newer copy never took effect.
-            // Overwrite when the incoming SKILL.md is fresher, else skip.
-            let src_newer =
-                file_mtime_secs(&pkg.join("SKILL.md")) > file_mtime_secs(&dest.join("SKILL.md"));
-            if src_newer {
-                let _ = std::fs::remove_dir_all(&dest);
-                copy_dir_recursive(pkg, &dest)?;
-                installed.push(format!("{safe} (已更新)"));
-            } else {
-                skipped.push(format!("{safe} (已存在且未更新，跳过)"));
+            // Same-name package already present. Decide from the recorded
+            // remote revision, never from mtime, and always keep a backup of
+            // whatever was there (the old code removed it outright, so local
+            // edits were gone with no way back).
+            let prev = read_install_marker(&dest);
+            let same_revision = match (&prev, src_commit.as_deref()) {
+                (Some(p), Some(cur)) => p.commit == cur,
+                _ => false,
+            };
+            if same_revision {
+                skipped.push(format!(
+                    "{safe} (远端仍是已安装的版本 {}，未覆盖，保留本地修改)",
+                    short_commit(src_commit.as_deref().unwrap_or(""))
+                ));
+                continue;
             }
+            let backup = backup_skill_dir(&dest, &safe)?;
+            replace_dir(&dest, pkg)?;
+            let note = match (&prev, src_commit.as_deref()) {
+                (Some(p), Some(cur)) => format!(
+                    "已更新 {} → {}",
+                    short_commit(&p.commit),
+                    short_commit(cur)
+                ),
+                (None, Some(cur)) => format!(
+                    "已安装 {}（原本地副本没有安装记录，来源未知）",
+                    short_commit(cur)
+                ),
+                _ => "已覆盖（无法确定远端版本）".to_string(),
+            };
+            if let Some(cur) = src_commit.as_deref() {
+                write_install_marker(&dest, &source_desc, cur)?;
+            }
+            installed.push(format!(
+                "{safe} ({note}；本地旧副本已备份到 {})",
+                backup.display()
+            ));
             continue;
         }
         copy_dir_recursive(pkg, &dest)?;
+        if let Some(cur) = src_commit.as_deref() {
+            write_install_marker(&dest, &source_desc, cur)?;
+        }
         installed.push(safe);
     }
-
-    let _ = std::fs::remove_dir_all(&tmp);
 
     let message = if installed.is_empty() {
         format!(
@@ -1259,13 +1502,205 @@ fn install_skill_spec(spec: &str) -> Result<InstallReport, String> {
         spec: spec.to_string(),
         installed,
         skipped,
-        source_dir: format!("github.com/{owner}/{repo}"),
+        source_dir: source_desc,
         target_dir: target_root.display().to_string(),
         message,
     })
 }
 
+/// Removes a temporary directory on drop (all `?` paths included).
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Timeout for the initial `git clone` (network + npx-free, but proxies vary).
+const GIT_CLONE_TIMEOUT_SECS: u64 = 180;
+/// Timeout for cheap local `git` metadata reads (`rev-parse`).
+const GIT_META_TIMEOUT_SECS: u64 = 30;
+
+/// Marker file recording which remote revision an installed package came from.
+const INSTALL_MARKER: &str = ".dscode-install.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct InstallMarker {
+    source: String,
+    commit: String,
+}
+
+/// Run `git` with a hard timeout, no credential prompt and no stdin.
+///
+/// `Command::status()` had none of these: on a private/deleted repo or a
+/// black-holing proxy git blocks at the credential prompt (it reads `/dev/tty`,
+/// so a null stdin alone does not save you) and, being synchronous inside
+/// `async fn execute`, the ReAct loop hung with no way to cancel.
+fn run_git_bounded(
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout_secs: u64,
+) -> Result<(bool, String, String), String> {
+    let mut git = std::process::Command::new("git");
+    git.args(args);
+    if let Some(dir) = cwd {
+        git.current_dir(dir);
+    }
+    git.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Hide the console window when the desktop app runs `git` on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        git.creation_flags(crate::tools::bash::CREATE_NO_WINDOW);
+    }
+    // Optional proxy for skill downloads
+    if let Ok(cfg) = crate::config::settings::Config::load() {
+        crate::config::settings::apply_proxy_env(&mut git, cfg.proxy_for_skills());
+    }
+    let mut child = git.spawn().map_err(|e| {
+        format!("无法运行 git（安装第三方 skill 需要本机有 git）: {e}")
+    })?;
+    // Drain both pipes on threads so a chatty git can never block on a full
+    // pipe while we poll for exit.
+    let out_handle = child.stdout.take().map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+    });
+    let err_handle = child.stderr.take().map(|mut p| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let tail = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+                    return Err(format!(
+                        "git {} 超时（{timeout_secs}s）{}",
+                        args.first().copied().unwrap_or(""),
+                        tail_suffix(&tail)
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("等待 git 进程失败: {e}"));
+            }
+        }
+    };
+    let stdout = out_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    Ok((status.success(), stdout, stderr))
+}
+
+/// Last ~400 chars of a command's stderr, prefixed for an error message.
+fn tail_suffix(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let tail: String = t.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("\n{tail}")
+}
+
+fn short_commit(c: &str) -> String {
+    c.chars().take(8).collect()
+}
+
+fn read_install_marker(dest: &Path) -> Option<InstallMarker> {
+    let raw = std::fs::read_to_string(dest.join(INSTALL_MARKER)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_install_marker(dest: &Path, source: &str, commit: &str) -> Result<(), String> {
+    let marker = InstallMarker {
+        source: source.to_string(),
+        commit: commit.to_string(),
+    };
+    let raw = serde_json::to_string_pretty(&marker).map_err(|e| e.to_string())?;
+    let path = dest.join(INSTALL_MARKER);
+    std::fs::write(&path, raw).map_err(|e| format!("无法写入安装标记 {:?}: {e}", path))
+}
+
+/// Move an installed package out of the skills tree into `<data>/skill-backups`
+/// before it gets replaced. The backup lives outside every search root so it is
+/// not itself loaded as a skill.
+///
+/// A rename is used when possible: it is atomic, keeps every file (including
+/// symlinks) byte-for-byte, and fails *before* anything is touched when a file
+/// is locked. The copy fallback skips symlinks on purpose — following them
+/// would drag arbitrary host trees into the backup.
+fn backup_skill_dir(dest: &Path, safe_name: &str) -> Result<PathBuf, String> {
+    let base = crate::config::settings::Config::data_dir()
+        .map(|d| d.join("skill-backups"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("dscode-skill-backups"));
+    std::fs::create_dir_all(&base)
+        .map_err(|e| format!("无法创建备份目录 {:?}: {e}", base))?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut backup = base.join(format!("{safe_name}-{stamp}"));
+    let mut n = 1;
+    while path_present(&backup) && n <= 100 {
+        backup = base.join(format!("{safe_name}-{stamp}-{n}"));
+        n += 1;
+    }
+    match std::fs::rename(dest, &backup) {
+        Ok(()) => Ok(backup),
+        Err(rename_err) => {
+            copy_dir_recursive(dest, &backup).map_err(|e| {
+                format!(
+                    "备份 {:?} 失败: {e}（rename 也失败: {rename_err}）——已放弃覆盖",
+                    dest
+                )
+            })?;
+            Ok(backup)
+        }
+    }
+}
+
+/// Delete the old package (already backed up) and copy the new one in.
+///
+/// Removal failure is an error: the old `let _ = remove_dir_all(&dest)`
+/// swallowed it and then merged the new files into the stale tree on Windows
+/// when a file was locked.
+fn replace_dir(dest: &Path, src: &Path) -> Result<(), String> {
+    if path_present(dest) {
+        std::fs::remove_dir_all(dest).map_err(|e| {
+            format!(
+                "无法删除旧版本 {}：{e}（文件可能被占用）。本地旧版本已备份，未覆盖。",
+                dest.display()
+            )
+        })?;
+    }
+    copy_dir_recursive(src, dest)
+}
+
 /// Parse `owner/repo`, `owner/repo/sub/path`, or GitHub URL.
+///
+/// The subpath is validated here (and again by canonical containment after the
+/// clone) because `repo_root.join(sub)` with `sub = "../../../../home/user"`
+/// escapes the temporary clone: an arbitrary host directory that happens to
+/// contain a SKILL.md would be packaged into `~/.dscode/skills`.
 fn parse_github_spec(spec: &str) -> Result<(String, String, Option<String>), String> {
     let s = spec
         .trim()
@@ -1287,8 +1722,20 @@ fn parse_github_spec(spec: &str) -> Result<(String, String, Option<String>), Str
     if owner.contains("..") || repo.contains("..") {
         return Err("非法仓库名".into());
     }
+    if owner.contains('\\') || repo.contains('\\') || owner.contains(':') || repo.contains(':') {
+        return Err("非法仓库名".into());
+    }
     let sub = if parts.len() > 2 {
-        Some(parts[2..].join("/"))
+        let joined = parts[2..].join("/");
+        for comp in joined.split('/') {
+            if comp == ".." {
+                return Err(format!("非法路径（不允许 `..`）: {joined}"));
+            }
+            if comp.contains('\\') || comp.contains(':') {
+                return Err(format!("非法路径: {joined}"));
+            }
+        }
+        Some(joined)
     } else {
         None
     };
@@ -1309,7 +1756,17 @@ fn find_skill_packages(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // symlink_metadata, never `path.is_dir()`: a cloned repo can contain
+        // `evil -> /home/user/some-dir`, and following it would package an
+        // arbitrary host directory into the skills tree.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            tracing::warn!(path = %path.display(), "skip symlink while scanning for skill packages");
+            continue;
+        }
+        if meta.file_type().is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') || name == "node_modules" || name == "target" {
                 continue;
@@ -1320,13 +1777,32 @@ fn find_skill_packages(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    // Refuse a symlinked package root outright — read_dir() would follow it.
+    if is_symlink(src) {
+        return Err(format!(
+            "拒绝复制符号链接 {}：技能包不能是符号链接",
+            src.display()
+        ));
+    }
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {:?}: {e}", dst))?;
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {:?}: {e}", src))?;
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().ok_or("bad name")?;
         let target = dst.join(name);
-        if path.is_dir() {
+        // Copy regular files/dirs only. `path.is_dir()` / `is_file()` follow
+        // symlinks, which let a malicious repo plant
+        // `scripts/keys -> /home/user/.ssh` and have the private keys copied
+        // into ~/.dscode/skills/<name>/scripts/.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => return Err(format!("stat {:?}: {e}", path)),
+        };
+        if meta.file_type().is_symlink() {
+            tracing::warn!(path = %path.display(), "skip symlink in skill package copy");
+            continue;
+        }
+        if meta.file_type().is_dir() {
             copy_dir_recursive(&path, &target)?;
         } else {
             std::fs::copy(&path, &target)
@@ -1370,7 +1846,10 @@ fn scan_skill_resources(root: &Path) -> Vec<SkillResource> {
         ("assets", SkillResourceKind::Asset),
     ] {
         let base = root.join(subdir);
-        if !base.is_dir() {
+        // symlink_metadata: never walk *through* a symlinked scripts/ dir —
+        // `scripts -> /home/user/.ssh` would otherwise put the user's private
+        // keys (with absolute paths) into the system prompt.
+        if !is_real_dir(&base) {
             continue;
         }
         walk_resources(&base, root, kind, &mut out, 0);
@@ -1379,7 +1858,10 @@ fn scan_skill_resources(root: &Path) -> Vec<SkillResource> {
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
                 continue;
             }
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1393,6 +1875,13 @@ fn scan_skill_resources(root: &Path) -> Vec<SkillResource> {
     }
     out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     out
+}
+
+/// True only for a real directory entry (symlinks to directories excluded).
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 fn walk_resources(
@@ -1410,9 +1899,16 @@ fn walk_resources(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            tracing::warn!(path = %path.display(), "skip symlink in skill resource scan");
+            continue;
+        }
+        if meta.file_type().is_dir() {
             walk_resources(&path, root, kind, out, depth + 1);
-        } else if path.is_file() {
+        } else if meta.file_type().is_file() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.') {
                 continue;
@@ -1428,7 +1924,7 @@ fn push_resource(path: &Path, root: &Path, kind: SkillResourceKind, out: &mut Ve
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| path.display().to_string());
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let mut executable = looks_like_script(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    let executable = looks_like_script(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1475,18 +1971,47 @@ fn get_field(fm: &HashMap<String, String>, key: &str) -> Option<String> {
 }
 
 /// Strip surrounding quotes and unescape simple YAML double-quoted scalars.
+///
+/// Must be the exact inverse of [`yaml_quote`]. The previous implementation
+/// ran `.replace("\\n", "\n")` *before* `.replace("\\\\", "\\")` as a chained
+/// pass, so a Windows path written as `"C:\\new\\bin"` came back as
+/// `C:<newline>ew<newline>bin`. Scanning escapes left-to-right in one pass is
+/// order-correct by construction.
 fn unquote_yaml(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        let inner = &s[1..s.len() - 1];
-        return inner
-            .replace("\\\"", "\"")
-            .replace("\\n", "\n")
-            .replace("\\\\", "\\");
+    // Trim only for *detecting* a quoted scalar. `get_field` funnels every
+    // value through here, including block scalars, whose chomped trailing
+    // newline a blanket `trim()` silently ate (`|` must keep one).
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let inner = &t[1..t.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    // Unknown escape — keep it verbatim rather than eating it.
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        }
+        return out;
     }
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        return s[1..s.len() - 1].to_string();
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        return t[1..t.len() - 1].to_string();
     }
+    // Plain scalars are already trimmed by the parser; returning `s` verbatim
+    // keeps a block scalar's trailing newline intact.
     s.to_string()
 }
 
@@ -1637,9 +2162,9 @@ mod tests {
             "---\nname: real-skill\ndescription: t\n---\n\nbody\n",
         )
         .unwrap();
-        let link = skills.join("real-skill");
         #[cfg(unix)]
         {
+            let link = skills.join("real-skill");
             std::os::unix::fs::symlink(&external, &link).unwrap();
             assert!(is_symlink(&link));
             assert!(is_under_any_skills_root(&link, &[skills.clone()]));
@@ -1708,5 +2233,125 @@ mod tests {
         assert!(s.resources.iter().any(|r| r.relative_path.contains("hello.sh")));
         let dir = SkillLoader::default_skills_dir().join(&name);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sanitize_name_allows_unicode() {
+        assert_eq!(sanitize_skill_name("Code Review").unwrap(), "code-review");
+        assert_eq!(sanitize_skill_name("代码审查").unwrap(), "代码审查");
+        assert_eq!(sanitize_skill_name("代码 审查").unwrap(), "代码-审查");
+        assert!(sanitize_skill_name("../x").is_err());
+        assert!(sanitize_skill_name("x/y").is_err());
+    }
+
+    #[test]
+    fn frontmatter_bom_block_scalar_and_dashes_in_value() {
+        let content = "\u{feff}---\nname: 代码审查\ndescription: a---b\ntriggers:\n- 代码审查\n- code review\nallowed-tools:\n- do_file_read\n- do_bash\nbody-note: |\n  first line\n  second line\n---\n\nbody text\n";
+        let (fm, body) = parse_yaml_frontmatter(content).unwrap();
+        assert_eq!(get_field(&fm, "name").as_deref(), Some("代码审查"));
+        // `---` inside a value must not terminate the frontmatter
+        assert_eq!(get_field(&fm, "description").as_deref(), Some("a---b"));
+        assert_eq!(
+            get_field(&fm, "triggers").as_deref(),
+            Some("代码审查, code review")
+        );
+        assert_eq!(
+            get_field(&fm, "allowed-tools").as_deref(),
+            Some("do_file_read, do_bash")
+        );
+        assert_eq!(
+            get_field(&fm, "body-note").as_deref(),
+            Some("first line\nsecond line\n")
+        );
+        assert_eq!(body, "body text");
+    }
+
+    #[test]
+    fn yaml_quote_unquote_roundtrip() {
+        for s in [
+            r"Run scripts in C:\new\bin",
+            "line1\nline2",
+            r#"quote " and backslash \"#,
+            r"regex: ^a\\d+$",
+        ] {
+            assert_eq!(unquote_yaml(&yaml_quote(s)), s, "roundtrip failed for {s:?}");
+        }
+    }
+
+    #[test]
+    fn delete_guard_rejects_search_root() {
+        let tmp = env::temp_dir().join(format!("dscode-del-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let skills = tmp.join("skills");
+        let pkg = skills.join("good");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("SKILL.md"),
+            "---\nname: good\ndescription: t\n---\n\nbody\n",
+        )
+        .unwrap();
+
+        // The root itself is never "under" itself, so it can never be a target.
+        assert!(!is_under_any_skills_root(&skills, &[skills.clone()]));
+        assert!(is_under_any_skills_root(&pkg, &[skills.clone()]));
+        // `<root>/x/..` resolves back to the root — must not count as inside.
+        assert!(!is_strictly_under(
+            Path::new("/a/skills/x/.."),
+            Path::new("/a/skills")
+        ));
+        // A directory without SKILL.md is not deletable, whatever the caller says.
+        assert!(validate_skill_target(&skills, "good").is_err());
+        assert!(validate_skill_target(&pkg, "something-else").is_err());
+        assert!(validate_skill_target(&pkg, "good").is_ok());
+        assert!(remove_dir_all_robust(&skills).is_err());
+        assert!(skills.exists(), "non-skill dir must not be removed");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_github_spec_rejects_escaping_subpath() {
+        assert!(parse_github_spec("owner/repo").is_ok());
+        assert!(parse_github_spec("owner/repo/skill-name").is_ok());
+        assert!(parse_github_spec("owner/repo/../../../../home/user").is_err());
+        assert!(parse_github_spec("owner/repo/a/../b").is_err());
+        assert!(parse_github_spec("owner/repo/..\\..\\windows").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_and_scan_skip_symlinks() {
+        let tmp = env::temp_dir().join(format!("dscode-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(src.join("scripts")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("id_rsa"), "PRIVATE KEY\n").unwrap();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: evil\ndescription: t\n---\n\nbody\n",
+        )
+        .unwrap();
+        // Directory symlink and file symlink pointing outside the package.
+        std::os::unix::fs::symlink(&outside, src.join("scripts").join("keys")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("id_rsa"),
+            src.join("scripts").join("leak.sh"),
+        )
+        .unwrap();
+
+        let resources = scan_skill_resources(&src);
+        assert!(
+            resources.iter().all(|r| !r.relative_path.contains("keys")
+                && !r.relative_path.contains("leak.sh")),
+            "symlinks must not be listed as resources: {resources:?}"
+        );
+
+        let dst = tmp.join("dst");
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert!(!path_present(&dst.join("scripts").join("keys")));
+        assert!(!path_present(&dst.join("scripts").join("leak.sh")));
+        assert!(!dst.join("scripts").join("id_rsa").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

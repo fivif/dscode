@@ -2,281 +2,424 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ============================================================================
+   DS Code — design system
+   ----------------------------------------------------------------------------
+   Tokens live in tailwind.config.js. This file holds only what tokens cannot
+   express: the app ground, the type ramp for markdown, and the few multi-layer
+   surfaces (glass, bubbles) that need several properties at once.
+
+   Rules for anything added here:
+     · colours come from a token, never a raw hex or `gray-*`
+     · elevation = surface + hairline + diffuse shadow, never a visible box
+     · motion is state feedback (hover/selection), never decoration
+============================================================================ */
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body, #root { height: 100%; width: 100%; overflow: hidden; }
 
-/* iOS 26 Liquid-Glass dark backdrop */
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text',
-    'Segoe UI', Roboto, sans-serif;
-  color: #e5e7eb;
-  background: #0b0c10;
+  font-family: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont,
+    'SF Pro Text', Roboto, system-ui, sans-serif;
+  color: theme('colors.primary');
+  background: theme('colors.main');
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv11', 'ss01'; /* Segoe UI Variable: single-storey a, cleaner l */
 }
 
-/* Ambient app background: deep gradient + soft aurora glows */
-.ios-app-bg {
+/* ── App ground ──────────────────────────────────────────────────────────────
+   dsh uses a flat ground with no ambient gradient at all — the separation
+   between planes comes entirely from the elevation hairline. We keep one very
+   low pool of accent light in the top-left corner so a full-black canvas does
+   not read as a dead panel, but it is a third of the old strength so the
+   palette reads as neutral rather than tinted. */
+.app-ground {
   background:
-    radial-gradient(1200px 700px at 15% -10%, rgba(99, 102, 241, 0.14), transparent 60%),
-    radial-gradient(1000px 600px at 110% 15%, rgba(56, 189, 248, 0.10), transparent 55%),
-    radial-gradient(900px 700px at 50% 120%, rgba(168, 85, 247, 0.10), transparent 60%),
-    linear-gradient(180deg, #101218 0%, #0b0d12 100%);
+    radial-gradient(1200px 700px at 8% -14%, rgba(103, 158, 254, 0.030), transparent 60%),
+    theme('colors.main');
 }
 
-::selection { background: rgba(129, 140, 248, 0.35); }
+::selection { background: rgba(103, 158, 254, 0.30); }
 
-::-webkit-scrollbar { width: 6px; height: 6px; }
+/* Scrollbars: present when needed, invisible otherwise. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.12);
   border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.22); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
 
 @layer components {
-  .sidebar-item { @apply px-3 py-1.5 mx-1 rounded cursor-pointer text-xs text-gray-400 hover:bg-white/[0.06] hover:text-gray-200 transition-colors truncate; }
-  .sidebar-item.active { @apply bg-white/[0.08] text-gray-100; }
-  .group-header { @apply px-3 py-1.5 text-xs text-gray-500 select-none bg-transparent border-none; }
-  .btn { @apply px-3 py-1.5 rounded text-sm font-medium transition-colors; }
-  .btn-primary { @apply bg-gray-600 text-white hover:bg-gray-500; }
-  .btn-ghost { @apply text-gray-400 hover:text-gray-200 hover:bg-white/[0.06]; }
-  .card { @apply bg-white/[0.04] border border-white/[0.08] rounded-lg p-3 my-2; }
-  .input { @apply w-full bg-white/[0.05] border border-white/[0.1] rounded-lg px-4 py-3 text-sm text-gray-100 placeholder-gray-500 resize-none focus:outline-none focus:border-indigo-400/50; }
+  /* ── Controls ── */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-control
+           text-[13px] font-medium transition-colors duration-150;
+  }
+  .btn-primary { @apply bg-accent text-main hover:bg-accent-hover; }
+  .btn-secondary { @apply bg-card text-primary hover:bg-hover; }
+  .btn-ghost { @apply text-secondary hover:text-primary hover:bg-hover; }
+  .btn-danger { @apply text-danger hover:bg-danger/10; }
 
-  /* User bubble — frosted glass */
-  .user-bubble {
-    @apply bg-white/[0.07] border border-white/[0.1] rounded-2xl;
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.08),
-      0 4px 20px rgba(0, 0, 0, 0.25),
-      0 1px 3px rgba(0, 0, 0, 0.3);
-    backdrop-filter: blur(18px) saturate(160%);
-    -webkit-backdrop-filter: blur(18px) saturate(160%);
+  /* Consistent focus ring for keyboard users on every interactive element. */
+  .btn:focus-visible,
+  .focus-ring:focus-visible {
+    @apply outline-none ring-2 ring-accent/60 ring-offset-2 ring-offset-main;
+  }
+
+  /* ── Surfaces ──
+     Elevated surfaces carry NO border: the hairline stroke is the first layer
+     of the shadow (see tailwind.config.js `boxShadow`). Pairing a real border
+     with one of these shadows draws the edge twice and is what made the old
+     chrome look heavy. */
+  .panel { @apply bg-card rounded-card shadow-card border-0; }
+  .field {
+    @apply w-full bg-input rounded-control px-3 py-2 text-[13px] text-primary
+           placeholder-muted resize-none transition-colors duration-150
+           focus:outline-none focus:ring-1 focus:ring-accent/25;
+    border: 1px solid theme('colors.border');
+  }
+  .field:focus { border-color: rgba(103, 158, 254, 0.6); }
+  /* A menu floating over content needs more separation than a resting panel. */
+  .menu { @apply bg-card rounded-card shadow-pop border-0; }
+
+  /* ── Sidebar rows ── */
+  .row {
+    @apply flex items-center gap-2 mx-2 px-2.5 py-[7px] rounded-control
+           text-[13px] text-secondary cursor-pointer select-none
+           transition-colors duration-100 hover:bg-hover hover:text-primary;
+  }
+  /* Selected nav row — the session list and the settings sections both use it.
+     dsh's `panelRow.panelActive`, which is the same shape of thing: a
+     translucent white veil, the primary label, and one weight step. No hue.
+
+     It used to be `bg-accent-soft` plus a 3px `bg-accent` rail on the left. The
+     accent is for *actions* in this app — the primary button, the focus ring,
+     the selected tab underline — and a nav row that is merely "where you are"
+     was the only decoration in the sidebar carrying it, which made a blue row
+     the loudest thing in a column whose job is to be scanned. Dropping the blue
+     also drops the rail: it was added because the tint was only ~15/255 away
+     from the plane and needed a second mark to be findable, whereas this fill
+     is ~32/255 away and bolder text carries the rest. A weight change is also a
+     cue nobody has to be able to see colour to read, which is what the rail was
+     really buying.
+
+     The veil rather than a solid hex because it lands on two different planes —
+     the sidebar here, the settings ground there — and one token reads correctly
+     on both. `relative` went with the rail; it had no other consumer. */
+  .row.active { @apply bg-selected text-primary font-medium; }
+
+  .icon-btn {
+    @apply inline-flex items-center justify-center w-7 h-7 rounded-control shrink-0
+           text-muted transition-colors duration-150 hover:text-primary hover:bg-hover
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50;
   }
 }
 
-/* ============ iOS 26 Markdown ============ */
-.md-body { color: rgba(229, 231, 235, 0.94); }
+/* ── User message bubble ─────────────────────────────────────────────────────
+   Was a frosted glass pane (blur + saturate + a highlight inset). dsh gives the
+   user turn a plain raised fill and no blur at all — cheaper to composite, and
+   it stops the bubble from reading as a different material from the rest of the
+   surface stack.
+
+   `.user-bubble` carries NO radius of its own. The bubble swaps between a
+   tail-less shape and a tailed one depending on whether it is the last of a run
+   (see MessageBubble.tsx), and a radius baked in here would fight the per-corner
+   values the tail needs — which is exactly what happened when this was
+   `@apply rounded-bubble` and the tail had to be faked on top of it. */
+.user-bubble {
+  @apply bg-hover;
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.06);
+}
+
+/* ── Reasoning "still running" sweep ─────────────────────────────────────────
+   From DeepSeek Harness (MIT), ReasoningRow.module.css: a 300px light band
+   crossing the collapsed think row every 2.6s, with the last 10% of the cycle
+   holding still so the loop does not read as a strobe. Painted with a token
+   rather than dsh's `--dsw-alias-bg-base` because the band has to lift
+   whatever it crosses, and the card tone is the plane these rows sit on. */
+.think-sweep {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 300px;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(44, 44, 46, 0.6) 55%,
+    transparent 100%
+  );
+  animation: think-row-sweep 2.6s ease-out infinite;
+}
+
+@keyframes think-row-sweep {
+  0% { left: -300px; }
+  90%, 100% { left: 100%; }
+}
+
+/* ============================================================================
+   Markdown — the type ramp
+
+   These are dsh's numbers, in px: body 14/24, one 16px step between blocks,
+   code 11/16 on the #1B1B1C code-block ground, table cells 10px 16px.
+   Rhythm is the point — every block carries the same 16px step, so a heading,
+   a list and a paragraph cannot drift apart the way per-element margins did.
+
+   Px, deliberately, and NOT a `html { font-size: 14px }`: Tailwind's spacing
+   scale is rem-based, so lowering the root would silently shrink every padding,
+   gap and 28px hit target in the app by 12.5% (`.icon-btn` would become 24.5px)
+   — a global regression in files this ramp does not own. Sizing the ramp itself
+   in px keeps it exact and leaves the rest of the UI alone.
+   ============================================================================ */
+.md-body {
+  @apply text-primary;
+  font-size: 14px;
+  line-height: 24px;
+  /* Long inline code and pasted paths have to be able to break: this is what
+     lets the inline-flex code chip shrink inside a narrow bubble. */
+  overflow-wrap: anywhere;
+}
+
+/* No leading margin on the first block, no trailing one on the last: the
+   bubble's own padding owns the edges. */
+.md-body > :first-child { margin-top: 0; }
+.md-body > :last-child { margin-bottom: 0; }
 
 .md-h1 {
-  font-size: 1.5rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  color: #f3f4f6;
-  margin: 0.25rem 0 0.9rem;
-  padding-bottom: 0.55rem;
-  line-height: 1.25;
-  background: linear-gradient(180deg, #ffffff 0%, #c7cbd4 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  position: relative;
+  @apply font-semibold tracking-[-0.02em] text-primary;
+  font-size: 20px;
+  line-height: 28px;
+  margin: 24px 0 12px;
 }
-.md-h1::after {
-  content: '';
-  position: absolute;
-  left: 0; right: 0; bottom: 0;
-  height: 1px;
-  background: linear-gradient(90deg, rgba(255,255,255,0.18), rgba(255,255,255,0.03) 60%, transparent);
-}
-
 .md-h2 {
-  font-size: 1.18rem;
-  font-weight: 650;
-  letter-spacing: -0.015em;
-  color: #f3f4f6;
-  margin: 1.35rem 0 0.6rem;
-  line-height: 1.3;
+  @apply font-semibold tracking-[-0.015em] text-primary;
+  font-size: 17px;
+  line-height: 26px;
+  margin: 24px 0 12px;
+  /* The hairline is part of the block, so the margin stays the rhythm and the
+     padding only separates the rule from the text it underlines. */
+  padding-bottom: 8px;
+  border-bottom: 1px solid theme('colors.divider');
 }
 .md-h3 {
-  font-size: 1.02rem;
-  font-weight: 600;
-  color: #e5e7eb;
-  margin: 1.1rem 0 0.45rem;
-  line-height: 1.35;
+  @apply font-semibold text-primary;
+  font-size: 15px;
+  line-height: 24px;
+  margin: 20px 0 8px;
 }
 .md-h4 {
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: #d1d5db;
-  margin: 0.9rem 0 0.35rem;
-  letter-spacing: 0.01em;
+  @apply font-semibold text-primary;
+  font-size: 14px;
+  line-height: 24px;
+  margin: 16px 0 6px;
 }
 
-.md-p { margin: 0.55rem 0; line-height: 1.75; color: rgba(229, 231, 235, 0.92); }
+.md-p { margin: 16px 0; }
 
-.md-ul { margin: 0.55rem 0; padding-left: 1.2rem; list-style: none; }
-.md-ol { margin: 0.55rem 0; padding-left: 1.3rem; list-style: none; counter-reset: md-ol; }
-.md-li { line-height: 1.7; color: rgba(229, 231, 235, 0.92); margin: 0.22rem 0; padding-left: 0.15rem; }
+.md-ul,
+.md-ol { margin: 16px 0; padding-left: 18px; list-style: none; }
+.md-ol { counter-reset: md-ol; }
+.md-li { line-height: 24px; }
+.md-li:not(:first-child) { margin-top: 6px; }
+
+/* A "loose" markdown list — any item followed by a blank line — wraps each
+   item's text in a <p>, and that paragraph's full 16px margins then stack on top
+   of the 6px item gap, so items sit 0px or 38px apart depending on nothing but a
+   blank line in the model's source. Keeping the outer margin on the item and
+   trimming the inner one makes the 6px rhythm above authoritative for both
+   spellings of the list. `:not(:last-child)` matters as much as the first: on
+   the last item a trailing margin would open a gap before the list's own 16px
+   bottom margin. */
+.md-li > :first-child { margin-top: 0; }
+.md-li > :last-child:not(:only-child) { margin-bottom: 0; }
+.md-li > :first-child:last-child { margin: 0; }
+
+/* A sublist belongs to the item above it, not to the list: at the inherited 16px
+   it reads as a sibling of its own parent. */
+.md-ul .md-ul,
+.md-ul .md-ol,
+.md-ol .md-ul,
+.md-ol .md-ol { margin: 6px 0 0; }
+
+/* Bullet — sat in the 18px gutter, centred on the first line's x-height
+   (line box 24px, so 12px down puts the dot's middle at ~14px). */
 .md-ul > .md-li { position: relative; }
 .md-ul > .md-li::before {
   content: '';
-  position: absolute;
-  left: -1.05rem; top: 0.68em;
-  width: 5px; height: 5px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, #a5b4fc, #67e8f9);
-  box-shadow: 0 0 8px rgba(129, 140, 248, 0.5);
+  @apply absolute w-[4px] h-[4px] rounded-full bg-muted;
+  left: -11px; top: 12px;
 }
+/* Number — right-aligned against the gutter so 9. and 10. share a margin. */
 .md-ol > .md-li { position: relative; }
 .md-ol > .md-li::before {
   counter-increment: md-ol;
-  content: counter(md-ol);
-  position: absolute;
-  left: -1.35rem; top: 0.12em;
-  font-size: 0.7rem;
-  font-weight: 600;
-  color: #8b93a5;
+  content: counter(md-ol) '.';
+  @apply absolute text-[11px] font-medium text-muted;
+  right: calc(100% + 6px); top: 0;
+  line-height: 24px;
   font-variant-numeric: tabular-nums;
 }
 
-.md-em { font-style: italic; color: rgba(203, 213, 225, 0.85); }
+/* Emphasis without a slanted glyph: Segoe UI Variable has no true italic on
+   Windows, so `font-style: italic` only sheared the roman — weight 500 is a
+   real axis on the variable font and separates cleanly from strong's 600. */
+.md-em { font-style: normal; font-weight: 500; }
+
+/* An image is a block, not a word.
+   `inline-flex` on the code chip is the right call for code but wrong for a
+   figure: a baseline-aligned inline image drags the line box's descent under it
+   as extra space, so the picture appears to float above its own paragraph, and
+   two images on one line leave the gap under the shorter one. `block` +
+   `margin: 0 auto` centres it in the column and lets the browser reserve exactly
+   the image's height; `width: auto` is what stops a small image being stretched
+   to the column width by the `max-w-full` above it. */
+.md-body img {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+  width: auto;
+  max-width: 100%;
+}
 
 .md-hr {
-  margin: 1.2rem 0;
+  margin: 24px 0;
   border: 0;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.14), transparent);
+  @apply bg-divider;
 }
 
-/* Inline code — glass pill */
+/* Inline code — a quiet well, not a pill with a glow. 0.875em of the surrounding
+   text, so it also steps down correctly inside a heading. */
 .md-inline-code {
-  font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.78rem;
-  background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  color: #e2e8f0;
-  padding: 0.12rem 0.45rem;
-  border-radius: 7px;
-  word-break: keep-all;
-  white-space: pre-wrap;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
-}
-
-/* Code block — liquid glass panel */
-.md-codeblock {
-  margin: 0.8rem 0;
-  border-radius: 16px;
-  overflow: hidden;
-  background: linear-gradient(180deg, rgba(17, 19, 26, 0.9), rgba(13, 15, 20, 0.94));
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.06),
-    0 8px 30px rgba(0, 0, 0, 0.35);
-  backdrop-filter: blur(20px) saturate(150%);
-  -webkit-backdrop-filter: blur(20px) saturate(150%);
-}
-.md-codeblock-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.45rem 0.9rem;
-  background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-.md-codeblock-lang {
+  @apply font-mono text-primary rounded-[6px];
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
-  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-  font-size: 0.62rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  color: rgba(203, 213, 225, 0.75);
+  font-size: 0.875em;
+  line-height: 20px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 0.5px solid theme('colors.border');
+  padding: 0 5px;
+  overflow-wrap: anywhere;
 }
+
+/* Code block — a real panel: header bar, then the body on dsh's code-block
+   ground (#1B1B1C, the `input` token) with 11/16 monospace inside. */
+.md-codeblock {
+  margin: 16px 0;
+  @apply rounded-card overflow-hidden border-0;
+  background: theme('colors.input');
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.06);
+}
+.md-codeblock-head {
+  @apply flex items-center justify-between pl-3 pr-1 py-1 bg-white/[0.03];
+  border-bottom: 0.5px solid theme('colors.divider');
+}
+.md-codeblock-lang {
+  @apply inline-flex items-center gap-1.5 font-mono text-[11px] font-medium
+         uppercase tracking-[0.1em] text-muted;
+}
+/* The header's terminal dot. Neutral on purpose: success/warning/danger are
+   status colours, and a coloured dot here would read as one. */
 .md-codeblock-dot {
-  width: 6px; height: 6px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, #818cf8, #22d3ee);
-  box-shadow: 0 0 8px rgba(99, 102, 241, 0.6);
+  @apply w-1.5 h-1.5 rounded-full bg-faint shrink-0;
 }
-.md-codeblock-pre {
-  margin: 0;
-  padding: 0.9rem 1rem;
-  overflow-x: auto;
-}
+.md-codeblock-pre { margin: 0; padding: 12px 16px; overflow-x: auto; }
 .md-codeblock-pre code {
-  font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.78rem;
-  line-height: 1.65;
-  color: #d6dae3;
-  display: block;
+  @apply block font-mono text-primary;
+  font-size: 11px;
+  line-height: 16px;
 }
 
-/* Links — refined iOS underline */
+/* Links — no underline at rest (they are not decoration in running text); the
+   dotted underline on hover/focus is the affordance, and the browser's own
+   focus ring is left in place for keyboard users. */
 .md-a {
-  color: #a5b4fc;
-  text-decoration: underline;
-  text-decoration-color: rgba(165, 180, 252, 0.35);
+  @apply text-accent font-medium;
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+.md-a:hover,
+.md-a:focus-visible {
+  @apply text-accent-hover;
+  text-decoration: underline dotted;
   text-underline-offset: 3px;
-  transition: color 0.15s ease, text-decoration-color 0.15s ease;
 }
-.md-a:hover { color: #c7d2fe; text-decoration-color: rgba(199, 210, 254, 0.7); }
 
-/* Tables — glass card */
+/* Tables — hairline rules, tabular figures, and a per-cell cap so one wide
+   column cannot blow the message column out; the wrapper scrolls instead. */
 .md-table-wrap {
-  margin: 0.8rem 0;
+  margin: 16px 0;
   overflow-x: auto;
-  border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.025);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.2);
+  @apply rounded-card border-0;
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.06);
 }
-.md-table { width: 100%; font-size: 0.78rem; border-collapse: collapse; }
-.md-thead { background: rgba(255, 255, 255, 0.04); }
+.md-table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 20px; }
+.md-thead { @apply bg-white/[0.03]; }
 .md-th {
-  padding: 0.55rem 0.85rem;
-  text-align: left;
-  font-weight: 600;
-  color: #e5e7eb;
-  white-space: nowrap;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
-  font-size: 0.74rem;
-  letter-spacing: 0.02em;
+  @apply text-start font-medium text-primary;
+  padding: 10px 16px;
+  border-bottom: 0.5px solid theme('colors.border');
+  max-width: min(30vw, 320px);
+  min-width: 100px;
 }
 .md-td {
-  padding: 0.5rem 0.85rem;
-  color: rgba(203, 213, 225, 0.9);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-  vertical-align: top;
-  line-height: 1.6;
+  @apply text-start align-top text-primary;
+  padding: 10px 16px;
+  border-bottom: 0.5px solid theme('colors.divider');
+  max-width: min(30vw, 320px);
+  min-width: 100px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 .md-tr:last-child .md-td { border-bottom: 0; }
-.md-tr { transition: background 0.12s ease; }
-.md-tr:hover { background: rgba(255, 255, 255, 0.035); }
+.md-tr { transition: background-color 0.15s ease; }
+.md-tr:hover { @apply bg-white/[0.02]; }
 
-/* Blockquote — gradient accent */
+/* Blockquote — a rule and a receding text colour. No gradient, no glow.
+   The rule is `border` (white 12%), deliberately, and NOT the accent: this is a
+   quotation marker, not a state, and the transcript's only blue belongs to
+   links and focus. */
 .md-quote {
-  position: relative;
-  margin: 0.8rem 0;
-  padding: 0.6rem 1rem 0.6rem 1.15rem;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  color: rgba(203, 213, 225, 0.88);
-  line-height: 1.7;
+  margin: 16px 0;
+  padding: 0 0 0 16px;
+  @apply border-l-2 border-border text-secondary;
 }
-.md-quote::before {
-  content: '';
-  position: absolute;
-  left: 0; top: 0.55rem; bottom: 0.55rem;
-  width: 3px;
-  border-radius: 999px;
-  background: linear-gradient(180deg, #818cf8, #22d3ee);
-  box-shadow: 0 0 10px rgba(99, 102, 241, 0.45);
-}
+.md-quote > :first-child { margin-top: 0; }
+.md-quote > :last-child { margin-bottom: 0; }
 
-/* ============ Syntax highlighting (iOS dark, low-saturation) ============ */
-.hljs-comment, .hljs-quote { color: #5b6472; font-style: italic; }
-.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name, .hljs-tag { color: #c4b5fd; }
-.hljs-string, .hljs-title, .hljs-section, .hljs-attribute, .hljs-literal, .hljs-template-tag,
-.hljs-template-variable, .hljs-type, .hljs-addition { color: #7dd3fc; }
-.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-meta, .hljs-selector-id,
-.hljs-selector-class, .hljs-variable, .hljs-attr, .hljs-params { color: #fca5a5; }
-.hljs-function .hljs-title, .hljs-title.function_ { color: #93c5fd; }
-.hljs-class .hljs-title, .hljs-title.class_ { color: #fde68a; }
-.hljs-regexp { color: #f9a8d4; }
+/* ============================================================================
+   Syntax highlighting — four tiers, all of them from the token layer.
+
+   The neutral ramp plus the two accent shades, deliberately: success/warning/
+   danger are status colours and must not turn up as decoration, so a token
+   palette cannot borrow their hues. Comments ride `muted` (a real reading
+   colour) and stay upright — the colour already marks them, so a slant adds
+   nothing but noise.
+   ============================================================================ */
+.hljs-comment, .hljs-quote { color: theme('colors.muted'); }
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name, .hljs-tag,
+.hljs-function .hljs-title, .hljs-title.function_,
+.hljs-class .hljs-title, .hljs-title.class_ { color: theme('colors.accent-hover'); }
+.hljs-string, .hljs-title, .hljs-section, .hljs-attribute, .hljs-literal,
+.hljs-template-tag, .hljs-template-variable, .hljs-type, .hljs-addition,
+.hljs-regexp { color: theme('colors.accent'); }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-meta,
+.hljs-selector-id, .hljs-selector-class, .hljs-variable, .hljs-attr,
+.hljs-params { color: theme('colors.secondary'); }
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: 700; }
+
+/* Respect the OS "reduce motion" setting: keep state changes, drop the travel. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

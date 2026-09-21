@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { sendMessage as tauriSendMessage, abort as tauriAbort, getSession } from '@/lib/tauri';
-import type { Message, StreamEvent, ToolCallRecord, ThinkingBlock, FactRecord, TeamAgent, PlanChoice } from '@/lib/types';
+import type { Message, StreamEvent, ToolCallRecord, ThinkingBlock, FactRecord, TeamAgent, PlanChoice, PermissionRequest } from '@/lib/types';
 import { genId } from '@/lib/types';
 import { useSessionStore } from '@/stores/sessionStore';
 
@@ -203,7 +203,16 @@ function scheduleFlush(set: any, get: any) {
   }
 }
 
-function drainPending() {
+/**
+ * Flush buffered token/tool/team chunks into the message, then drop whatever is
+ * left. The flush is what matters: tokens live only in `_pendingText` until the
+ * next animation frame, so a plain discard (Stop pressed in the same frame as
+ * the last token, or `requestAnimationFrame` suspended while the window is
+ * minimized) threw away the tail of the answer — potentially the whole visible
+ * response. Never drop user-visible text to cancel a pending frame.
+ */
+function drainPending(set: any, get: any) {
+  flushStreamBatch(set, get);
   _flushScheduled = false;
   if (_rafId != null && typeof cancelAnimationFrame === 'function') {
     cancelAnimationFrame(_rafId);
@@ -367,7 +376,11 @@ function upsertTeamAgent(
   const next = [...agents];
   const cur = next[idx];
   if (mode === 'output') {
-    next[idx] = { ...cur, output: cur.output + (patch.output || '') };
+    // Cap like tool results do: an /teams sub-agent can emit megabytes of build
+    // logs, and an uncapped append keeps every byte resident (in the team row,
+    // in the host message and in the session buffer) while copying the whole
+    // accumulated string on every frame.
+    next[idx] = { ...cur, output: ((cur.output || '') + (patch.output || '')).slice(-80_000) };
   } else {
     next[idx] = {
       ...cur,
@@ -464,6 +477,10 @@ export interface ChatStore {
   /** Pending Safe-mode permission prompts */
   pendingPermissions: import('@/lib/types').PermissionRequest[];
   removePermission: (id: string) => void;
+  /** Event bridge reported dropped events (`Lagged`) — stream UI may be incomplete. */
+  bridgeLaggedCount: number | null;
+  markBridgeLagged: (skipped: number) => void;
+  clearBridgeLagged: () => void;
 }
 
 let _streamTimeouts: Record<string, ReturnType<typeof setTimeout>> = {};
@@ -512,6 +529,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
     teamsModeBySession,
     teamAgents: [],
     pendingPermissions: [],
+    bridgeLaggedCount: null,
+    markBridgeLagged(skipped) {
+      set({ bridgeLaggedCount: skipped });
+    },
+    clearBridgeLagged() {
+      set({ bridgeLaggedCount: null });
+    },
     removePermission(id) {
       set((s) => ({
         pendingPermissions: s.pendingPermissions.filter((p) => p.id !== id),
@@ -569,7 +593,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     },
 
     setActiveSession(id) {
-      drainPending();
+      drainPending(set, get);
       const prev = get();
       const map = prev.teamsModeBySession;
       // Persist outgoing session (including in-flight stream) so it keeps running.
@@ -641,9 +665,20 @@ export const useChatStore = create<ChatStore>((set, get) => {
         const session = await getSession(id);
         // Each DB row becomes one renderable item (thinking, text, or tool card).
         // Tool results are attached to their preceding tool_calls message.
+        //
+        // Rust's `Message` has no `id` field and `load_messages` does not select
+        // the DB id column, so these rows arrive WITHOUT an id. `ChatArea` keys
+        // rows by `msg.id` and compares `msg.id === lastId` — undefined ids made
+        // every historical row share one React key and made `isLast` true for
+        // all of them. Synthesize a stable, collision-free id here.
         let prevWithToolCalls: any = null;
         const msgs: any[] = [];
-        for (const m of (session?.messages || [])) {
+        const rows: any[] = session?.messages || [];
+        for (let i = 0; i < rows.length; i++) {
+          const raw = rows[i];
+          const m = raw?.id
+            ? raw
+            : { ...raw, id: `h${i}-${raw?.created_at ?? 0}` };
           if (m.role === 'tool') {
             // Attach tool result to the preceding tool_calls message
             if (prevWithToolCalls?.tool_calls) {
@@ -812,13 +847,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
         return;
       }
 
-      // Team / plan structured events may arrive after text stream pieces.
+      // Team / plan structured events may arrive after text stream pieces, and a
+      // permission request is global (its card is not tied to the live bubble) —
+      // none of them may be dropped just because `_stream` is already null.
       if (
         event.type === 'team_agent_start' ||
         event.type === 'team_agent_output' ||
         event.type === 'team_agent_end' ||
         event.type === 'team_complete' ||
-        event.type === 'plan_question'
+        event.type === 'plan_question' ||
+        event.type === 'permission_request'
       ) {
         // handled below
       } else {
@@ -1052,7 +1090,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
 
         case 'error': {
-          drainPending();
+          drainPending(set, get);
           clearStreamIdleTimeout(sessionId);
           set((s) => {
             const messages = s.messages;
@@ -1158,7 +1196,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     endStream(error, sessionId) {
       const sid = sessionId || get().activeSessionId;
       if (sid) clearStreamIdleTimeout(sid);
-      if (sid && sid === get().activeSessionId) drainPending();
+      if (sid && sid === get().activeSessionId) drainPending(set, get);
       set((s) => {
         const target = sessionId || s.activeSessionId;
         if (!target) {
@@ -1271,6 +1309,28 @@ function applyBackgroundEvent(
   event: StreamEvent,
 ) {
   let touchAfter = false;
+  // A permission request is a *blocking* event: the backend auto-denies it when
+  // `timeout_secs` elapses, so it must be surfaced even when its session is not
+  // on screen. Previously it fell through to `default: return s` here and the
+  // card never rendered.
+  if (event.type === 'permission_request') {
+    const req: PermissionRequest = {
+      id: event.id,
+      tool_call_id: event.tool_call_id,
+      command: event.command,
+      reason: event.reason,
+      timeout_secs: event.timeout_secs || 120,
+      session_id: sessionId,
+    };
+    set((s) => ({
+      pendingPermissions: [...s.pendingPermissions.filter((p) => p.id !== req.id), req],
+    }));
+    // Auto-remove the UI card after the backend's own timeout (already denied by then).
+    setTimeout(() => {
+      get().removePermission(req.id);
+    }, (req.timeout_secs + 2) * 1000);
+    return;
+  }
   set((s) => {
     const buf = { ...(s.sessionBuffers[sessionId] || emptyBuffer()) };
     let st = buf._stream;

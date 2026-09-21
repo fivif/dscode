@@ -5,12 +5,13 @@
 //! event loop that reads user input, spawns Forge tasks, receives
 //! `StreamEvent` values, and renders the UI at each tick.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
-use crossterm::event::{self, Event as CrosstermEvent};
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -20,10 +21,11 @@ use dscode_core::agent::stream::{StreamEvent, ToolStatus, UsageInfo};
 use dscode_core::config::settings::Config;
 use dscode_core::providers::create_provider;
 use dscode_core::providers::trait_def::{Message, MessageContent, Role};
+use dscode_core::safety::{PermissionHub, SafetyGuard};
 use dscode_core::session::manager::{Session, SessionGroups, SessionManager};
 use dscode_core::tools::registry::ToolRegistry;
 
-use crate::events::{key_event_to_action, mouse_event_to_action, Action};
+use crate::events::{key_event_to_action, mouse_event_to_action, Action, KeyContext};
 use crate::ui;
 
 /// A single rendered message in the chat view.
@@ -70,6 +72,16 @@ pub enum ToolCardStatus {
 /// Selectable item index type.
 pub type SelectIndex = Option<usize>;
 
+/// A tool-confirmation request raised by the safety layer that is waiting for
+/// the user to answer y/n.
+#[derive(Debug, Clone)]
+pub struct PendingPermission {
+    /// Request id used to answer the [`PermissionHub`].
+    pub id: String,
+    /// The command that needs confirmation.
+    pub command: String,
+}
+
 /// The complete application state.
 pub struct AppState {
     // ── Session ──
@@ -81,7 +93,12 @@ pub struct AppState {
 
     // ── Chat ──
     pub messages: Vec<UiMessage>,
+    /// Scroll offset measured **from the bottom** of the transcript:
+    /// 0 = pinned to the newest line, N = N lines scrolled up.
     pub chat_scroll_offset: usize,
+    /// Index of the first message produced by the current turn. Everything
+    /// before it has already been persisted.
+    pub turn_start: usize,
 
     // ── Sidebar ──
     pub sidebar_scroll_offset: usize,
@@ -105,6 +122,14 @@ pub struct AppState {
     pub config: Config,
     pub working_dir: PathBuf,
     pub tool_registry: Arc<ToolRegistry>,
+
+    // ── Permissions ──
+    /// Shared permission gate. The Forge emits `PermissionRequest` through the
+    /// stream channel; the user answers it in the input bar with y/n.
+    pub permission_hub: Arc<PermissionHub>,
+    /// Confirmation requests waiting for a y/n answer, in arrival order
+    /// (parallel tool calls can raise more than one).
+    pub pending_permissions: VecDeque<PendingPermission>,
 
     // ── UI flags ──
     pub sidebar_visible: bool,
@@ -134,7 +159,9 @@ impl AppState {
         let handle = task_manager.handle();
         let notify_tx = task_manager.notify_tx();
         let mut tool_registry = ToolRegistry::new();
-        tool_registry.register_default_tools();
+        // Same as the server: `image_enabled = false` means the tool is not
+        // registered, not merely that it refuses to run.
+        tool_registry.register_default_tools_with_image(config.generation.image_enabled);
         tool_registry.register(dscode_core::tools::background::DoBackground::new(handle.clone(), task_manager.live_handle(), notify_tx));
         tool_registry.register(dscode_core::tools::background::DoTaskStatus::new(handle));
         let tool_registry = Arc::new(tool_registry);
@@ -147,6 +174,7 @@ impl AppState {
             new_session_title: String::new(),
             messages: vec![],
             chat_scroll_offset: 0,
+            turn_start: 0,
             sidebar_scroll_offset: 0,
             input_buffer: String::new(),
             input_cursor: 0,
@@ -160,6 +188,8 @@ impl AppState {
             config,
             working_dir,
             tool_registry,
+            permission_hub: PermissionHub::shared(),
+            pending_permissions: VecDeque::new(),
             sidebar_visible: true,
             show_settings: false,
             should_quit: false,
@@ -177,74 +207,62 @@ impl AppState {
     pub fn load_session(&mut self, session_id: &str) {
         match self.session_manager.get_session(session_id) {
             Ok(Some(session)) => {
-                // Convert stored messages to UiMessages for display.
-                self.messages = session
-                    .messages
-                    .iter()
-                    .map(|msg| {
-                        let ts = Utc::now().timestamp(); // messages don't carry individual timestamps
-                        match msg.role {
-                            Role::User => UiMessage::User {
-                                content: msg.content.as_text().unwrap_or("").to_string(),
-                                timestamp: ts,
-                            },
-                            Role::Assistant => {
-                                // Check for reasoning content first
-                                if let Some(ref reasoning) = msg.reasoning_content {
-                                    if !reasoning.is_empty() {
-                                        // We'll just show them as separate entries
-                                        // (thinking is shown in-app as a separate UiMessage type)
-                                    }
-                                }
-                                UiMessage::Assistant {
-                                    content: msg.content.as_text().unwrap_or("").to_string(),
-                                    timestamp: ts,
-                                }
-                            }
-                            Role::Tool => {
-                                // Try to look up the tool name from the registry.
-                                let tool_content = msg.content.as_text().unwrap_or("").to_string();
-                                let (name, description) = msg
-                                    .tool_call_id
-                                    .as_deref()
-                                    .and_then(|_| {
-                                        // Attempt to extract a tool name from the content or
-                                        // from the registry. If the tool_call_id doesn't give us
-                                        // a name match, derive one from the first line of content.
-                                        let first_line = tool_content
-                                            .lines()
-                                            .next()
-                                            .unwrap_or("")
-                                            .trim()
-                                            .to_string();
-                                        Some((String::new(), first_line))
-                                    })
-                                    .unwrap_or_else(|| {
-                                        let first_line = tool_content
-                                            .lines()
-                                            .next()
-                                            .unwrap_or("")
-                                            .trim()
-                                            .to_string();
-                                        (String::new(), first_line)
-                                    });
-                                UiMessage::ToolCard {
-                                    id: msg.tool_call_id.clone().unwrap_or_default(),
-                                    name,
-                                    description,
-                                    result: Some(tool_content),
-                                    status: ToolCardStatus::Success,
+                // Convert stored messages to UiMessages for display. Real
+                // timestamps and reasoning content are preserved so a reopened
+                // session looks like it did when it was live.
+                let mut messages: Vec<UiMessage> = Vec::with_capacity(session.messages.len());
+                let mut thinking_step = 0u32;
+                for msg in &session.messages {
+                    let ts = msg.created_at;
+                    let text = msg.content.as_text().unwrap_or("").to_string();
+                    match msg.role {
+                        Role::User => messages.push(UiMessage::User {
+                            content: text,
+                            timestamp: ts,
+                        }),
+                        Role::Assistant => {
+                            // Reasoning is stored on its own row (empty content);
+                            // render it as a collapsible thinking block.
+                            if let Some(reasoning) = msg
+                                .reasoning_content
+                                .as_deref()
+                                .filter(|r| !r.trim().is_empty())
+                            {
+                                messages.push(UiMessage::Thinking {
+                                    content: reasoning.to_string(),
+                                    step: thinking_step,
                                     collapsed: true,
-                                }
+                                });
+                                thinking_step += 1;
                             }
-                            Role::System => UiMessage::Assistant {
-                                content: format!("[system] {}", msg.content.as_text().unwrap_or("")),
-                                timestamp: ts,
-                            },
+                            if !text.is_empty() {
+                                messages.push(UiMessage::Assistant {
+                                    content: text,
+                                    timestamp: ts,
+                                });
+                            }
                         }
-                    })
-                    .collect();
+                        Role::Tool => {
+                            let description =
+                                text.lines().next().unwrap_or("").trim().to_string();
+                            messages.push(UiMessage::ToolCard {
+                                id: msg.tool_call_id.clone().unwrap_or_default(),
+                                name: msg.name.clone().unwrap_or_default(),
+                                description,
+                                result: Some(text),
+                                status: ToolCardStatus::Success,
+                                collapsed: true,
+                            });
+                        }
+                        Role::System => messages.push(UiMessage::Assistant {
+                            content: format!("[system] {}", text),
+                            timestamp: ts,
+                        }),
+                    }
+                }
+                self.messages = messages;
                 self.active_session = Some(session);
+                // Offset is measured from the bottom, so 0 shows the newest lines.
                 self.chat_scroll_offset = 0;
             }
             Ok(None) => {
@@ -315,6 +333,23 @@ impl AppState {
         self.session_select_index = all.iter().position(|s| s.id == id);
     }
 
+    /// Byte offset of a char index in `input_buffer`, clamped to the end.
+    ///
+    /// `input_cursor` is a **char** index (the renderer and every mutation use
+    /// it that way); `String::insert`/`remove` need a byte index.
+    fn input_byte_offset(&self, char_idx: usize) -> usize {
+        self.input_buffer
+            .char_indices()
+            .nth(char_idx)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.input_buffer.len())
+    }
+
+    /// Number of chars in the input buffer.
+    fn input_char_len(&self) -> usize {
+        self.input_buffer.chars().count()
+    }
+
     /// Submit the current input as a user message and launch the Forge.
     pub fn submit_input(&mut self) {
         let message = std::mem::take(&mut self.input_buffer);
@@ -339,6 +374,10 @@ impl AppState {
 
         let now = Utc::now().timestamp();
 
+        // Everything from here on belongs to this turn — the persistence step on
+        // `Complete` only writes messages at or after this index.
+        self.turn_start = self.messages.len();
+
         // Append user message to UI.
         self.messages.push(UiMessage::User {
             content: message.clone(),
@@ -361,6 +400,7 @@ impl AppState {
 
         self.is_streaming = true;
         self.streaming_accumulator = String::new();
+        // Pin the view to the bottom so the answer is visible as it streams.
         self.chat_scroll_offset = 0;
     }
 
@@ -534,21 +574,30 @@ impl AppState {
                 });
             }
             StreamEvent::PermissionRequest {
+                id,
                 command,
                 reason,
                 timeout_secs,
                 ..
             } => {
+                self.pending_permissions.push_back(PendingPermission {
+                    id,
+                    command: command.clone(),
+                });
                 self.messages.push(UiMessage::Assistant {
                     content: format!(
                         "⚠️ Permission required ({timeout_secs}s):\n`{command}`\n{reason}\n\
-                         (Use desktop GUI to approve, or enable absolute_trust in config.)"
+                         Press y to approve, n to deny (Ctrl+Q to quit)."
                     ),
                     timestamp: Utc::now().timestamp(),
                 });
             }
             StreamEvent::Error { content } => {
                 self.messages.push(UiMessage::Error { content });
+                // The forge emits `Error` on every fatal path and then returns
+                // without a `Complete`; without this the loop would relaunch the
+                // same request forever.
+                self.is_streaming = false;
             }
             StreamEvent::Complete { usage } => {
                 // Finalize the streaming accumulator as a settled assistant message.
@@ -583,8 +632,11 @@ impl AppState {
                         );
                     }
 
-                    // Persist each tool card as a Role::Tool message.
-                    for msg in &self.messages {
+                    // Persist each tool card as a Role::Tool message. Only this
+                    // turn's messages are written — earlier turns were already
+                    // persisted and re-writing them would grow the DB every turn.
+                    let turn_start = self.turn_start.min(self.messages.len());
+                    for msg in &self.messages[turn_start..] {
                         if let UiMessage::ToolCard {
                             id,
                             name,
@@ -621,7 +673,7 @@ impl AppState {
                     }
 
                     // Persist thinking blocks as reasoning content.
-                    for msg in &self.messages {
+                    for msg in &self.messages[turn_start..] {
                         if let UiMessage::Thinking { content, .. } = msg {
                             let _ = self.session_manager.add_message(
                                 session_id,
@@ -667,22 +719,24 @@ impl AppState {
             }
             Action::Backspace => {
                 if self.input_cursor > 0 {
+                    // `input_cursor` is a char index — convert before removing,
+                    // otherwise multi-byte chars (CJK, emoji) panic.
                     self.input_cursor -= 1;
-                    self.input_buffer.remove(self.input_cursor);
+                    let at = self.input_byte_offset(self.input_cursor);
+                    self.input_buffer.remove(at);
                 }
             }
             Action::Delete => {
-                if self.input_cursor < self.input_buffer.len() {
-                    self.input_buffer.remove(self.input_cursor);
+                if self.input_cursor < self.input_char_len() {
+                    let at = self.input_byte_offset(self.input_cursor);
+                    self.input_buffer.remove(at);
                 }
             }
             Action::CursorLeft => {
-                if self.input_cursor > 0 {
-                    self.input_cursor -= 1;
-                }
+                self.input_cursor = self.input_cursor.saturating_sub(1);
             }
             Action::CursorRight => {
-                if self.input_cursor < self.input_buffer.len() {
+                if self.input_cursor < self.input_char_len() {
                     self.input_cursor += 1;
                 }
             }
@@ -690,14 +744,16 @@ impl AppState {
                 self.input_cursor = 0;
             }
             Action::CursorEnd => {
-                self.input_cursor = self.input_buffer.len();
+                self.input_cursor = self.input_char_len();
             }
             Action::InsertChar(c) => {
-                self.input_buffer.insert(self.input_cursor, c);
+                let at = self.input_byte_offset(self.input_cursor);
+                self.input_buffer.insert(at, c);
                 self.input_cursor += 1;
             }
             Action::InsertNewline => {
-                self.input_buffer.insert(self.input_cursor, '\n');
+                let at = self.input_byte_offset(self.input_cursor);
+                self.input_buffer.insert(at, '\n');
                 self.input_cursor += 1;
             }
             Action::SessionUp => {
@@ -740,23 +796,22 @@ impl AppState {
                 self.delete_selected_session();
             }
             Action::ScrollUp => {
-                // Scroll up: decrease offset to show older messages.
-                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(1);
-            }
-            Action::ScrollDown => {
-                // Scroll down: increase offset to show newer messages.
+                // Offset counts lines hidden below the viewport, so scrolling
+                // up means increasing it.
                 self.chat_scroll_offset = self.chat_scroll_offset.saturating_add(1);
             }
-            Action::ScrollPageUp => {
-                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
+            Action::ScrollDown => {
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(1);
             }
-            Action::ScrollPageDown => {
+            Action::ScrollPageUp => {
                 self.chat_scroll_offset = self.chat_scroll_offset.saturating_add(10);
             }
+            Action::ScrollPageDown => {
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(10);
+            }
             Action::ScrollBottom => {
-                // Use usize::MAX as a sentinel — the chat renderer clamps
-                // it to the bottom-most visible position.
-                self.chat_scroll_offset = usize::MAX;
+                // 0 == pinned to the newest line.
+                self.chat_scroll_offset = 0;
             }
             Action::ToggleThinking(idx) => {
                 let mut msg_idx = 0;
@@ -770,6 +825,16 @@ impl AppState {
                         }
                         msg_idx += 1;
                     }
+                }
+            }
+            Action::ToggleLatestThinking => {
+                let count = self
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, UiMessage::Thinking { .. }))
+                    .count();
+                if count > 0 {
+                    self.handle_action(Action::ToggleThinking(count - 1));
                 }
             }
             Action::ToggleToolCard(idx) => {
@@ -786,11 +851,21 @@ impl AppState {
                     }
                 }
             }
+            Action::ToggleLatestToolCard => {
+                let count = self
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, UiMessage::ToolCard { .. }))
+                    .count();
+                if count > 0 {
+                    self.handle_action(Action::ToggleToolCard(count - 1));
+                }
+            }
             Action::HistoryPrevious => {
                 if !self.input_history.is_empty() && self.history_index > 0 {
                     self.history_index -= 1;
                     self.input_buffer = self.input_history[self.history_index].clone();
-                    self.input_cursor = self.input_buffer.len();
+                    self.input_cursor = self.input_char_len();
                 }
             }
             Action::HistoryNext => {
@@ -801,7 +876,7 @@ impl AppState {
                     } else {
                         self.input_buffer.clear();
                     }
-                    self.input_cursor = self.input_buffer.len();
+                    self.input_cursor = self.input_char_len();
                 }
             }
             Action::Noop => {}
@@ -812,7 +887,6 @@ impl AppState {
 /// Shared application handle used by the event loop.
 pub struct App {
     pub state: AppState,
-    pub tool_registry: Arc<ToolRegistry>,
     /// Handle to the currently running forge task, if any.
     pub forge_handle: Option<(String, JoinHandle<()>)>,
     /// Receiver for stream events from the running forge.
@@ -823,16 +897,29 @@ impl App {
     pub fn new() -> Result<Self> {
         let state = AppState::new()?;
 
-        let mut tool_registry = ToolRegistry::new();
-        tool_registry.register_default_tools();
-        let tool_registry = Arc::new(tool_registry);
-
         Ok(Self {
             state,
-            tool_registry,
             forge_handle: None,
             event_rx: None,
         })
+    }
+
+    /// Answer the pending tool-confirmation request and record the decision in
+    /// the transcript. No-op when nothing is pending.
+    pub async fn resolve_pending_permission(&mut self, allow: bool) {
+        let Some(pending) = self.state.pending_permissions.pop_front() else {
+            return;
+        };
+        let result = self.state.permission_hub.resolve(&pending.id, allow).await;
+        let text = match result {
+            Ok(()) if allow => format!("✔ Approved: `{}`", pending.command),
+            Ok(()) => format!("✘ Denied: `{}`", pending.command),
+            Err(e) => format!("⚠️ Could not answer permission request: {e}"),
+        };
+        self.state.messages.push(UiMessage::Assistant {
+            content: text,
+            timestamp: Utc::now().timestamp(),
+        });
     }
 }
 
@@ -864,7 +951,11 @@ pub async fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // Forge completed — finalize.
+                        // Forge finished (normally or with an error) — finalize.
+                        // `is_streaming` must be cleared here: the forge returns
+                        // without emitting `Complete` on every fatal path, and a
+                        // stale `true` would re-issue the same request forever.
+                        app.state.is_streaming = false;
                         app.event_rx = None;
                         app.forge_handle = None;
                         break;
@@ -887,48 +978,86 @@ pub async fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
         // ── Poll for user input ──
         if event::poll(std::time::Duration::from_millis(16))? {
             let ev = event::read()?;
-            match ev {
-                CrosstermEvent::Key(key) => {
-                    let action = key_event_to_action(key);
-                    app.state.handle_action(action);
+
+            // A pending permission prompt owns y/n (and Esc = deny) so the
+            // answer never lands in the input buffer.
+            let mut consumed = false;
+            if !app.state.pending_permissions.is_empty() {
+                if let CrosstermEvent::Key(key) = &ev {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.resolve_pending_permission(true).await;
+                            consumed = true;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.resolve_pending_permission(false).await;
+                            consumed = true;
+                        }
+                        _ => {}
+                    }
                 }
-                CrosstermEvent::Mouse(mouse) => {
-                    let action = mouse_event_to_action(mouse);
-                    app.state.handle_action(action);
-                }
-                CrosstermEvent::Resize(_, _) => {
-                    // Terminal resize — the next render pass will adapt.
-                }
-                _ => {}
             }
+
+            if !consumed {
+                match ev {
+                    CrosstermEvent::Key(key) => {
+                        let ctx = KeyContext {
+                            sidebar_selected: app.state.session_select_index.is_some(),
+                            input_empty: app.state.input_buffer.is_empty(),
+                        };
+                        let action = key_event_to_action(key, ctx);
+                        app.state.handle_action(action);
+                    }
+                    CrosstermEvent::Mouse(mouse) => {
+                        let action = mouse_event_to_action(mouse);
+                        app.state.handle_action(action);
+                    }
+                    CrosstermEvent::Resize(_, _) => {
+                        // Terminal resize — the next render pass will adapt.
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Check exit condition before the launch block ──
+        // Must come first: a failing launch must never trap the user in a loop
+        // where Escape/Ctrl+Q is not consulted.
+        if app.state.should_quit {
+            break;
         }
 
         // ── If Submit action triggered, launch forge ──
         if app.state.is_streaming && app.forge_handle.is_none() {
-            // Set up the forge channel.
-            let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
-            app.event_rx = Some(rx);
+            let (session_id, message, history) = {
+                // submit_input guarantees a session, but never panic the whole
+                // UI if that invariant is ever broken.
+                let Some(session) = app.state.active_session.as_ref() else {
+                    app.state.is_streaming = false;
+                    continue;
+                };
 
-            let session = app.state.active_session.as_ref().unwrap();
-            let session_id = session.id.clone();
+                let message = app
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| match m {
+                        UiMessage::User { content, .. } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+
+                let history = session
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                (session.id.clone(), message, history)
+            };
             let session_id_for_handle = session_id.clone();
-            let message = app
-                .state
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    UiMessage::User { content, .. } => Some(content.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-
-            let history = session
-                .messages
-                .iter()
-                .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-                .cloned()
-                .collect::<Vec<_>>();
 
             let provider = match create_provider(&app.state.model_name, &app.state.config) {
                 Ok(p) => p,
@@ -936,14 +1065,65 @@ pub async fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
                     app.state.messages.push(UiMessage::Error {
                         content: format!("Provider error: {e}"),
                     });
+                    // Stop streaming, otherwise every 16 ms tick appends another
+                    // copy of this error and relaunches nothing.
+                    app.state.is_streaming = false;
+                    app.event_rx = None;
                     continue;
                 }
             };
-            let forge = Arc::new(Forge::new(
-                provider,
-                app.state.tool_registry.clone(),
-                app.state.working_dir.clone(),
-            ));
+
+            // Build the agent the way the desktop/web front-end does
+            // (`dscode-server/src/commands/chat.rs`), so the user's safety
+            // config, global prompt, context config and memory recall all apply.
+            let (system_prompt, context_cfg, safety_guard, perm_timeout, teams_cfg) = {
+                let config = &app.state.config;
+                let mut system_prompt = config
+                    .agent
+                    .resolve_system_prompt(dscode_core::agent::forge::DEFAULT_SYSTEM_PROMPT);
+                if config.agent.memory_enabled {
+                    // Scoped to this conversation — the FTS index is global, so
+                    // an unscoped scribe recalls nothing (see `Scribe::recall`).
+                    if let Ok(scribe) =
+                        dscode_core::memory::scribe::Scribe::for_session(session_id.clone())
+                    {
+                        let hits = scribe.recall(&message, 6);
+                        if !hits.is_empty() {
+                            system_prompt.push_str("\n\n## Memory recall (optional context)\n");
+                            for h in hits {
+                                system_prompt.push_str("- ");
+                                system_prompt.push_str(&h);
+                                system_prompt.push('\n');
+                            }
+                        }
+                    }
+                }
+                (
+                    system_prompt,
+                    config.context.clone(),
+                    Arc::new(SafetyGuard::from_config(config)),
+                    config.safety.permission_timeout_secs.max(10),
+                    config.teams.clone(),
+                )
+            };
+
+            // Set up the forge channel.
+            let (tx, rx) = mpsc::unbounded_channel::<StreamEvent>();
+            app.event_rx = Some(rx);
+
+            let forge = Arc::new(
+                Forge::new(
+                    provider,
+                    app.state.tool_registry.clone(),
+                    app.state.working_dir.clone(),
+                )
+                .with_system_prompt(system_prompt)
+                .with_context_config(context_cfg)
+                .with_safety_guard(safety_guard)
+                .with_permission_hub(app.state.permission_hub.clone())
+                .with_permission_timeout(perm_timeout)
+                .with_teams_config(teams_cfg),
+            );
 
             let handle = tokio::spawn(async move {
                 let _ = forge
@@ -952,11 +1132,6 @@ pub async fn run(app: &mut App, mut terminal: DefaultTerminal) -> Result<()> {
             });
 
             app.forge_handle = Some((session_id_for_handle, handle));
-        }
-
-        // ── Check exit condition ──
-        if app.state.should_quit {
-            break;
         }
     }
 

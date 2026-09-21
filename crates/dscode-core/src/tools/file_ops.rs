@@ -6,13 +6,40 @@
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::tools::trait_def::{Tool, ToolContext, ToolError, ToolResult};
+
+/// Largest file `do_file_read` will materialize in one go (offset/limit windows
+/// are bounded by the same budget).
+const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Path resolution helpers
 // ---------------------------------------------------------------------------
+
+/// Windows reserves a handful of device names in *every* directory: opening
+/// `C:\proj\NUL` succeeds and silently discards the bytes, so `do_file_write`
+/// would answer "Wrote 42 bytes to C:\proj\NUL" for a file that does not exist
+/// and cannot be read back. Reject such names before anything is attempted.
+///
+/// Windows also ignores trailing dots/spaces and resolves `NUL.txt` to the
+/// device, hence the trimming and the stem comparison.
+#[cfg(windows)]
+fn is_reserved_device_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let trimmed = name.trim_end_matches(&[' ', '.'][..]);
+    let stem = trimmed.split('.').next().unwrap_or(trimmed).to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    // COM1..COM9 / LPT1..LPT9 — COM0/LPT0 are not devices.
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
+}
 
 /// Resolve `path` relative to `working_dir` and verify it stays within the
 /// working directory boundary (no path-escape attacks).
@@ -34,6 +61,19 @@ fn resolve_path(path: &str, working_dir: &Path) -> Result<PathBuf, ToolError> {
     let guard = crate::safety::guard::SafetyGuard::new(&[], false);
     match guard.resolve_safe_path(path, working_dir) {
         Ok(p) => {
+            #[cfg(windows)]
+            {
+                if is_reserved_device_name(&p) {
+                    return Err(ToolError::InvalidParameter {
+                        name: "path".into(),
+                        reason: format!(
+                            "'{}' is a reserved Windows device name — writes to it are \
+                             accepted and discarded by the OS, so the file would never exist",
+                            p.display()
+                        ),
+                    });
+                }
+            }
             // Extra: if path exists and is symlink, ensure target still under root
             if p.exists() {
                 if let Ok(canon) = p.canonicalize() {
@@ -55,6 +95,20 @@ fn resolve_path(path: &str, working_dir: &Path) -> Result<PathBuf, ToolError> {
         Err(e) => Err(ToolError::PathEscape(e)),
     }
 }
+
+/// Write `content` to `path` atomically.
+///
+/// `std::fs::write` truncates the target in place: a crash, a full disk, or the
+/// process being killed between truncate and write leaves the file empty or
+/// half-written — the data loss `do_file_edit`'s description promises cannot
+/// happen. Instead write a sibling temp file, flush it to disk, then rename it
+/// over the target. On any failure the original is untouched.
+///
+/// The same primitive backs `Config::save`, which has the identical problem with
+/// a worse blast radius — a truncated config presents as "all my settings reset".
+/// It lives in `config::atomic`; this is a re-export so tool code keeps its
+/// shorter path.
+use crate::config::atomic::write_atomic;
 
 async fn check_write_allowed(ctx: &ToolContext, path_str: &str) -> Result<(), ToolError> {
     let (Some(agent_id), Some(fo)) = (&ctx.team_agent_id, &ctx.file_ownership) else {
@@ -146,7 +200,7 @@ impl Tool for DoFileRead {
         "Read the contents of a file at the given path. \
          Path is resolved relative to the project working directory. \
          Returns the file content as a string. \
-         Supports reading multiple files by passing an array of paths."
+         Use offset/limit to page through a file that is too large to read at once."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -154,6 +208,7 @@ impl Tool for DoFileRead {
             "type": "object",
             "properties": {
                 "path": {
+                    "type": "string",
                     "description": "The path to the file to read, relative to the working directory."
                 },
                 "offset": {
@@ -201,27 +256,95 @@ impl Tool for DoFileRead {
             g.insert(file_path.to_string_lossy().to_string());
         }
 
-        let content = std::fs::read_to_string(&file_path).map_err(|e| {
-            ToolError::Io(e)
-        })?;
-
         // Apply offset/limit for large files
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let limit = args["limit"].as_u64().map(|v| v as usize);
 
         let output = if offset > 0 || limit.is_some() {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = offset.min(lines.len());
-            let end = limit
-                .map(|l| (start + l).min(lines.len()))
-                .unwrap_or(lines.len());
-            lines[start..end].join("\n")
+            read_lines_windowed(&file_path, offset, limit)?
         } else {
-            content
+            // Size guard: `read_to_string` materializes the whole file, and the
+            // offset/limit branch used to build a second Vec of every line on
+            // top of it. Refuse rather than pull a 4 GB log into memory.
+            let size = std::fs::metadata(&file_path).map_err(ToolError::Io)?.len();
+            if size > MAX_READ_BYTES {
+                return Ok(ToolResult::err(
+                    "",
+                    format!(
+                        "File is {size} bytes, over the {MAX_READ_BYTES}-byte read limit. \
+                         Read it in windows with the offset/limit parameters \
+                         (e.g. offset=0, limit=2000)."
+                    ),
+                ));
+            }
+            std::fs::read_to_string(&file_path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    // The bare io error ("stream did not contain valid UTF-8")
+                    // tells the model nothing about what to do next.
+                    ToolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{} is not valid UTF-8 text (binary or UTF-16 file?)",
+                            file_path.display()
+                        ),
+                    ))
+                } else {
+                    ToolError::Io(e)
+                }
+            })?
         };
 
         Ok(ToolResult::ok(output))
     }
+}
+
+/// Read the `limit` lines starting at `offset` without materializing the file.
+///
+/// `BufReader::lines()` only reads as far as it is asked to, so paging into a
+/// multi-GB log stays cheap. The output is still bounded by `MAX_READ_BYTES`
+/// (an `offset` with no `limit` runs to the end of the file).
+fn read_lines_windowed(
+    path: &Path,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<String, ToolError> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).map_err(ToolError::Io)?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut out = String::new();
+    let mut pushed = 0usize;
+    let mut truncated = false;
+    for line in reader.lines().skip(offset).take(limit.unwrap_or(usize::MAX)) {
+        let line = line.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} contains bytes that are not valid UTF-8 \
+                         (binary or UTF-16 file?)",
+                        path.display()
+                    ),
+                ))
+            } else {
+                ToolError::Io(e)
+            }
+        })?;
+        if out.len() + line.len() + 1 > MAX_READ_BYTES as usize {
+            truncated = true;
+            break;
+        }
+        if pushed > 0 {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        pushed += 1;
+    }
+    if truncated {
+        out.push_str("\n[output truncated at 10MB]\n");
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -299,9 +422,7 @@ impl Tool for DoFileWrite {
             })?;
         }
 
-        std::fs::write(&file_path, content).map_err(|e| {
-            ToolError::Io(e)
-        })?;
+        write_atomic(&file_path, content).map_err(ToolError::Io)?;
 
         Ok(ToolResult::ok(format!(
             "Wrote {} bytes to {}",
@@ -446,9 +567,7 @@ impl Tool for DoFileEdit {
             original.replacen(old_string, new_string, 1)
         };
 
-        std::fs::write(&file_path, &modified).map_err(|e| {
-            ToolError::Io(e)
-        })?;
+        write_atomic(&file_path, &modified).map_err(ToolError::Io)?;
 
         let count = if replace_all { occurrences } else { 1 };
         Ok(ToolResult::ok(format!(
@@ -466,6 +585,7 @@ impl Tool for DoFileEdit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     async fn make_ctx(dir: &std::path::Path) -> ToolContext {
@@ -755,5 +875,84 @@ mod tests {
     async fn test_normalize_path() {
         let normalized = normalize_path(Path::new("/foo/bar/../baz/./qux"));
         assert_eq!(normalized, PathBuf::from("/foo/baz/qux"));
+    }
+
+    /// The write must go through a sibling temp file, so no temp may survive a
+    /// successful edit (and the content must still land).
+    #[tokio::test]
+    async fn test_edit_is_atomic_and_leaves_no_temp_files() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("src.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+        let tool = DoFileEdit::new();
+        let ctx = make_ctx(dir.path()).await;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "file_path": "src.txt",
+                    "old_string": "beta",
+                    "new_string": "gamma"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "alpha\ngamma\n");
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "src.txt")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    /// Reserved device names are valid paths on Windows but discard whatever is
+    /// written, so reporting success would be a lie.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_reserved_device_names_are_rejected() {
+        let dir = tempdir().unwrap();
+        let ctx = make_ctx(dir.path()).await;
+
+        for name in ["NUL", "nul", "con", "AUX", "COM1", "lpt9", "NUL.txt", "con."] {
+            let result = DoFileWrite::new()
+                .execute(serde_json::json!({ "path": name, "content": "x" }), &ctx)
+                .await;
+            assert!(
+                matches!(&result, Err(ToolError::InvalidParameter { .. })),
+                "{name} should be rejected, got {result:?}"
+            );
+        }
+
+        // Ordinary names that merely share a prefix are unaffected.
+        for name in ["console.txt", "null.md", "com0.txt"] {
+            let result = DoFileWrite::new()
+                .execute(serde_json::json!({ "path": name, "content": "x" }), &ctx)
+                .await
+                .unwrap();
+            assert!(result.success, "{name} should be writable");
+        }
+    }
+
+    /// `read_lines_windowed` must agree with the old offset/limit math.
+    #[tokio::test]
+    async fn test_read_offset_without_limit_reads_to_eof() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("lines.txt"), "a\nb\nc\nd\n").unwrap();
+
+        let tool = DoFileRead::new();
+        let ctx = make_ctx(dir.path()).await;
+        let result = tool
+            .execute(
+                serde_json::json!({ "path": "lines.txt", "offset": 2 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output, "c\nd");
     }
 }

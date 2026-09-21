@@ -70,6 +70,17 @@ impl std::fmt::Display for PlanPhase {
 /// This struct is the source of truth for the plan engine. It tracks which
 /// phase we are in, how many questions have been asked, how many remain, and
 /// carries the draft PRD once one has been generated.
+///
+/// # Consumers
+///
+/// On the live path ([`super::active::ActivePlanSession`]) only `phase`,
+/// `draft_prd` and `metadata` are read: `questions_asked` is incremented but
+/// never consumed, `questions_remaining` is *not* maintained (the live path
+/// reports remaining questions per turn from
+/// [`super::llm_interview::MAX_QUESTIONS_PER_PHASE`]), and `task_id` is never
+/// set — `plan_id` holds the task uuid instead. They are kept as public API for
+/// external users rather than removed; do not rely on them being accurate when
+/// the plan came from `/plan`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanState {
     /// Current phase of the planning process.

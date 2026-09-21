@@ -4,7 +4,7 @@
 //! output, then assigns a quality score (0-100) and decides whether the MAGI
 //! spiral should stop or continue with a specific focus.
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::providers::trait_def::{
     LlmProvider, Message, MessageContent, Role,
@@ -103,30 +103,75 @@ pub async fn promote(
 /// QUALITY: <number>
 /// FOCUS: <text>
 /// ```
+///
+/// Returns `Err(MagiError::Parse)` when no usable `QUALITY` can be found, so
+/// the caller's retry wrapper treats a refused/garbled evaluation as an
+/// evaluation failure instead of silently counting it as a "continue" vote.
 fn parse_promotion(raw: &str) -> Result<Promotion, MagiError> {
     let raw = raw.trim();
 
-    let mut should_stop = false;
+    let mut stop_opt: Option<bool> = None;
     let mut stop_reason = String::new();
-    let mut quality_score = 0.0f64;
+    let mut quality_opt: Option<f64> = None;
     let mut next_round_focus = String::new();
 
     for line in raw.lines() {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("STOP:").or_else(|| line.strip_prefix("STOP ")) {
-            let value = value.trim().to_lowercase();
-            should_stop = value == "true" || value == "yes";
-        } else if let Some(value) = line.strip_prefix("REASON:").or_else(|| line.strip_prefix("REASON ")) {
-            stop_reason = value.trim().to_string();
-        } else if let Some(value) = line.strip_prefix("QUALITY:").or_else(|| line.strip_prefix("QUALITY ")) {
-            let value = value.trim();
-            quality_score = value
-                .parse::<f64>()
-                .unwrap_or(50.0)
-                .clamp(0.0, 100.0);
-        } else if let Some(value) = line.strip_prefix("FOCUS:").or_else(|| line.strip_prefix("FOCUS ")) {
-            next_round_focus = value.trim().to_string();
+        // Tolerate markdown list bullets / bold keys: "- **STOP:** true".
+        let line = line.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ' || c == '\t');
+        let line = line.strip_prefix("**").unwrap_or(line);
+        // Tolerate a numbered-list prefix: "1. STOP: true".
+        let line = strip_list_number(line);
+
+        // Split into (key, value) on the first ':' (or first whitespace for
+        // the "STOP true" form) and normalise the key of markdown decoration.
+        let (key_raw, value) = match line.find(':') {
+            Some(i) => (&line[..i], line[i + 1..].trim()),
+            None => match line.find(char::is_whitespace) {
+                Some(i) => (&line[..i], line[i..].trim()),
+                None => (line, ""),
+            },
+        };
+        let key = key_raw
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_uppercase();
+
+        match key.as_str() {
+            "STOP" => match first_word(value).as_str() {
+                "true" | "yes" | "done" | "complete" | "completed" => stop_opt = Some(true),
+                "false" | "no" | "continue" | "incomplete" | "pending" => stop_opt = Some(false),
+                other => {
+                    // Never guess toward "done" — an unreadable STOP means continue.
+                    warn!(value = %other, "Melchior: unrecognised STOP value — treating as continue");
+                    stop_opt = Some(false);
+                }
+            },
+            "REASON" => stop_reason = value.trim_matches('*').trim().to_string(),
+            "QUALITY" => quality_opt = parse_leading_int(value),
+            "FOCUS" => next_round_focus = value.trim_matches('*').trim().to_string(),
+            _ => {}
         }
+    }
+
+    // QUALITY is the evidence for the decision; without it there is no verdict.
+    let Some(quality_score) = quality_opt else {
+        return Err(MagiError::parse(format!(
+            "Melchior response has no parseable QUALITY (raw: {})",
+            raw.chars().take(200).collect::<String>()
+        )));
+    };
+    let quality_score = quality_score.clamp(0.0, 100.0);
+
+    // Cross-validate: Melchior's own rules bind 90-100 to STOP=true. A lone
+    // `STOP: true` (or a stop paired with a low score) must not ship work as
+    // complete without quality evidence.
+    let mut should_stop = stop_opt.unwrap_or(false);
+    if should_stop && quality_score < 90.0 {
+        warn!(
+            quality = quality_score,
+            "Melchior: STOP=true contradicts QUALITY < 90 — treating as continue"
+        );
+        should_stop = false;
     }
 
     // Validate that we got the essentials
@@ -160,6 +205,55 @@ fn parse_promotion(raw: &str) -> Result<Promotion, MagiError> {
         stop_reason,
         next_round_focus,
     })
+}
+
+/// Strip a leading numbered-list marker (`"1. "` / `"2) "`) if present.
+fn strip_list_number(line: &str) -> &str {
+    let digits_end = line
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(line.len());
+    if digits_end == 0 || digits_end > 3 {
+        return line;
+    }
+    let rest = line[digits_end..].trim_start();
+    if let Some(r) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')) {
+        r.trim_start()
+    } else {
+        line
+    }
+}
+
+/// First whitespace-delimited token, stripped of surrounding punctuation and
+/// markdown, lowercased. `"**true**."` → `"true"`, `"done (complete)"` → `"done"`.
+fn first_word(s: &str) -> String {
+    s.trim_start_matches(|c: char| !c.is_alphanumeric())
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
+/// Extract a leading integer/float from a value like `88/100`, `85 (good)`,
+/// `**88**`, `-50`, `85%`. Returns `None` when no leading number exists.
+fn parse_leading_int(s: &str) -> Option<f64> {
+    let s = s.trim().trim_start_matches(|c: char| c == '*' || c == '`' || c == ' ');
+    let mut end = 0usize;
+    let mut seen_digit = false;
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_digit() {
+            seen_digit = true;
+            end = i + c.len_utf8();
+        } else if (c == '-' || c == '+') && !seen_digit && i == 0 {
+            continue;
+        } else {
+            break;
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    s[..end].parse::<f64>().ok()
 }
 
 #[cfg(test)]
@@ -257,12 +351,50 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_promotion_defaults() {
-        // Empty or missing fields get defaults
-        let p = parse_promotion("STOP: true").unwrap();
-        assert!(p.should_stop);
-        assert!(!p.stop_reason.is_empty());
-        assert!((p.quality_score - 0.0).abs() < f64::EPSILON);
+    fn test_parse_promotion_missing_quality_is_parse_error() {
+        // A lone STOP:true has no quality evidence — must not be a verdict.
+        assert!(parse_promotion("STOP: true").is_err());
+        // A refusal is not a "continue" vote either.
+        assert!(parse_promotion("I can't evaluate this.").is_err());
+        assert!(parse_promotion("").is_err());
+    }
+
+    #[test]
+    fn test_parse_promotion_stop_without_quality_band_is_continue() {
+        // STOP:true + low quality contradicts Melchior's own rules → continue.
+        let p = parse_promotion("STOP: true\nREASON: looks done\nQUALITY: 40\nFOCUS: x").unwrap();
+        assert!(!p.should_stop);
+        assert!((p.quality_score - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_promotion_markdown_and_variants() {
+        let variants = [
+            ("STOP: **true**\nQUALITY: **95**", true, 95.0),
+            ("- STOP: TRUE (complete)\n- QUALITY: 92/100", true, 92.0),
+            ("STOP: done\nQUALITY: 96", true, 96.0),
+            ("STOP: true.\nQUALITY: 90 (good)", true, 90.0),
+            ("STOP: no\nQUALITY: 88/100", false, 88.0),
+            ("STOP: false\nQUALITY: 85%", false, 85.0),
+            ("**STOP**: true\n**QUALITY**: 91", true, 91.0),
+            ("1. STOP: true\n2. QUALITY: 94", true, 94.0),
+        ];
+        for (raw, want_stop, want_quality) in variants {
+            let p = parse_promotion(raw).unwrap_or_else(|e| panic!("{raw:?} → {e}"));
+            assert_eq!(p.should_stop, want_stop, "raw={raw:?}");
+            assert!((p.quality_score - want_quality).abs() < f64::EPSILON, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_leading_int() {
+        assert_eq!(parse_leading_int("88/100"), Some(88.0));
+        assert_eq!(parse_leading_int(" 85 (good)"), Some(85.0));
+        assert_eq!(parse_leading_int("**88**"), Some(88.0));
+        assert_eq!(parse_leading_int("-50"), Some(-50.0));
+        assert_eq!(parse_leading_int("85%"), Some(85.0));
+        assert_eq!(parse_leading_int("n/a"), None);
+        assert_eq!(parse_leading_int("unknown"), None);
     }
 
     #[test]

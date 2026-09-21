@@ -11,6 +11,9 @@ use ratatui::text::{Line, Span};
 use crate::app::ToolCardStatus;
 use crate::theme::Theme;
 
+/// Maximum rendered width of one result line, in chars (the `…` is included).
+const MAX_LINE_CHARS: usize = 120;
+
 /// Render a tool card as a sequence of `Line` values appended to `lines`.
 pub fn render_tool_card_lines<'a>(
     lines: &mut Vec<Line<'a>>,
@@ -67,8 +70,12 @@ pub fn render_tool_card_lines<'a>(
         if let Some(output) = result {
             if !output.is_empty() {
                 for line_str in output.lines() {
-                    let truncated = if line_str.len() > 120 {
-                        format!("{}…", &line_str[..119])
+                    // Truncate on a char boundary — byte slicing panics on CJK
+                    // and emoji output. The ellipsis counts toward the 120 width.
+                    let char_count = line_str.chars().count();
+                    let truncated = if char_count > MAX_LINE_CHARS {
+                        let kept: String = line_str.chars().take(MAX_LINE_CHARS - 1).collect();
+                        format!("{}…", kept)
                     } else {
                         line_str.to_string()
                     };

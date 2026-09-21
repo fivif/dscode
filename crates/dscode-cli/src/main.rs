@@ -10,11 +10,17 @@ use dscode_core::{
     session::manager::SessionManager,
     tools::registry::ToolRegistry,
 };
+use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+const USAGE: &str = "Usage: dscode-cli [--teams] <message>";
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Must run before anything is printed: a zh-CN console defaults to CP936
+    // and would render this process's UTF-8 output as 乱码.
+    dscode_core::platform::enable_utf8_console();
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -23,9 +29,17 @@ async fn main() -> Result<()> {
     } else if args.len() > 1 {
         (false, args[1..].join(" "))
     } else {
-        eprintln!("Usage: dscode-cli [--teams] <message>");
+        eprintln!("{USAGE}");
         std::process::exit(1);
     };
+
+    // An empty message (bare `--teams`, empty quotes) is a usage error: sending
+    // it would bill a provider round-trip and record an empty user turn.
+    if message.trim().is_empty() {
+        eprintln!("{USAGE}");
+        eprintln!("error: message must not be empty");
+        std::process::exit(1);
+    }
 
     // Load config
     let config = Config::load()?;
@@ -55,7 +69,10 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Session: {}", e))?;
     let session = session_manager.create_session(
         "New Chat",
-        "/Users/zay/Desktop/DS_code",
+        // The Forge itself runs in `current_dir()`, so the session row must use
+        // the same directory (the old hardcoded macOS path left every user's DB
+        // pointing at a non-existent directory and leaked a developer username).
+        &working_dir.to_string_lossy(),
         &config.default_model,
     )
         .map_err(|e| anyhow::anyhow!("Create session: {}", e))?;
@@ -88,9 +105,13 @@ async fn main() -> Result<()> {
         match event {
             StreamEvent::Thinking { content, .. } => {
                 print!("\x1b[90m{}\x1b[0m", content);
+                // stdout is a LineWriter — without a flush the "stream" arrives
+                // in 1 KB chunks and looks like a hang.
+                let _ = std::io::stdout().flush();
             }
             StreamEvent::Token { content } => {
                 print!("{}", content);
+                let _ = std::io::stdout().flush();
                 assistant_content.push_str(&content);
             }
             StreamEvent::ToolStart { name, .. } => {
@@ -126,6 +147,7 @@ async fn main() -> Result<()> {
             }
             StreamEvent::TeamAgentOutput { agent_id, content } => {
                 print!("  [{}] {}", agent_id, content);
+                let _ = std::io::stdout().flush();
             }
             StreamEvent::TeamAgentEnd { agent_id, success, summary } => {
                 let icon = if success { "✅" } else { "❌" };
@@ -151,15 +173,21 @@ async fn main() -> Result<()> {
     // Wait for forge to complete
     match forge_handle.await {
         Ok(Ok(())) => {
-            if !had_error {
-                println!("\n✅ Done");
+            if had_error {
+                // The forge reported an error on the stream but returned Ok;
+                // a wrapper script must still be able to detect the failure.
+                eprintln!("\n❌ Agent reported an error");
+                std::process::exit(1);
             }
+            println!("\n✅ Done");
         }
         Ok(Err(e)) => {
             eprintln!("\n❌ Agent error: {}", e);
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("\n❌ Join error: {}", e);
+            std::process::exit(1);
         }
     }
 

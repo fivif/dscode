@@ -9,7 +9,10 @@
 
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -18,6 +21,15 @@ use serde_json::{json, Value};
 use dscode_server::app_state::AppState;
 use dscode_server::commands::{chat, config, mcp, session};
 
+/// Maximum accepted request body.
+///
+/// `stage_upload` carries base64 of up to `attachments::MAX_UPLOAD_BYTES`
+/// (40 MiB), which inflates by 4/3; add 1 MiB of JSON overhead. axum's `Json`
+/// default of 2 MiB used to reject anything over ~1.5 MiB of file with an
+/// opaque 413.
+pub const MAX_BODY_BYTES: usize =
+    dscode_server::attachments::MAX_UPLOAD_BYTES / 3 * 4 + 1024 * 1024;
+
 #[derive(Deserialize)]
 pub struct InvokeRequest {
     pub command: String,
@@ -25,10 +37,78 @@ pub struct InvokeRequest {
     pub args: Value,
 }
 
+/// API error that actually reaches the client as a non-2xx status.
+///
+/// Previously `dispatch` returned `Result<_, String>`, which axum renders as
+/// `200 OK` + `text/plain`; the frontend then called `res.json()` on the error
+/// text and surfaced `SyntaxError: Unexpected token 'F'` instead of the message.
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    // `pub(crate)` for `image.rs`, whose refusals must reuse this type rather
+    // than invent a second error path that axum might render as a 200.
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    /// Preserve the extractor's own status (400 / 413 / 415 / 422) and add a
+    /// hint for the body-limit case, which is the one users actually hit.
+    fn from_rejection(rejection: &JsonRejection) -> Self {
+        let status = rejection.status();
+        let mut message = rejection.body_text();
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            message = format!(
+                "{message} (request bodies are capped at {} MiB; base64 inflates the file by ~1.33x)",
+                MAX_BODY_BYTES / (1024 * 1024)
+            );
+        }
+        Self { status, message }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}
+
+/// Any `Result<_, String>` produced by a `dscode-server` command becomes a 400
+/// with the message intact. (Those commands do not classify their failures, so
+/// "Session not found" and "provider failed" share a status; the message is
+/// what callers display either way.)
+impl From<String> for ApiError {
+    fn from(message: String) -> Self {
+        ApiError::bad_request(message)
+    }
+}
+
+pub type ApiResult<T> = Result<T, ApiError>;
+
 pub async fn invoke_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<InvokeRequest>,
-) -> Result<Json<Value>, String> {
+    payload: Result<Json<InvokeRequest>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    let Json(req) = payload.map_err(|e| ApiError::from_rejection(&e))?;
     let value = dispatch(state, req.command, req.args).await?;
     Ok(Json(value))
 }
@@ -37,16 +117,16 @@ fn parse<T: DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("bad args: {e}"))
 }
 
-fn to_value<T: serde::Serialize>(v: T) -> Result<Value, String> {
-    serde_json::to_value(v).map_err(|e| format!("serialize: {e}"))
+fn to_value<T: serde::Serialize>(v: T) -> ApiResult<Value> {
+    serde_json::to_value(v).map_err(|e| ApiError::internal(format!("serialize: {e}")))
 }
 
 #[allow(dead_code)]
-fn ok() -> Result<Value, String> {
+fn ok() -> ApiResult<Value> {
     Ok(json!({ "ok": true }))
 }
 
-async fn dispatch(state: Arc<AppState>, command: String, args: Value) -> Result<Value, String> {
+async fn dispatch(state: Arc<AppState>, command: String, args: Value) -> ApiResult<Value> {
     match command.as_str() {
         // ── chat ──
         "send_message" => {
@@ -76,6 +156,12 @@ async fn dispatch(state: Arc<AppState>, command: String, args: Value) -> Result<
             let path = chat::stage_upload(state, a.session_id, a.name, a.base64_data).await?;
             to_value(path)
         }
+        // SECURITY: `approve_permission` answers a dangerous-command prompt, so
+        // it must never be reachable unauthenticated. The only credential is
+        // the `request_id` that `/api/events` streams — which means this route
+        // and the SSE route must share the same auth boundary. Both live in
+        // `main.rs::api_router` behind the token middleware; do not move either
+        // one out of it, and do not add a command that bypasses it.
         "approve_permission" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -360,6 +446,6 @@ async fn dispatch(state: Arc<AppState>, command: String, args: Value) -> Result<
             to_value(v)
         }
 
-        _ => Err(format!("unknown command: {command}")),
+        _ => Err(ApiError::not_found(format!("unknown command: {command}"))),
     }
 }

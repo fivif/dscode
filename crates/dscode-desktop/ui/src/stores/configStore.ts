@@ -10,8 +10,12 @@ import {
 } from '@/lib/models';
 
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
+/** Latest config waiting to be written; overwritten by newer edits (coalescing). */
 let _pendingConfig: AppConfig | null = null;
+/** Callers awaiting the write of `_pendingConfig` (resolved when it lands). */
 let _pendingResolvers: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
+/** Config writes currently in flight — drives `loading`, never gates writes. */
+let _inflightSaves = 0;
 
 function defaultAppConfig(): AppConfig {
   return {
@@ -65,6 +69,10 @@ function defaultAppConfig(): AppConfig {
     mcp_use_proxy: false,
     skills_use_proxy: false,
     absolute_trust: false,
+    image_enabled: true,
+    image_model: 'gpt-image-1',
+    image_size: '1024x1024',
+    image_provider: '',
   };
 }
 
@@ -271,6 +279,127 @@ function applyEnabledModelsToConfig(
   return next;
 }
 
+/**
+ * Build the **full** `Config` payload Rust expects.
+ *
+ * `update_config` deserializes a whole `Config` and `Config::save()` rewrites the
+ * entire TOML, while every field carries `#[serde(default)]` — so any key this
+ * payload omits is silently reset to its default on disk (`config.toml` is shared
+ * with the CLI). That used to wipe `agent.git_bash_path` / `agent.read_before_edit`
+ * / `agent.memory_*`, `context.max_agent_iterations` and the whole `[teams]`
+ * section on every settings save.
+ *
+ * So: read the current config, spread it, and override only the fields this UI
+ * actually owns. Sections the settings page never touches (`agent`, `teams`) are
+ * passed through byte-for-byte.
+ *
+ * Throws when the current config cannot be read — the caller must abort the save
+ * rather than write a payload with missing sections.
+ */
+async function buildSavePayload(
+  cfg: AppConfig,
+): Promise<{ payload: Record<string, unknown>; synced: AppConfig }> {
+  let synced = cfg.default_model
+    ? withSyncedModel(cfg, cfg.default_model, cfg.active_provider, {
+        ...Object.fromEntries(
+          Object.entries(cfg.providers).map(([k, p]) => [k, p.model_list || []]),
+        ),
+      })
+    : cfg;
+  synced = normalizeProxyFlags(synced);
+
+  let cur: any;
+  try {
+    cur = await tauri.getConfig();
+  } catch (e: any) {
+    throw new Error(
+      `读取当前配置失败，已取消本次保存以免覆盖 config.toml：${e?.message || String(e)}`,
+    );
+  }
+
+  /**
+   * Pack one channel for the wire. Fields this UI does not model are copied from
+   * the current on-disk channel instead of being dropped — e.g. `api_format`
+   * (`"responses"` switches a channel to the OpenAI Responses wire format) is
+   * only settable outside the settings UI and used to be reset on every save.
+   */
+  const packProv = (key: string) => {
+    const p = synced.providers[key];
+    const base: Record<string, unknown> = {
+      api_key: p?.api_key || '',
+      base_url: p?.base_url || '',
+      enabled: !!p?.enabled,
+      use_proxy: !!p?.use_proxy && isProxyConfigured(synced.proxy.url),
+      model: p?.model || '',
+      model_list: Array.isArray(p?.model_list) ? p.model_list : [],
+    };
+    // Only write enabled_models when curated (array, including empty).
+    // Omit when null so legacy "all model_list" round-trips as missing key…
+    // but Rust Option needs Some for empty; we always send array once user curated.
+    if (p?.enabled_models !== undefined && p?.enabled_models !== null) {
+      base.enabled_models = Array.isArray(p.enabled_models) ? p.enabled_models : [];
+    }
+    const disk = cur?.providers?.[key];
+    if (disk && typeof disk === 'object') {
+      for (const [k, v] of Object.entries(disk)) {
+        if (!(k in base)) base[k] = v;
+      }
+    }
+    return base;
+  };
+
+  const payload: Record<string, unknown> = {
+    // Pass through every section we do not own (agent, teams, safety extras,
+    // extensions extras, …) so nothing is reset to its serde default.
+    ...(cur || {}),
+    default_model: synced.default_model,
+    router_model: synced.default_model,
+    active_provider: synced.active_provider || 'deepseek',
+    providers: {
+      deepseek: packProv('deepseek'),
+      openai: packProv('openai'),
+      anthropic: packProv('anthropic'),
+      ollama: packProv('ollama'),
+    },
+    session: { ...(cur?.session || {}), retention_days: synced.retention_days },
+    safety: { ...(cur?.safety || {}), absolute_trust: !!synced.absolute_trust },
+    generation: {
+      ...(cur?.generation || {}),
+      reasoning_effort: synced.reasoning_effort,
+      max_tokens: synced.max_tokens,
+      temperature: synced.temperature,
+      proxy_url: '', // legacy cleared; use top-level proxy
+      image_enabled: synced.image_enabled,
+      image_model: synced.image_model,
+      image_size: synced.image_size,
+      image_provider: synced.image_provider,
+    },
+    context: {
+      ...(cur?.context || {}),
+      window_tokens: synced.context_window_tokens,
+      compress_threshold: synced.context_compress_threshold,
+    },
+    extensions: {
+      ...(cur?.extensions || {}),
+      mcp_use_proxy:
+        isProxyConfigured(synced.proxy.url) &&
+        (synced.proxy.global || synced.mcp_use_proxy),
+      skills_use_proxy:
+        isProxyConfigured(synced.proxy.url) &&
+        (synced.proxy.global || synced.skills_use_proxy),
+    },
+    proxy: {
+      url: synced.proxy.url.trim(),
+      global: isProxyConfigured(synced.proxy.url) && !!synced.proxy.global,
+      web_use_proxy:
+        isProxyConfigured(synced.proxy.url) &&
+        (!!synced.proxy.global || !!synced.proxy.web_use_proxy),
+    },
+  };
+
+  return { payload, synced };
+}
+
 export interface ConfigStore {
   config: AppConfig;
   loading: boolean;
@@ -306,7 +435,11 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
       config: nextCfg,
       fetchedModels: { ...s.fetchedModels, [provider]: clean },
     }));
-    await get().saveConfig(nextCfg);
+    try {
+      await get().saveConfig(nextCfg);
+    } catch {
+      /* failure is surfaced through the store `error` */
+    }
   },
 
   clearFetchedModels: async (provider) => {
@@ -325,13 +458,21 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
       delete fetched[provider];
       return { config: next, fetchedModels: fetched };
     });
-    await get().saveConfig(next);
+    try {
+      await get().saveConfig(next);
+    } catch {
+      /* failure is surfaced through the store `error` */
+    }
   },
 
   setEnabledModels: async (provider, models) => {
     const nextCfg = applyEnabledModelsToConfig(get().config, provider, models);
     set({ config: nextCfg });
-    await get().saveConfig(nextCfg);
+    try {
+      await get().saveConfig(nextCfg);
+    } catch {
+      /* failure is surfaced through the store `error` */
+    }
   },
 
   refreshEnabledModels: async () => {
@@ -404,6 +545,15 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
         mcp_use_proxy: !!(r as any).extensions?.mcp_use_proxy,
         skills_use_proxy: !!(r as any).extensions?.skills_use_proxy,
         absolute_trust: !!(r as any).safety?.absolute_trust,
+        // `??` not `||`: `false` is a real value. A missing key means an older
+        // config.toml, where the Rust side defaults the feature to on.
+        image_enabled: (r as any).generation?.image_enabled ?? true,
+        // Empty model/size is meaningful on the Rust side (it substitutes its
+        // own default), so showing that default here is the same value.
+        image_model: (r as any).generation?.image_model || 'gpt-image-1',
+        image_size: (r as any).generation?.image_size || '1024x1024',
+        // Empty provider means "follow active_provider" — must NOT be coerced.
+        image_provider: ((r as any).generation?.image_provider || '').trim(),
       };
       draft = normalizeProxyFlags(draft);
 
@@ -436,119 +586,51 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
     }
   },
 
+  /**
+   * Coalescing save: edits within the debounce window merge into one write and
+   * the newest state always wins. Callers' promises settle only after *their*
+   * (or a newer) payload has actually been persisted.
+   */
   saveConfig: async (c) => {
     _pendingConfig = c;
-    const oldResolvers = _pendingResolvers;
-    _pendingResolvers = [];
-    for (const r of oldResolvers) r.resolve();
 
     if (_saveTimer) clearTimeout(_saveTimer);
-    _saveTimer = setTimeout(async () => {
+    _saveTimer = setTimeout(() => {
       _saveTimer = null;
-      const cfg = _pendingConfig!;
+      const cfg = _pendingConfig;
       _pendingConfig = null;
-      try {
-        let synced = cfg.default_model
-          ? withSyncedModel(cfg, cfg.default_model, cfg.active_provider, {
-              ...Object.fromEntries(
-                Object.entries(cfg.providers).map(([k, p]) => [k, p.model_list || []]),
-              ),
-            })
-          : cfg;
-        synced = normalizeProxyFlags(synced);
-        const packProv = (p?: ProviderConfig) => {
-          const base: Record<string, unknown> = {
-            api_key: p?.api_key || '',
-            base_url: p?.base_url || '',
-            enabled: !!p?.enabled,
-            use_proxy: !!p?.use_proxy && isProxyConfigured(synced.proxy.url),
-            model: p?.model || '',
-            model_list: Array.isArray(p?.model_list) ? p!.model_list : [],
-          };
-          // Only write enabled_models when curated (array, including empty).
-          // Omit when null so legacy "all model_list" round-trips as missing key…
-          // but Rust Option needs Some for empty; we always send array once user curated.
-          if (p?.enabled_models !== undefined && p?.enabled_models !== null) {
-            base.enabled_models = Array.isArray(p.enabled_models)
-              ? p.enabled_models
-              : [];
-          }
-          return base;
-        };
-        // Preserve mcp_servers / skills_dirs / agent / safety extras already on disk
-        let existingExt: any = {};
-        let existingAgent: any = { global_prompt: '', replace_system_prompt: false };
-        let existingSafety: any = {};
-        try {
-          const cur = await tauri.getConfig();
-          existingExt = (cur as any).extensions || {};
-          existingSafety = (cur as any).safety || {};
-          if ((cur as any).agent) {
-            existingAgent = {
-              global_prompt: (cur as any).agent.global_prompt || '',
-              replace_system_prompt: !!(cur as any).agent.replace_system_prompt,
-            };
-          }
-        } catch {
-          /* ignore */
-        }
-        await tauri.updateConfig({
-          default_model: synced.default_model,
-          router_model: synced.default_model,
-          active_provider: synced.active_provider || 'deepseek',
-          providers: {
-            deepseek: packProv(synced.providers.deepseek),
-            openai: packProv(synced.providers.openai),
-            anthropic: packProv(synced.providers.anthropic),
-            ollama: packProv(synced.providers.ollama),
-          },
-          session: { retention_days: synced.retention_days },
-          safety: {
-            allow_write_outside_project: !!existingSafety.allow_write_outside_project,
-            blocked_commands: existingSafety.blocked_commands || [],
-            tool_timeout_secs: existingSafety.tool_timeout_secs || 120,
-            absolute_trust: !!synced.absolute_trust,
-            permission_timeout_secs: existingSafety.permission_timeout_secs || 120,
-          },
-          generation: {
-            reasoning_effort: synced.reasoning_effort,
-            max_tokens: synced.max_tokens,
-            temperature: synced.temperature,
-            proxy_url: '', // legacy cleared; use top-level proxy
-          },
-          context: {
-            window_tokens: synced.context_window_tokens,
-            compress_threshold: synced.context_compress_threshold,
-          },
-          extensions: {
-            mcp_servers: existingExt.mcp_servers || [],
-            skills_dirs: existingExt.skills_dirs || [],
-            mcp_use_proxy:
-              isProxyConfigured(synced.proxy.url) &&
-              (synced.proxy.global || synced.mcp_use_proxy),
-            skills_use_proxy:
-              isProxyConfigured(synced.proxy.url) &&
-              (synced.proxy.global || synced.skills_use_proxy),
-          },
-          proxy: {
-            url: synced.proxy.url.trim(),
-            global: isProxyConfigured(synced.proxy.url) && !!synced.proxy.global,
-            web_use_proxy:
-              isProxyConfigured(synced.proxy.url) &&
-              (!!synced.proxy.global || !!synced.proxy.web_use_proxy),
-          },
-          agent: existingAgent,
-        } as any);
-        // Keep store aligned if save path re-synced
-        set({ config: synced });
-        const resolvers = _pendingResolvers;
-        _pendingResolvers = [];
+      const resolvers = _pendingResolvers;
+      _pendingResolvers = [];
+      if (!cfg) {
         for (const r of resolvers) r.resolve();
-      } catch (e: any) {
-        const resolvers = _pendingResolvers;
-        _pendingResolvers = [];
-        for (const r of resolvers) r.reject(e);
+        return;
       }
+      void (async () => {
+        _inflightSaves += 1;
+        set({ loading: true });
+        try {
+          const { payload, synced } = await buildSavePayload(cfg);
+          await tauri.updateConfig(payload as any);
+          // Only re-align the store when nothing newer was edited meanwhile;
+          // otherwise this stale snapshot would clobber in-flight keystrokes.
+          if (get().config === cfg) {
+            set({ config: synced, error: null });
+          } else {
+            set({ error: null });
+          }
+          for (const r of resolvers) r.resolve();
+        } catch (e: any) {
+          const msg = e?.message || String(e);
+          console.error('saveConfig failed:', e);
+          // Surface it: the UI keeps showing the new value, so a silent failure
+          // is indistinguishable from a successful save.
+          set({ error: `配置保存失败（改动未写入磁盘）：${msg}` });
+          for (const r of resolvers) r.reject(e);
+        } finally {
+          _inflightSaves = Math.max(0, _inflightSaves - 1);
+          if (_inflightSaves === 0) set({ loading: false });
+        }
+      })();
     }, 300);
 
     return new Promise<void>((resolve, reject) => {
@@ -557,28 +639,23 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
   },
 
   updateConfig: async (p) => {
-    if (get().loading) return;
-    set({ loading: true });
+    let merged = { ...get().config, ...p };
+    if (p.proxy) {
+      merged.proxy = { ...get().config.proxy, ...p.proxy };
+    }
+    if (p.default_model) {
+      merged = withSyncedModel(merged, p.default_model);
+    }
+    merged = normalizeProxyFlags(merged);
+    set({ config: merged });
     try {
-      let merged = { ...get().config, ...p };
-      if (p.proxy) {
-        merged.proxy = { ...get().config.proxy, ...p.proxy };
-      }
-      if (p.default_model) {
-        merged = withSyncedModel(merged, p.default_model);
-      }
-      merged = normalizeProxyFlags(merged);
-      set({ config: merged });
       await get().saveConfig(merged);
     } catch (e: any) {
       console.error('updateConfig failed:', e);
-    } finally {
-      set({ loading: false });
     }
   },
 
   setDefaultModel: async (modelId, providerHint) => {
-    if (get().loading) return;
     const cfg = get().config;
     const fetched = get().fetchedModels;
     const p = resolveProviderForModel(cfg, modelId, fetched, providerHint);
@@ -594,21 +671,16 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
       console.warn('setDefaultModel blocked: model not in scanned list', modelId, p);
       return;
     }
-    set({ loading: true });
     try {
       const merged = withSyncedModel(cfg, modelId, p, fetched);
       set({ config: merged });
       await get().saveConfig(merged);
     } catch (e: any) {
       console.error('setDefaultModel failed:', e);
-    } finally {
-      set({ loading: false });
     }
   },
 
   updateProvider: async (provider, p) => {
-    if (get().loading) return;
-    set({ loading: true });
     try {
       const current = get().config;
       const fetched = get().fetchedModels;
@@ -670,8 +742,6 @@ export const useConfigStore = create<ConfigStore>((set, get) => ({
       await get().saveConfig(merged);
     } catch (e: any) {
       console.error('updateProvider failed:', e);
-    } finally {
-      set({ loading: false });
     }
   },
 }));

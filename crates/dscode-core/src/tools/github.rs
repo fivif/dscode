@@ -2,10 +2,16 @@
 //! Agent-Reach style "installed & usable" platform tool.
 
 use super::trait_def::{Tool, ToolContext, ToolError, ToolResult};
-use super::web::{proxy_note, proxy_configured_url, web_client_for_args};
+use super::web::{
+    proxy_configured_url, proxy_note, read_body_capped, validate_target, web_client_for_args,
+};
 use crate::agent::stream::StreamEvent;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+/// GitHub search JSON for one page is far below this; the cap only exists so a
+/// hostile/proxied endpoint cannot stream an unbounded body into memory.
+const MAX_GITHUB_BYTES: usize = 1024 * 1024;
 
 pub struct DoGithubSearch;
 
@@ -101,7 +107,7 @@ impl Tool for DoGithubSearch {
             .and_then(|p| p.as_u64())
             .unwrap_or(8)
             .min(20) as usize;
-        let use_proxy = args
+        let _use_proxy = args
             .get("use_proxy")
             .and_then(|p| p.as_bool())
             .unwrap_or_else(|| proxy_configured_url().is_some());
@@ -109,15 +115,24 @@ impl Tool for DoGithubSearch {
         let (client, proxy) = web_client_for_args(&args)?;
         progress(ctx, format!("  ▸ GitHub {kind} 搜索 …\n"));
 
-        let api = match kind.as_str() {
-            "issues" => "issues",
-            "users" => "users",
-            _ => "repositories",
+        // `sort` is endpoint-specific and an unsupported value is a validation
+        // error, not a no-op: /search/issues accepts comments|created|updated|…
+        // and /search/users accepts followers|repositories|joined — only
+        // /search/repositories knows `stars`.
+        let (api, sort) = match kind.as_str() {
+            "issues" => ("issues", "&sort=created&order=desc"),
+            "users" => ("users", "&sort=followers&order=desc"),
+            _ => ("repositories", "&sort=stars&order=desc"),
         };
         let url = format!(
-            "https://api.github.com/search/{api}?q={}&per_page={per_page}&sort=stars&order=desc",
+            "https://api.github.com/search/{api}?q={}&per_page={per_page}{sort}",
             encode_q(&query)
         );
+        // Shared URL policy (the host is fixed today; this keeps the client
+        // layer authoritative if it ever becomes caller-supplied).
+        if let Err(reason) = validate_target(&url, proxy.is_some()).await {
+            return Err(ToolError::Internal(format!("GitHub API target refused: {reason}")));
+        }
 
         let resp = client
             .get(&url)
@@ -129,16 +144,26 @@ impl Tool for DoGithubSearch {
             .map_err(|e| ToolError::Internal(format!("GitHub API HTTP: {e}")))?;
 
         let status = resp.status();
-        let v: Value = resp
-            .json()
+        let (bytes, truncated) = read_body_capped(resp, MAX_GITHUB_BYTES)
             .await
-            .map_err(|e| ToolError::Internal(format!("GitHub API parse: {e}")))?;
+            .map_err(|e| ToolError::Internal(format!("GitHub API body: {e}")))?;
 
+        // Status first: a proxy's HTML/502 page must surface as the real HTTP
+        // status, not as a JSON-decode error.
         if !status.is_success() {
-            let msg = v
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown");
+            let body_text = String::from_utf8_lossy(&bytes);
+            let msg = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_else(|| {
+                    body_text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                });
             let hint = if status.as_u16() == 403 {
                 " (rate limited — unauthenticated GitHub allows ~10 req/min)"
             } else {
@@ -150,6 +175,14 @@ impl Tool for DoGithubSearch {
                 format!("GitHub HTTP {status}: {msg}{hint}"),
             ));
         }
+
+        let v: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            ToolError::Internal(format!(
+                "GitHub API parse: {e} (HTTP {status}, {} bytes{})",
+                bytes.len(),
+                if truncated { ", truncated" } else { "" }
+            ))
+        })?;
 
         let items = v
             .get("items")

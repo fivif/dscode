@@ -15,20 +15,14 @@ pub struct Pattern {
 
 impl Pattern {
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        let name = name.into();
-        // Stable id from name so upserts collide instead of duplicating rows
-        let id = format!(
-            "pat_{:x}",
-            {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                name.hash(&mut h);
-                h.finish()
-            }
-        );
         Self {
-            id,
-            name,
+            // The upsert conflict target is the UNIQUE `name`, so the id only
+            // needs to be unique — it no longer has to be derived from the
+            // name. It used to come from `DefaultHasher`, which is not stable
+            // across Rust releases and could collide into an uncaught PK
+            // violation.
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
             description: description.into(),
             occurrence_count: 1,
             last_seen_at: chrono::Utc::now().timestamp(),
@@ -38,6 +32,12 @@ impl Pattern {
 }
 
 /// Promote repeated facts into patterns.
+///
+/// The `occurrence_count` on a returned pattern is the *increment* for this
+/// pass (1), not the size of the observed window: `store.insert_pattern`
+/// accumulates it into the stored total, and this window is re-scanned on
+/// every turn, so contributing the window count would grow the total
+/// quadratically. The window count is kept in the description instead.
 pub fn promote_patterns(facts: &[(String, String, String)]) -> Vec<Pattern> {
     use std::collections::HashMap;
     let mut counts: HashMap<(String, String, String), u32> = HashMap::new();
@@ -52,9 +52,9 @@ pub fn promote_patterns(facts: &[(String, String, String)]) -> Vec<Pattern> {
         .map(|((s, p, o), n)| {
             let mut pat = Pattern::new(
                 format!("{s}_{p}"),
-                format!("{s} {p} {o} (seen {n} times)"),
+                format!("{s} {p} {o} (seen {n} times in the recent window)"),
             );
-            pat.occurrence_count = n;
+            // occurrence_count stays 1: this pass observed the pattern.
             pat.tags = vec![p];
             pat
         })

@@ -57,6 +57,11 @@ pub enum LlmInterviewAction {
 /// Raw JSON shape the model is asked to return.
 #[derive(Debug, Deserialize)]
 struct LlmTurnJson {
+    /// Defaulted on purpose: models routinely answer "return the JSON object"
+    /// with no `action` key. A missing key used to be a hard deserialize error
+    /// — exactly the case the "unknown action" fallback below exists to cover —
+    /// while an unknown *value* was tolerated.
+    #[serde(default)]
     action: String,
     #[serde(default)]
     question: String,
@@ -77,6 +82,9 @@ pub fn project_snapshot(working_dir: &Path) -> String {
 
     // Top-level entries
     if let Ok(rd) = std::fs::read_dir(working_dir) {
+        // Filter and sort *before* truncating: taking 40 entries and sorting
+        // afterwards fed the model the first 40 names in OS readdir order, i.e.
+        // an arbitrary sample of a large repo rather than its top-level layout.
         let mut names: Vec<String> = rd
             .filter_map(|e| e.ok())
             .map(|e| {
@@ -88,9 +96,9 @@ pub fn project_snapshot(working_dir: &Path) -> String {
                 }
             })
             .filter(|n| !n.starts_with('.') && n != "target/" && n != "node_modules/")
-            .take(40)
             .collect();
         names.sort();
+        names.truncate(40);
         if !names.is_empty() {
             parts.push(format!("Top-level: {}", names.join(", ")));
         }
@@ -256,8 +264,27 @@ async fn collect_plan_llm_response(
         Ok(mut stream) => {
             let mut content = String::new();
             let mut saw_content = false;
+            let mut stream_error: Option<String> = None;
             while let Some(item) = stream.next().await {
-                let chunk = item.map_err(|e| format!("plan stream error: {e}"))?;
+                let chunk = match item {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        // Network drop / SSE abort mid-generation. Keep whatever
+                        // arrived instead of `?`-ing out: a truncated body still
+                        // reaches the `chat()` retry in `next_llm_turn`, whereas
+                        // returning early discarded the user's typed answer and
+                        // their paragraph had to be retyped. A mid-stream error is
+                        // the most likely LLM failure and used to be the only one
+                        // that skipped the fallback.
+                        warn!(
+                            %e,
+                            partial_len = content.len(),
+                            "plan stream failed mid-turn — keeping partial content"
+                        );
+                        stream_error = Some(format!("plan stream error: {e}"));
+                        break;
+                    }
+                };
                 if let Some(rc) = chunk.reasoning_content {
                     if !rc.is_empty() {
                         if let Some(tx) = progress {
@@ -284,7 +311,11 @@ async fn collect_plan_llm_response(
                 }
             }
             if content.trim().is_empty() {
-                warn!("plan stream empty — falling back to chat()");
+                if let Some(err) = &stream_error {
+                    warn!(%err, "plan stream produced nothing usable — falling back to chat()");
+                } else {
+                    warn!("plan stream empty — falling back to chat()");
+                }
                 let r = provider
                     .chat(messages, vec![])
                     .await
@@ -292,6 +323,9 @@ async fn collect_plan_llm_response(
                 emit_reasoning(progress, r.reasoning_content.as_deref());
                 Ok(r.content)
             } else {
+                if let Some(err) = &stream_error {
+                    warn!(%err, "plan stream ended early; partial content will be parsed/retried");
+                }
                 Ok(content)
             }
         }
@@ -356,7 +390,11 @@ fn parse_llm_turn(raw: &str) -> Result<LlmInterviewAction, String> {
             reason: parsed.reason,
         }),
         other => {
-            warn!(action = %other, "unknown plan action, treating as ask if question present");
+            if other.is_empty() {
+                warn!("plan LLM JSON had no `action` field, inferring from the payload");
+            } else {
+                warn!(action = %other, "unknown plan action, treating as ask if question present");
+            }
             if !parsed.question.trim().is_empty() {
                 Ok(LlmInterviewAction::Ask {
                     question: parsed.question,
@@ -398,6 +436,12 @@ fn normalize_options(raw: &[String], recommended: &str) -> Vec<String> {
 }
 
 /// Extract first `{...}` JSON object from model output.
+///
+/// Braces inside JSON strings are not structure: a question like
+/// `How should the template handle a stray } character?` used to drive the
+/// depth back to zero early, so the extractor returned a truncated object,
+/// serde failed, and the retry sent the identical prompt to fail identically.
+/// This scan tracks string state and backslash escapes.
 fn extract_json_object(text: &str) -> Option<String> {
     let trimmed = text.trim();
     // Strip ```json fences if present
@@ -410,8 +454,21 @@ fn extract_json_object(text: &str) -> Option<String> {
 
     let start = body.find('{')?;
     let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
     for (i, ch) in body[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -455,6 +512,46 @@ mod tests {
     #[test]
     fn test_parse_advance() {
         let a = parse_llm_turn(r#"{"action":"advance","reason":"enough"}"#).unwrap();
+        assert!(matches!(a, LlmInterviewAction::Advance { .. }));
+    }
+
+    #[test]
+    fn test_extract_json_object_ignores_braces_inside_strings() {
+        // The `}` inside the question used to end the object early, so the
+        // extractor returned a truncated document and serde failed.
+        let raw = r#"{"action":"ask","question":"How should the template handle a stray } character?","recommended":"escape it"}"#;
+        let extracted = extract_json_object(raw).unwrap();
+        assert!(extracted.ends_with('}'));
+
+        match parse_llm_turn(raw).unwrap() {
+            LlmInterviewAction::Ask { question, .. } => assert!(question.contains("stray }")),
+            other => panic!("expected ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_json_object_handles_escaped_quotes() {
+        let raw = r#"{"action":"ask","question":"Is \"quoted\note\" ok?","reason":"a \\ b"}"#;
+        let extracted = extract_json_object(raw).unwrap();
+        assert!(extracted.ends_with('}'));
+        assert!(parse_llm_turn(raw).is_ok());
+    }
+
+    #[test]
+    fn test_parse_missing_action_infers_ask() {
+        // Models routinely omit `action`; that used to be a hard deserialize
+        // error even though the fallback branch exists to cover it.
+        let a = parse_llm_turn(r#"{"question":"Who is the user?","recommended":"internal ops"}"#)
+            .unwrap();
+        match a {
+            LlmInterviewAction::Ask { question, .. } => assert!(question.contains("user")),
+            other => panic!("expected ask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_missing_action_without_question_advances() {
+        let a = parse_llm_turn(r#"{"reason":"nothing left to ask"}"#).unwrap();
         assert!(matches!(a, LlmInterviewAction::Advance { .. }));
     }
 }

@@ -1,7 +1,31 @@
-//! Configuration system — single TOML file for all settings.
+//! Configuration system — TOML for settings, YAML for secrets.
+//!
+//! Three things about this layer are load-bearing and worth knowing before
+//! changing it:
+//!
+//!   · **A save is an overlay, not a rewrite.** `save()` serialises the config
+//!     and merges it over the file that is already there (`patch::overlay`), so
+//!     comments survive and so does any key this build does not know about.
+//!     Without that, `toml::to_string_pretty` would flatten the file to exactly
+//!     the fields declared below and delete the rest — which is the whole reason
+//!     the desktop frontend has to read-modify-write the entire config on every
+//!     keystroke. See `patch.rs`.
+//!   · **Secrets are not in here.** `ProviderConfig::api_key` is read for wire
+//!     compatibility with payloads that still carry it, but it is backfilled
+//!     from — and migrated into — `~/.dscode/.credentials.yaml` on load, and
+//!     stripped from what gets written. See `credentials.rs` for what the split
+//!     does and does not promise.
+//!   · **Every write is atomic.** `atomic::write_atomic` writes a sibling temp
+//!     file, fsyncs, and renames. A crash mid-save leaves the previous config
+//!     intact rather than a truncated file that would fail to parse on next
+//!     boot, which presents to the user as "all my settings reset".
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use super::credentials::Credentials;
+use super::providers::default_true;
+use super::{atomic, patch};
 
 /// Main configuration, persisted to ~/.dscode/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,8 +113,15 @@ impl Default for Config {
 
 impl Config {
     /// Load config from ~/.dscode/config.toml, creating default if missing.
+    ///
+    /// Also loads the credentials file and backfills `provider.api_key` from it,
+    /// so every caller downstream keeps reading `provider.api_key` and does not
+    /// need to know the two stores exist. A key still sitting in the TOML (an
+    /// install that has not saved since the split) is honoured as a fallback and
+    /// migrated out on the next save.
     pub fn load() -> Result<Self, ConfigError> {
         let path = Self::config_path()?;
+        let mut credentials = Credentials::load()?;
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
             let mut config: Config = toml::from_str(&content)?;
@@ -100,11 +131,60 @@ impl Config {
             {
                 config.proxy.url = config.generation.proxy_url.trim().to_string();
             }
+            let migrated = config.apply_credentials(&mut credentials);
+            config.migrate_proxy_url_from_legacy(&content);
+            if migrated {
+                // The keys have moved; persist the credentials file immediately
+                // so a crash before the first settings save cannot lose them at
+                // the same moment the TOML that still held them gets rewritten.
+                credentials.save()?;
+            }
             Ok(config)
         } else {
             let config = Config::default();
             config.save()?;
             Ok(config)
+        }
+    }
+
+    /// Fill every `provider.api_key` from `credentials`, falling back to the key
+    /// still present in the TOML and recording it for migration.
+    ///
+    /// Returns whether anything was taken *from the TOML* and therefore needs to
+    /// be written out to the credentials file.
+    fn apply_credentials(&mut self, credentials: &mut Credentials) -> bool {
+        let mut migrated = false;
+        for (key, provider) in self.providers.iter_mut() {
+            let stored = credentials.get(key);
+            if !stored.is_empty() {
+                provider.api_key = stored.to_string();
+                continue;
+            }
+            let legacy = provider.api_key.trim();
+            if !legacy.is_empty() {
+                credentials.set(key, legacy);
+                migrated = true;
+            }
+        }
+        migrated
+    }
+
+    /// One-shot fixes applied to the raw TOML before anything writes it back.
+    ///
+    /// Today: drop the now-duplicated `generation.proxy_url`. It was the legacy
+    /// home of the proxy setting and is folded into `proxy.url` above; leaving
+    /// it in the file means the next hand-edit changes a value nothing reads,
+    /// and it is what let the two copies disagree in the first place.
+    fn migrate_proxy_url_from_legacy(&self, raw: &str) {
+        let Ok(mut doc) = raw.parse::<toml_edit::Document>() else {
+            return;
+        };
+        if !self.proxy.url.trim().is_empty()
+            && patch::remove_path(&mut doc, &["generation", "proxy_url"])
+        {
+            if let Ok(path) = Self::config_path() {
+                let _ = atomic::write_atomic(&path, &doc.to_string());
+            }
         }
     }
 
@@ -186,14 +266,165 @@ impl Config {
         }
     }
 
-    /// Save config to ~/.dscode/config.toml
+    /// Save config to ~/.dscode/config.toml, and any API keys it carries to
+    /// ~/.dscode/.credentials.yaml.
+    ///
+    /// The TOML write is an **overlay**: the current file is parsed, this
+    /// config's non-secret fields are merged over it, and the result is written.
+    /// Comments and keys this build does not understand therefore survive. See
+    /// the module docs and `patch.rs`.
+    ///
+    /// Secrets go first. If the credentials write fails, the config file is left
+    /// alone — the other order could strip a key from the TOML on a path that
+    /// then failed to record it anywhere. The two writes are still not one
+    /// transaction; see [`Self::save_with_credentials`] for the caller that can
+    /// make them one.
     pub fn save(&self) -> Result<(), ConfigError> {
-        let config_path = Self::config_path()?;
+        self.save_credentials()?;
+        self.save_config_only()
+    }
+
+    /// Write `config.toml` without touching the credentials store.
+    ///
+    /// The split exists for callers that hold a config carrying **no** key at
+    /// all — a payload read back out of the TOML rather than out of the running
+    /// app. `save_credentials` treats a blank key as "not my business" (see its
+    /// docs), so the two paths are equivalent *today*; naming this one makes the
+    /// distinction explicit rather than relying on that accident.
+    pub fn save_config_only(&self) -> Result<(), ConfigError> {
+        let mut merged = self.merged_document()?;
+        Self::strip_secrets(&mut merged);
+        Self::write_config(&merged.to_string())
+    }
+
+    /// Write both halves under a lock, re-reading the credentials file inside it.
+    ///
+    /// True atomicity across two files does not exist, but the window that
+    /// matters is narrower than it looks. Consider two saves racing:
+    ///
+    ///   A: load credentials → B: load credentials → A: write creds → B: write creds
+    ///
+    /// A key A introduced is silently gone, because B's copy was read before A's
+    /// write and B overwrites the whole file. The lock plus the in-lock re-read
+    /// closes exactly that: B's read now happens after A's write, so B's merge
+    /// starts from A's state and the union survives. A same-key collision still
+    /// resolves last-writer-wins, which is the correct semantic for two settings
+    /// pages setting the same field.
+    ///
+    /// The dedicated, *actionable* entry point for the settings page is
+    /// [`Self::set_api_key`]; this is for callers that already hold a whole
+    /// config and cannot express the change as one field.
+    pub fn save_with_credentials(&self) -> Result<(), ConfigError> {
+        let _guard = credentials_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut credentials = Credentials::load()?;
+        let mut changed = false;
+        for (key, provider) in self.providers.iter() {
+            let secret = provider.api_key.trim();
+            if !secret.is_empty() && credentials.get(key) != secret {
+                credentials.set(key, secret);
+                changed = true;
+            }
+        }
+        if changed {
+            credentials.save()?;
+        }
+        self.save_config_only()
+    }
+
+    /// Set one channel's API key, leaving every other key and the whole of
+    /// `config.toml` untouched.
+    ///
+    /// This is the interface the settings page should hold: changing a key is a
+    /// one-field write, not a reason to round-trip an entire config through the
+    /// UI and back — which is exactly the shape that made a stray save able to
+    /// clobber sections it does not own.
+    ///
+    /// An empty `key` **removes** the stored secret, so this one method both
+    /// sets and clears. (Contrast [`Self::save_with_credentials`], where a blank
+    /// key means "unchanged".)
+    pub fn set_api_key(&self, channel: &str, key: &str) -> Result<(), ConfigError> {
+        let _guard = credentials_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut credentials = Credentials::load()?;
+        if credentials.get(channel) == key.trim() {
+            return Ok(());
+        }
+        credentials.set(channel, key);
+        credentials.save()
+    }
+
+    /// This config as a document overlaid on whatever is currently on disk.
+    ///
+    /// Serialising at the *document* level this way — rather than to a string
+    /// and re-parsing — is what lets `patch::remove_path` drop a single nested
+    /// key after the fact.
+    fn merged_document(&self) -> Result<toml_edit::Document, ConfigError> {
+        let layer: toml_edit::Document = toml::to_string_pretty(self)?.parse()?;
+        let path = Self::config_path()?;
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.trim().is_empty() {
+            return Ok(layer);
+        }
+        // A config file that will not parse is the user's to fix: reporting the
+        // error beats silently replacing whatever is in it.
+        let mut doc: toml_edit::Document = existing.parse()?;
+        patch::merge_document(&mut doc, &layer);
+        Ok(doc)
+    }
+
+    /// Remove every channel's `api_key` from a document about to be written.
+    ///
+    /// Two jobs, one pass. It keeps a stray key out of `config.toml` on a
+    /// payload that carries one (the settings page round-trips the live key), and
+    /// it clears out a key left behind by an install that predates the
+    /// credentials split — that value would otherwise sit in the file forever,
+    /// since nothing reads it any more now that `.credentials.yaml` is
+    /// authoritative.
+    ///
+    /// Note this is **not** what keeps keys out of the file in the first place;
+    /// `Config::load` backfills `provider.api_key` from the credentials store, so
+    /// the in-memory config *does* hold the secret and serialising it would write
+    /// it. This is the strip that stops that. See `providers.rs` for why the
+    /// field is not `skip_serializing`.
+    fn strip_secrets(doc: &mut toml_edit::Document) {
+        let channels: Vec<&'static str> = super::providers::CHANNELS.to_vec();
+        for key in channels {
+            patch::remove_path(doc, &["providers", key, "api_key"]);
+        }
+    }
+
+    fn write_config(content: &str) -> Result<(), ConfigError> {        let config_path = Self::config_path()?;
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, content)?;
+        atomic::write_atomic(&config_path, content)?;
+        Ok(())
+    }
+
+    /// Save only the API keys, leaving every other field of `config.toml` alone.
+    ///
+    /// This is the target the settings page will move to: a key change should not
+    /// require the frontend to read the whole config, spread it, and post it all
+    /// back just to avoid clobbering sections it does not own.
+    ///
+    /// A non-empty `api_key` means "the user set this". An empty one means
+    /// "this payload did not carry a key" — NOT "delete it" — because most saves
+    /// originate from the frontend's read-modify-write cycle and routing the key
+    /// back through it is a lossy round trip we should not depend on. Clearing a
+    /// key is therefore a deliberate act (delete the entry in the credentials
+    /// file), not a side effect of saving an unrelated setting.
+    pub fn save_credentials(&self) -> Result<(), ConfigError> {
+        let mut credentials = Credentials::load()?;
+        let mut changed = false;
+        for (key, provider) in self.providers.iter() {
+            let secret = provider.api_key.trim();
+            if !secret.is_empty() && credentials.get(key) != secret {
+                credentials.set(key, secret);
+                changed = true;
+            }
+        }
+        if changed {
+            credentials.save()?;
+        }
         Ok(())
     }
 
@@ -221,6 +452,33 @@ impl Config {
             )
         {
             return active;
+        }
+
+        // A channel that *advertises* this model outranks prefix inference.
+        //
+        // This is the relay case, and it is the difference between a working
+        // install and a dead one. A gateway's whole purpose is to serve other
+        // people's models, so `[providers.openai]` legitimately lists
+        // `deepseek-flash` and a `deepseek-*` id that belongs to the relay is
+        // indistinguishable, by name alone, from one that belongs to DeepSeek.
+        // `model_list` is the user telling us which — and before this curve,
+        // routing never consulted it, so the id went to a channel with no key.
+        //
+        // Deliberately ordered *after* the exact-default rule above: an explicit
+        // `active_provider` is a stronger statement than a published list, and
+        // a channel the user disabled must not be resurrected by curation.
+        //
+        // Ambiguity (two enabled channels claiming one id) falls through to
+        // prefix inference rather than picking one arbitrarily.
+        let mut claiming = self
+            .providers
+            .iter()
+            .filter(|(_, p)| p.enabled && p.model_list.iter().any(|listed| listed.trim() == m))
+            .map(|(name, _)| name);
+        if let Some(first) = claiming.next() {
+            if claiming.next().is_none() {
+                return first.to_string();
+            }
         }
 
         if m.starts_with("deepseek") {
@@ -291,101 +549,11 @@ fn dirs_next() -> Option<PathBuf> {
         .ok()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfigs {
-    #[serde(default)]
-    pub deepseek: ProviderConfig,
-    #[serde(default)]
-    pub openai: ProviderConfig,
-    #[serde(default)]
-    pub anthropic: ProviderConfig,
-    #[serde(default)]
-    pub ollama: ProviderConfig,
-}
-
-impl Default for ProviderConfigs {
-    fn default() -> Self {
-        Self {
-            deepseek: ProviderConfig {
-                api_key: String::new(),
-                base_url: "https://api.deepseek.com/v1".into(),
-                enabled: true,
-                use_proxy: false,
-                ..Default::default()
-            },
-            openai: ProviderConfig {
-                api_key: String::new(),
-                base_url: "https://api.openai.com/v1".into(),
-                enabled: false,
-                use_proxy: false,
-                ..Default::default()
-            },
-            anthropic: ProviderConfig {
-                api_key: String::new(),
-                base_url: "https://api.anthropic.com".into(),
-                enabled: false,
-                use_proxy: false,
-                ..Default::default()
-            },
-            ollama: ProviderConfig {
-                api_key: String::new(),
-                base_url: "http://localhost:11434/v1".into(),
-                enabled: false,
-                use_proxy: false,
-                ..Default::default()
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProviderConfig {
-    #[serde(default)]
-    pub api_key: String,
-    #[serde(default)]
-    pub base_url: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Use configured HTTP proxy for this channel (ignored if proxy not configured;
-    /// forced on when `proxy.global` is true).
-    #[serde(default)]
-    pub use_proxy: bool,
-    /// Last successful `/models` scan for this channel (persisted). Empty = not scanned.
-    /// Full catalog for the settings multi-select UI.
-    #[serde(default)]
-    pub model_list: Vec<String>,
-    /// Models that appear in the global picker (default model + input box).
-    /// - `None` / missing in TOML: not curated yet → treat as "all of model_list" (legacy).
-    /// - `Some([])`: user cleared selection → contribute nothing to global list.
-    /// - `Some([...])`: explicit whitelist.
-    #[serde(default)]
-    pub enabled_models: Option<Vec<String>>,
-    /// Last selected model id for this channel (optional UI hint / fallback).
-    #[serde(default)]
-    pub model: String,
-    /// API wire format for this channel: "" (empty) = OpenAI-compatible Chat
-    /// Completions; "responses" = OpenAI Responses API (e.g. DeepSeek /responses).
-    #[serde(default)]
-    pub api_format: String,
-}
-
-impl ProviderConfig {
-    /// Models that should appear in global pickers for this channel.
-    pub fn effective_enabled_models(&self) -> Vec<String> {
-        match &self.enabled_models {
-            Some(v) => v
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            None => self
-                .model_list
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        }
-    }
+/// The user's home directory, or `None` when neither `HOME` nor `USERPROFILE`
+/// is set. Public because `credentials` needs the same root, and two copies of
+/// this resolution would eventually disagree about which one is authoritative.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    dirs_next()
 }
 
 #[cfg(test)]
@@ -461,7 +629,23 @@ mod provider_enabled_models_tests {
     }
 }
 
-fn default_true() -> bool { true }
+/// Re-exported so call sites that say `settings::ProviderConfig` keep working;
+/// the definitions now live in `config::providers`.
+pub use super::providers::{default_base_url, ProviderConfig, ProviderConfigs, CHANNELS};
+
+/// Serialises the read-modify-write of `.credentials.yaml`.
+///
+/// A module-level mutex is right here rather than a per-instance one: the state
+/// being protected is the *file*, and every `Config` loaded from the same home
+/// directory contends for it regardless of which struct instance it came from.
+/// `unwrap_or_else(|e| e.into_inner())` on the lock is deliberate — a panic in
+/// one save must not poison every later one, and the critical section touches
+/// only process-local state plus one file write.
+fn credentials_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 
 /// Outbound proxy settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,6 +755,22 @@ pub struct GenerationConfig {
     /// Legacy proxy field — prefer top-level `[proxy].url`. Kept for migration.
     #[serde(default)]
     pub proxy_url: String,
+    /// Enable the `do_image_generate` tool.
+    #[serde(default = "default_true")]
+    pub image_enabled: bool,
+    /// Image model id sent to the provider's `/images/generations` endpoint.
+    /// `gpt-image-1` is the default; `dall-e-3` is accepted too and is the id
+    /// most other OpenAI-compatible gateways carry (see `tools::image`, which
+    /// adapts the request and response shape to whichever one is configured).
+    #[serde(default = "default_image_model")]
+    pub image_model: String,
+    /// Default image size, e.g. `1024x1024` (the tool's `size` arg wins).
+    #[serde(default = "default_image_size")]
+    pub image_size: String,
+    /// Provider channel used for image generation (deepseek / openai /
+    /// anthropic / ollama). Empty = follow `active_provider`.
+    #[serde(default)]
+    pub image_provider: String,
 }
 
 impl Default for GenerationConfig {
@@ -580,12 +780,18 @@ impl Default for GenerationConfig {
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             proxy_url: String::new(),
+            image_enabled: true,
+            image_model: default_image_model(),
+            image_size: default_image_size(),
+            image_provider: String::new(),
         }
     }
 }
 
 fn default_reasoning() -> String { "max".into() }
 fn default_max_tokens() -> u32 { 8192 }
+fn default_image_model() -> String { "gpt-image-1".into() }
+fn default_image_size() -> String { "1024x1024".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
@@ -807,6 +1013,10 @@ pub enum ConfigError {
     Toml(#[from] toml::de::Error),
     #[error("TOML serialize error: {0}")]
     TomlSer(#[from] toml::ser::Error),
+    #[error("TOML edit error: {0}")]
+    TomlEdit(#[from] toml_edit::TomlError),
+    #[error("credentials error: {0}")]
+    Credentials(#[from] serde_yaml::Error),
 }
 
 #[cfg(test)]
@@ -890,5 +1100,73 @@ enabled_models = []
         )
         .unwrap();
         assert!(p3.enabled_models.is_none());
+    }
+}
+
+#[cfg(test)]
+mod model_routing_tests {
+    use super::Config;
+
+    /// A model a channel *advertises* but that its name does not reveal — the
+    /// relay case in the wild: `[providers.openai]` lists `deepseek-flash`,
+    /// because the whole point of a gateway is to serve other people's models.
+    ///
+    /// Name-prefix inference alone sends this to `deepseek`, which has no key,
+    /// so every turn on that model fails with `NoApiKey`. `model_list` is the
+    /// only evidence in the file that the user meant the openai channel, and
+    /// before this curve it was ignored entirely by routing.
+    #[test]
+    fn advertised_model_routes_to_the_channel_that_advertises_it() {
+        let raw = r#"
+default_model = "deepseek-flash"
+active_provider = "openai"
+
+[providers.deepseek]
+api_key = ""
+base_url = "https://api.deepseek.com/v1"
+enabled = true
+
+[providers.openai]
+api_key = "k"
+base_url = "https://relay.example/v1"
+enabled = true
+model_list = ["deepseek-flash", "gpt-5.5"]
+"#;
+        let c: Config = toml::from_str(raw).expect("parse");
+        assert_eq!(c.provider_key_for_model("deepseek-flash"), "openai");
+        // A model that is genuinely DeepSeek's still goes to DeepSeek.
+        let c2: Config = toml::from_str(&raw.replace("deepseek-v4-pro", "x")).unwrap();
+        assert_eq!(
+            c2.provider_key_for_model("deepseek-v4-chat"),
+            "deepseek",
+            "an unadvertised deepseek-* id must still infer to the deepseek channel"
+        );
+    }
+
+    /// The published list must not outrank a disabled channel, or curation
+    /// would resurrect a channel the user switched off.
+    ///
+    /// The probe is an id no prefix rule claims and that only the *disabled*
+    /// channel advertises — so if the `enabled` filter were dropped, routing
+    /// would hand it to a channel that cannot serve it.
+    #[test]
+    fn disabled_channel_does_not_win_an_advertised_model() {
+        let raw = r#"
+default_model = "deepseek-v4-pro"
+active_provider = "deepseek"
+
+[providers.deepseek]
+api_key = "k"
+base_url = "https://api.deepseek.com/v1"
+enabled = true
+
+[providers.openai]
+api_key = "k"
+base_url = "https://relay.example/v1"
+enabled = false
+model_list = ["mystery-model"]
+"#;
+        let c: Config = toml::from_str(raw).expect("parse");
+        assert_eq!(c.provider_key_for_model("mystery-model"), "deepseek");
     }
 }

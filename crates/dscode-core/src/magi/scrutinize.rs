@@ -126,6 +126,18 @@ fn build_scrutiny_prompt(
             prompt.push_str("\n\n");
         }
 
+        // Melchior's FOCUS directive was parsed and stored but never read —
+        // without it the "spiral" only re-derives the same gaps each round.
+        if let Some(focus) = previous_rounds.last().map(|r| r.promotion.next_round_focus.as_str())
+        {
+            let focus = focus.trim();
+            if !focus.is_empty() && !focus.eq_ignore_ascii_case("none") {
+                prompt.push_str("## Focus for this round (from Melchior)\n\n");
+                prompt.push_str(focus);
+                prompt.push_str("\n\n");
+            }
+        }
+
         prompt.push_str(
             "## Your Task\n\n\
              Review the progress above and identify what still needs to be done. \

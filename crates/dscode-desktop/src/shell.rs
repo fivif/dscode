@@ -21,7 +21,29 @@ pub fn spawn_event_bridge(app: &tauri::AppHandle) {
     let mut rx = bus.subscribe();
 
     tauri::async_runtime::spawn(async move {
-        while let Ok(ev) = rx.recv().await {
+        // `EventBus` is a `broadcast::channel(8192)` shared by every session, so a
+        // slow consumer eventually sees `Lagged` — a chatty session's ToolProgress
+        // flood can evict a quiet session's Complete/PermissionRequest. The old
+        // `while let Ok(ev) = rx.recv().await` treated that as the end of the
+        // stream and exited the loop, after which *every* stream event, title
+        // update and task notification was silently dropped until restart.
+        loop {
+            let ev = match rx.recv().await {
+                Ok(ev) => ev,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "event bridge lagged: events were dropped, resuming"
+                    );
+                    // Tell the client it missed events so it can resync.
+                    let _ = app.emit(
+                        "event-bridge-lagged",
+                        serde_json::json!({ "skipped": skipped }),
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             match ev {
                 ServerEvent::Stream { session_id, event } => {
                     let _ = app.emit(

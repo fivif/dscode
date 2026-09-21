@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import SessionItem from './SessionItem';
 import type { Session } from '@/lib/types';
 import { groupSessions, type SessionGroup } from '@/lib/types';
+import { IconChevronRight16, IconMessage16 } from '@/components/icons';
 
 interface Props {
   sessions: Session[];
@@ -36,8 +37,10 @@ export default function SessionList({ sessions, activeId, onSelect, onDelete, on
 
   if (sessions.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center">
-        <p className="text-gray-500 text-xs">暂无对话</p>
+      <div className="flex-1 flex flex-col items-center justify-center gap-2 px-4 text-center">
+        <IconMessage16 size={28} className="text-faint shrink-0" />
+        <p className="text-[13px] text-muted">暂无对话</p>
+        <p className="text-[11px] text-faint">点击上方「新对话」开始</p>
       </div>
     );
   }
@@ -51,18 +54,15 @@ export default function SessionList({ sessions, activeId, onSelect, onDelete, on
         return (
           <div key={group}>
             <button
-              className="group-header w-full flex items-center gap-1.5 cursor-pointer hover:text-gray-300 transition-colors text-left"
+              className="w-full flex items-center gap-1.5 px-2.5 pt-2 pb-1 cursor-pointer text-left text-[11px] font-medium text-muted hover:text-secondary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
               onClick={() => toggle(group)}
             >
-              <svg
-                width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                strokeWidth="2.5" strokeLinecap="round"
+              <IconChevronRight16
+                size={10}
                 className={`transition-transform shrink-0 ${isCollapsed ? '' : 'rotate-90'}`}
-              >
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
+              />
               <span>{LABELS[group]}</span>
-              <span className="text-gray-600 ml-auto text-[10px]">{items.length}</span>
+              <span className="text-faint ml-auto text-[11px] tabular-nums">{items.length}</span>
             </button>
             {!isCollapsed && items.map((s) => (
               <SessionItem

@@ -13,6 +13,22 @@
 //!   └─────────┴──────────────┴────────┴────────┘ (retreat on revision)
 //! ```
 //!
+//! # Which path is live
+//!
+//! There are two interview implementations in this module, and only one of them
+//! is reachable from the product:
+//!
+//! * **Live** — [`ActivePlanSession`] + [`llm_interview`]. `/plan <goal>` calls
+//!   `ActivePlanSession::start_with_llm` (`agent/forge.rs`), each user reply
+//!   drives `answer_with_llm`, and the session is persisted under
+//!   `~/.dscode/plans/<session>.json`. Questions are generated one at a time by
+//!   the LLM.
+//! * **Not wired** — [`run_plan_interview`] + [`InterviewEngine`]. Nothing in
+//!   the workspace calls `run_plan_interview`; it also does not interview
+//!   anyone (it synthesises every answer from the user's original message via
+//!   `auto_answer_for`). It is kept as public API, but new work should extend
+//!   the live path above.
+//!
 //! # Usage
 //!
 //! ```no_run
@@ -47,6 +63,13 @@ pub use prd::{
 };
 
 /// Run a complete plan interview for the given task ID and title.
+///
+/// **Not wired into the product.** No caller exists anywhere in the workspace:
+/// `/plan` goes through [`ActivePlanSession`] + [`llm_interview`] instead (see
+/// the module docs). It also does not actually interview the user —
+/// `auto_answer_for` fabricates every answer from `user_message` plus the
+/// canned `recommended_answer`, so the PRD it persists is built from strings
+/// nobody said. Kept as public API; do not treat its output as user input.
 ///
 /// This is the high-level entry point. It:
 /// 1. Creates a [`PlanState`] in the Scope phase.
@@ -188,7 +211,13 @@ pub async fn run_plan_interview(
         }
     }
 
-    // 8. Ensure we are in Approved state
+    // 8. A plan only exists once a PRD was actually produced. The old code
+    //    forced the phase to Approved unconditionally, so callers received
+    //    `Ok(state)` for a plan whose `draft_prd` was `None` and whose
+    //    `has_prd()` was false — success reported for nothing.
+    if state.draft_prd.is_none() {
+        return Err(PrdError::NoPrd);
+    }
     if state.phase != PlanPhase::Approved {
         state.retreat_to(PlanPhase::Approved);
     }

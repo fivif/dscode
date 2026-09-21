@@ -7,10 +7,179 @@ use dscode_core::agent::stream::StreamEvent;
 use dscode_core::providers::create_provider;
 use dscode_core::providers::trait_def::{FunctionCall, Message, MessageContent, Role, ToolCall};
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::app_state::{ActiveForge, AppState};
+
+/// Persist a message, logging instead of discarding the failure.
+///
+/// These call sites used to be `.ok()`: under concurrent SQLite writers a
+/// `SQLITE_BUSY` silently dropped assistant replies and tool results, so a
+/// reopened session looked like the turn never happened. Every call now leaves
+/// a `warn!` trail; paths where the user must know escalate further.
+fn persist_message(
+    sm: &dscode_core::session::manager::SessionManager,
+    session_id: &str,
+    msg: &Message,
+) -> Result<(), String> {
+    sm.add_message(session_id, msg).map_err(|e| {
+        tracing::warn!(session = %session_id, error = %e, role = ?msg.role, "chat: persist failed");
+        e
+    })
+}
+
+/// Ask the router model for a better session title, beside the turn.
+///
+/// Fire-and-forget on purpose: `derived` is already stored and already on its
+/// way to the sidebar, so every failure here is invisible by design and the
+/// session simply keeps the title it has. The provider comes from
+/// `create_provider_pair`, whose runtime half prefers `router_model` —
+/// naming is a routing-class task and must not spend the session's (possibly
+/// expensive) model on one line of output.
+fn spawn_llm_title(
+    state: Arc<AppState>,
+    session_id: String,
+    source: String,
+    derived: String,
+) {
+    tokio::spawn(async move {
+        let provider = {
+            let config = state.config.lock().await;
+            dscode_core::providers::factory::create_provider_pair(&config.default_model, &config)
+                .map(|(_, runtime)| runtime)
+        };
+        let Ok(provider) = provider else {
+            debug!(%session_id, "session namer: no usable provider, keeping derived title");
+            return;
+        };
+
+        let Some(candidate) =
+            dscode_core::session::namer::suggest_title(provider.as_ref(), &source).await
+        else {
+            return;
+        };
+
+        let sm_guard = state.session_manager.lock().await;
+        let Some(sm) = sm_guard.as_ref() else {
+            return;
+        };
+        match sm.replace_title_if_unchanged(&session_id, &derived, &candidate) {
+            Ok(true) => {
+                info!(%session_id, %candidate, "session: LLM-titled");
+                state.event_bus.emit_session_title(&session_id, candidate);
+            }
+            Ok(false) => {
+                debug!(%session_id, "session namer: title changed meanwhile, keeping it");
+            }
+            Err(e) => {
+                warn!(%session_id, error = %e, "session namer: could not apply title");
+            }
+        }
+    });
+}
+
+/// One image-generation turn: no agent loop, no chat completion.
+///
+/// Used when the session's model is an image model. The turn is deliberately
+/// short — the tool call *is* the whole turn — but it still emits the same
+/// `Token` … `Complete` sequence the frontend already listens for, so pointing a
+/// session at an image model needs no UI change. The assistant message it
+/// persists contains the tool's `dscode-image:` markdown, which the renderer
+/// turns into an actual `<img>` when the session is reopened.
+async fn run_image_turn(
+    state: Arc<AppState>,
+    session_id: String,
+    prompt: String,
+    model: String,
+    working_dir: PathBuf,
+) -> Result<(), String> {
+    use dscode_core::tools::trait_def::{Tool, ToolContext};
+
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+
+    // Generation takes tens of seconds, so forward the tool's progress events —
+    // otherwise the UI sits on one line looking hung.
+    let bus = state.event_bus.clone();
+    let fwd_sid = session_id.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(ev) = progress_rx.recv().await {
+            bus.emit_stream(&fwd_sid, ev);
+        }
+    });
+
+    state.event_bus.emit_stream(
+        &session_id,
+        StreamEvent::Token {
+            content: format!("正在用 `{model}` 生成图片…\n\n"),
+        },
+    );
+
+    let safety_guard = {
+        let config = state.config.lock().await;
+        Arc::new(dscode_core::safety::guard::SafetyGuard::from_config(&config))
+    };
+    let ctx = ToolContext::simple(
+        working_dir,
+        session_id.clone(),
+        "direct-image-turn",
+        progress_tx,
+        safety_guard,
+    );
+
+    // No `size`/`n`/`quality` here on purpose: the configured values are what the
+    // user chose in Settings, and the tool validates them against the model.
+    let outcome = dscode_core::tools::image::DoImageGenerate::new()
+        .execute(
+            serde_json::json!({ "prompt": prompt, "model": model }),
+            &ctx,
+        )
+        .await;
+
+    let text = match outcome {
+        Ok(r) if r.success => r.output,
+        Ok(r) => r.error.unwrap_or(r.output),
+        Err(e) => format!("生图失败：{e}"),
+    };
+
+    state.event_bus.emit_stream(
+        &session_id,
+        StreamEvent::Token {
+            content: text.clone(),
+        },
+    );
+
+    // A failed generation is persisted too: the transcript should read the same
+    // way it did on screen, and leaving the user's prompt with no reply is what
+    // makes people resend it.
+    {
+        let sm_guard = state.session_manager.lock().await;
+        let sm = sm_guard
+            .as_ref()
+            .ok_or_else(|| "Session manager not initialized".to_string())?;
+        persist_message(
+            sm,
+            &session_id,
+            &Message {
+                role: Role::Assistant,
+                content: MessageContent::Text(text),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                created_at: 0,
+            },
+        )?;
+    }
+
+    // `ctx` holds the progress sender; drop it first or the forwarder never ends.
+    drop(ctx);
+    let _ = forwarder.await;
+
+    state.event_bus.emit_stream(&session_id, StreamEvent::Complete { usage: None });
+    Ok(())
+}
 
 /// Send a user message to the agent and stream the response back to the
 /// frontend via `stream-event` Tauri events.
@@ -41,7 +210,12 @@ pub async fn send_message(
     // Load session first so provider uses session-bound model (not global only).
     state.ensure_session_manager().await?;
 
-    let (history, working_dir, full_message, session_model) = {
+    // Read the session under the lock, then release it before any file I/O.
+    // `build_message_with_attachments` does `create_dir_all` + `fs::copy` of up
+    // to 40 MiB per attachment; holding the *global* `session_manager` mutex
+    // across that froze every other command (list / rename / delete / persist
+    // for every session) for the whole copy.
+    let (history, working_dir, session_model) = {
         let sm_guard = state.session_manager.lock().await;
         let sm = sm_guard
             .as_ref()
@@ -50,7 +224,6 @@ pub async fn send_message(
         let session = sm
             .get_session(&session_id)?
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
-        let history = session.messages;
         let session_model = session.model.trim().to_string();
 
         let wd = if session.workspace.is_empty() {
@@ -59,16 +232,48 @@ pub async fn send_message(
             PathBuf::from(&session.workspace)
         };
 
-        let paths = attachments.unwrap_or_default();
-        let full_message = crate::attachments::build_message_with_attachments(
-            &message,
-            &paths,
-            &wd,
-            &session_id,
-        )?;
+        (session.messages, wd, session_model)
+    };
+
+    let paths = attachments.unwrap_or_default();
+    // Auto-name from user-visible text when possible
+    let title_src = if message.trim().is_empty() && !paths.is_empty() {
+        format!(
+            "附件: {}",
+            paths
+                .iter()
+                .filter_map(|p| PathBuf::from(p).file_name()?.to_str().map(|s| s.to_string()))
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        message.clone()
+    };
+
+    // Attachment staging is synchronous file I/O: run it on the blocking pool,
+    // with the session_manager lock released.
+    let full_message = {
+        let msg = message.clone();
+        let sid = session_id.clone();
+        let wd = working_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::attachments::build_message_with_attachments(&msg, &paths, &wd, &sid)
+        })
+        .await
+        .map_err(|e| format!("attachment staging panicked: {e}"))??
+    };
+
+    // Re-acquire only for the (fast) DB writes.
+    let auto_title = {
+        let sm_guard = state.session_manager.lock().await;
+        let sm = sm_guard
+            .as_ref()
+            .ok_or_else(|| "Session manager not initialized".to_string())?;
 
         // Persist the user message (with attachment context for history continuity).
-        sm.add_message(
+        persist_message(
+            sm,
             &session_id,
             &Message {
                 role: Role::User,
@@ -81,27 +286,56 @@ pub async fn send_message(
             },
         )?;
 
-        // Auto-name from user-visible text when possible
-        let title_src = if message.trim().is_empty() && !paths.is_empty() {
-            format!(
-                "附件: {}",
-                paths
-                    .iter()
-                    .filter_map(|p| PathBuf::from(p).file_name()?.to_str().map(|s| s.to_string()))
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        } else {
-            message.clone()
-        };
-        if let Ok(Some(new_title)) = sm.maybe_auto_title(&session_id, &title_src) {
-            info!(%session_id, %new_title, "session: auto-titled");
-            state.event_bus.emit_session_title(&session_id, new_title);
+        // `maybe_auto_title` returns `Some` only when the stored title was a
+        // placeholder, so it doubles as the gate for LLM naming: a title the
+        // user set by hand never gets here, and the returned string is exactly
+        // what the namer's compare-and-swap expects.
+        match sm.maybe_auto_title(&session_id, &title_src) {
+            Ok(Some(new_title)) => {
+                info!(%session_id, %new_title, "session: auto-titled");
+                state.event_bus.emit_session_title(&session_id, new_title.clone());
+                Some(new_title)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(%session_id, error = %e, "session: auto-title failed");
+                None
+            }
         }
-
-        (history, wd, full_message, session_model)
     };
+
+    // The deterministic title is already visible; improve on it with the model
+    // without making the turn wait for that call. Slash commands are left
+    // alone: the deterministic namer already turned them into a semantic title
+    // (the mode prefix, or the command's argument) and a model that never sees
+    // the command would drop that.
+    if let Some(derived) = auto_title.filter(|_| !title_src.trim_start().starts_with('/')) {
+        spawn_llm_title(state.clone(), session_id.clone(), title_src.clone(), derived);
+    }
+
+    // ── Direct image generation ──
+    //
+    // When the session's model *is* an image model, the message is a prompt: an
+    // image-only model rejects `/chat/completions` outright, so there is no agent
+    // loop to run. Route it straight to `/images/generations` and stream the
+    // result through the same event pipeline — the tool's output already carries
+    // the `dscode-image:` markdown the renderer understands, so the frontend
+    // needs no special case.
+    {
+        let model = {
+            let config = state.config.lock().await;
+            if session_model.trim().is_empty() {
+                config.default_model.clone()
+            } else {
+                session_model.clone()
+            }
+        };
+        if dscode_core::tools::image::is_image_model(&model) {
+            info!(%session_id, %model, "chat: session model is an image model — generating directly");
+            return run_image_turn(state.clone(), session_id.clone(), full_message.clone(), model, working_dir.clone())
+                .await;
+        }
+    }
 
     // Provider: session.model if set, else global default_model.
     let (
@@ -127,9 +361,14 @@ pub async fn send_message(
         let mut system_prompt = config
             .agent
             .resolve_system_prompt(dscode_core::agent::forge::DEFAULT_SYSTEM_PROMPT);
-        // Optional memory recall into system prompt
+        // Optional memory recall into system prompt.
+        //
+        // Must be `for_session`: the memory index is global, so an unscoped
+        // scribe recalls nothing (and warns) — and if it did recall, one
+        // conversation's facts would be injected into another's system prompt.
         if config.agent.memory_enabled {
-            if let Ok(scribe) = dscode_core::memory::scribe::Scribe::new() {
+            if let Ok(scribe) = dscode_core::memory::scribe::Scribe::for_session(session_id.clone())
+            {
                 let hits = scribe.recall(&message, 6);
                 if !hits.is_empty() {
                     system_prompt.push_str("\n\n## Memory recall (optional context)\n");
@@ -215,21 +454,32 @@ pub async fn send_message(
                         let now = chrono::Utc::now().timestamp();
                         // DB6: Persist accumulated thinking as one message.
                         if !thinking_buffer.is_empty() {
-                            sm.add_message(&persist_sid, &Message {
+                            let _ = persist_message(sm, &persist_sid, &Message {
                                 role: Role::Assistant,
                                 content: MessageContent::Text(String::new()),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
                                 created_at: now,
-                            }).ok();
+                            });
                         }
                         if !assistant_content.is_empty() {
-                            sm.add_message(&persist_sid, &Message {
+                            // This is the user's partial answer — losing it silently
+                            // is the bug this whole branch exists for.
+                            let partial = Message {
                                 role: Role::Assistant,
                                 content: MessageContent::Text(std::mem::take(&mut assistant_content)),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: None, created_at: now,
-                            }).ok();
+                            };
+                            if let Err(e) = persist_message(sm, &persist_sid, &partial) {
+                                error!(session = %persist_sid, %e, "chat: failed to persist partial answer on cancel");
+                                state_clone.event_bus.emit_stream(
+                                    &persist_sid,
+                                    StreamEvent::Error {
+                                        content: format!("⚠ 中止前的部分回复未能写入会话历史: {e}"),
+                                    },
+                                );
+                            }
                         }
                         // Incomplete tool batch: drop pending tool_calls so next turn
                         // does not send orphaned assistant(tool_calls) without results.
@@ -272,21 +522,21 @@ pub async fn send_message(
                                         // (before the first pending tool_call accumulates).
                                         if pending_tool_calls.is_empty() {
                                             if !thinking_buffer.is_empty() {
-                                                sm.add_message(&persist_sid, &Message {
+                                                let _ = persist_message(sm, &persist_sid, &Message {
                                                     role: Role::Assistant,
                                                     content: MessageContent::Text(String::new()),
                                                     name: None, tool_calls: None, tool_call_id: None,
                                                     reasoning_content: Some(std::mem::take(&mut thinking_buffer)),
                                                     created_at: now,
-                                                }).ok();
+                                                });
                                             }
                                             if !assistant_content.is_empty() {
-                                                sm.add_message(&persist_sid, &Message {
+                                                let _ = persist_message(sm, &persist_sid, &Message {
                                                     role: Role::Assistant,
                                                     content: MessageContent::Text(std::mem::take(&mut assistant_content)),
                                                     name: None, tool_calls: None, tool_call_id: None,
                                                     reasoning_content: None, created_at: now,
-                                                }).ok();
+                                                });
                                             }
                                         }
                                         // Buffer — do NOT write assistant(tool_calls) yet.
@@ -312,7 +562,7 @@ pub async fn send_message(
                                         // with all buffered tool_calls, then this tool result.
                                         // Never insert assistant between tool_calls and tools.
                                         if !pending_tool_calls.is_empty() {
-                                            sm.add_message(&persist_sid, &Message {
+                                            let _ = persist_message(sm, &persist_sid, &Message {
                                                 role: Role::Assistant,
                                                 content: MessageContent::Text(String::new()),
                                                 name: None,
@@ -320,7 +570,7 @@ pub async fn send_message(
                                                 tool_calls: Some(std::mem::take(&mut pending_tool_calls)),
                                                 reasoning_content: None,
                                                 created_at: now,
-                                            }).ok();
+                                            });
                                         }
                                         // Truncate huge tool results for SQLite (UI still gets full event)
                                         let store_result = if result.len() > 48_000 {
@@ -336,7 +586,7 @@ pub async fn send_message(
                                             tool_call_id: Some(id.clone()),
                                             reasoning_content: None, created_at: now,
                                         };
-                                        sm.add_message(&persist_sid, &tool_end).ok();
+                                        let _ = persist_message(sm, &persist_sid, &tool_end);
                                     }
                                 }
                             }
@@ -371,21 +621,33 @@ pub async fn send_message(
             let now = chrono::Utc::now().timestamp();
             // DB6: Persist any remaining accumulated thinking.
             if !thinking_buffer.is_empty() {
-                sm.add_message(&persist_sid, &Message {
+                let _ = persist_message(sm, &persist_sid, &Message {
                     role: Role::Assistant,
                     content: MessageContent::Text(String::new()),
                     name: None, tool_calls: None, tool_call_id: None,
                     reasoning_content: Some(thinking_buffer),
                     created_at: now,
-                }).ok();
+                });
             }
             if !assistant_content.is_empty() {
-                sm.add_message(&persist_sid, &Message {
+                // The turn's actual answer. If the DB write fails (e.g.
+                // SQLITE_BUSY under concurrent writers) the user must not be
+                // left believing it was saved — surface it on the stream.
+                let answer = Message {
                     role: Role::Assistant,
                     content: MessageContent::Text(assistant_content.clone()),
                     name: None, tool_calls: None, tool_call_id: None,
                     reasoning_content: None, created_at: now,
-                }).ok();
+                };
+                if let Err(e) = persist_message(sm, &persist_sid, &answer) {
+                    error!(session = %persist_sid, %e, "chat: failed to persist final assistant answer");
+                    state_clone.event_bus.emit_stream(
+                        &persist_sid,
+                        StreamEvent::Error {
+                            content: format!("⚠ 回复已生成但未能写入会话历史(可能数据库忙): {e}"),
+                        },
+                    );
+                }
             }
         }
         drop(sm_guard);
@@ -429,8 +691,9 @@ pub async fn abort(
         cp.stop_all().await;
     }
     if state.abort_forge(&session_id).await {
-        // Brief yield so cancel handlers can persist partial content.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // `abort_forge` already waited (bounded) for the cancelled turn to
+        // persist its partial content before hard-aborting; the old sleep(100ms)
+        // ran *after* the task was gone and bought nothing.
         info!(%session_id, "chat: forge task aborted");
     } else {
         info!(%session_id, "chat: no active forge for session");
@@ -644,12 +907,13 @@ pub async fn stage_upload(
                 }
             })
     };
-    crate::attachments::stage_bytes(
-        &name,
-        &bytes,
-        workspace.as_deref(),
-        &session_id,
-    )
+    // Up to 40 MiB of writes: keep them off the async executor (and the lock
+    // above is already released).
+    tokio::task::spawn_blocking(move || {
+        crate::attachments::stage_bytes(&name, &bytes, workspace.as_deref(), &session_id)
+    })
+    .await
+    .map_err(|e| format!("upload staging panicked: {e}"))?
 }
 
 /// Delete a skill package.
@@ -679,22 +943,39 @@ pub async fn delete_skill(name: String, root: Option<String>) -> Result<String, 
 
 /// Subscribe to real-time background task notifications.
 ///
-/// Spawns a background Tokio task that listens on the [`TaskManager`] broadcast
-/// channel and emits `task-notification` Tauri events to the frontend for each
-/// task start, progress, and completion. The frontend should call this once at
-/// startup to enable push-based task monitoring.
+/// Spawns **one** background Tokio task that listens on the [`TaskManager`]
+/// broadcast channel and emits task notifications on the shared [`EventBus`].
+/// The frontend calls this once at startup.
+///
+/// Idempotent: the handle is kept on [`AppState`], so repeated calls (the web
+/// API is reachable by any client) neither double every notification nor leak a
+/// never-cancelled forwarder per call.
 pub async fn subscribe_task_events(
     state: Arc<AppState>,
 ) -> Result<(), String> {
+    let mut slot = state.task_forwarder.lock().await;
+    if slot.as_ref().map(|h| !h.is_finished()).unwrap_or(false) {
+        return Ok(());
+    }
+
     let mut rx = state.task_manager.subscribe();
     let bus = state.event_bus.clone();
 
-    tokio::spawn(async move {
-        while let Ok(notification) = rx.recv().await {
-            bus.emit_task_notification(notification);
+    let handle = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(notification) => bus.emit_task_notification(notification),
+                // The old `while let Ok(..)` treated a lagged receiver as
+                // "sender closed" and ended the forwarder, silently disabling
+                // task notifications for the rest of the process. Recover.
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "task events: forwarder lagged, notifications dropped");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
-
+    *slot = Some(handle);
     Ok(())
 }
 

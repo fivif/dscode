@@ -31,6 +31,10 @@ const DEFAULT_MAGI_MAX_STEPS: u32 = 12;
 /// Max concurrent MAGI spirals when Teams is combined with /auto.
 const DEFAULT_MAX_PARALLEL: usize = 4;
 
+/// Single quality bar for accepting a subtask, used identically by the
+/// natural-stop path and the max-rounds path (previously 70 vs 60).
+pub const ACCEPT_QUALITY: f64 = 70.0;
+
 /// Errors that can occur during the auto-runner loop.
 #[derive(Debug, thiserror::Error)]
 pub enum AutoError {
@@ -53,6 +57,10 @@ pub enum AutoError {
     /// No subtasks were produced by the decomposer.
     #[error("decomposer produced no subtasks")]
     NoSubtasks,
+
+    /// The run was stopped by the caller's cancellation token.
+    #[error("cancelled by user")]
+    Cancelled,
 }
 
 /// A single subtask within the auto-runner's work plan.
@@ -127,6 +135,8 @@ pub struct AutoRunner {
     safety_guard: Arc<crate::safety::guard::SafetyGuard>,
     permission_hub: Option<Arc<crate::safety::permission::PermissionHub>>,
     permission_timeout_secs: u64,
+    /// Cooperative cancel, polled between subtasks/phases.
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl AutoRunner {
@@ -152,6 +162,7 @@ impl AutoRunner {
             safety_guard: Arc::new(crate::safety::guard::SafetyGuard::new(&[], false)),
             permission_hub: None,
             permission_timeout_secs: 120,
+            cancel_token: None,
         }
     }
 
@@ -177,6 +188,19 @@ impl AutoRunner {
     pub fn with_progress(mut self, tx: ProgressTx) -> Self {
         self.progress = Some(tx);
         self
+    }
+
+    /// Cooperative cancel — polled between subtasks and inside each spiral.
+    pub fn with_cancel_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false)
     }
 
     /// Enable Teams-style parallel MAGI for independent ready subtasks.
@@ -268,12 +292,25 @@ impl AutoRunner {
                 .to_string()
         };
         self.emit_token(mode_line);
-        let mut subtasks = decompose_task(&**self.runtime_provider, prd).await?;
-
-        if subtasks.is_empty() {
-            warn!(session = %session_id, "AutoRunner: no subtasks produced");
-            return Err(AutoError::NoSubtasks);
-        }
+        let mut subtasks = match decompose_task(&**self.runtime_provider, prd).await {
+            Ok(list) if !list.is_empty() => list,
+            Ok(_) => {
+                warn!(session = %session_id, "AutoRunner: decomposer produced no subtasks");
+                self.emit_token(
+                    "⚠️ Decomposer produced no subtasks — running the whole task as one subtask.\n\n",
+                );
+                vec![single_task(prd)]
+            }
+            Err(e) => {
+                // Previously terminal: one prose reply aborted the whole /auto
+                // even though the agent could have just executed the PRD.
+                warn!(session = %session_id, error = %e, "AutoRunner: decomposition failed");
+                self.emit_token(format!(
+                    "⚠️ Decomposition failed ({e}) — running the whole task as one subtask.\n\n"
+                ));
+                vec![single_task(prd)]
+            }
+        };
 
         info!(
             session = %session_id,
@@ -302,8 +339,21 @@ impl AutoRunner {
         let mut stall_detector = StallDetector::new(self.stall_rounds);
         let mut recompose_count = 0u32;
         let mut consecutive_recompose_failures = 0u32;
+        // Subtasks dropped by re-decomposition — kept so the final report and
+        // counters do not silently under-report failures.
+        let mut archived: Vec<Subtask> = Vec::new();
 
         loop {
+            if self.is_cancelled() {
+                warn!(session = %session_id, "AutoRunner: cancelled");
+                for s in subtasks.iter_mut() {
+                    if s.status == SubtaskStatus::Pending {
+                        s.status = SubtaskStatus::Failed("cancelled".into());
+                    }
+                }
+                break;
+            }
+
             let ready_indices = find_all_ready(&subtasks);
 
             if ready_indices.is_empty() {
@@ -422,13 +472,35 @@ impl AutoRunner {
                 );
 
                 match decompose_task(&**self.runtime_provider, &remaining_prd).await {
-                    Ok(new_subtasks) => {
-                        // Remove all non-Completed subtasks before appending new ones.
-                        // Only keep subtasks that are already Done.
+                    Ok(new_subtasks) if !new_subtasks.is_empty() => {
+                        // Archive every non-Done subtask (including its error
+                        // string) before it is dropped from the plan.
+                        archived.extend(
+                            subtasks
+                                .iter()
+                                .filter(|s| s.status != SubtaskStatus::Done)
+                                .cloned(),
+                        );
+                        // Remove all non-Done subtasks before appending new ones.
                         subtasks.retain(|s| s.status == SubtaskStatus::Done);
                         let next_id = subtasks.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+                        // Remap dependencies through the SAME id remapping as
+                        // the new tasks — otherwise deps point at unrelated
+                        // completed tasks (running too early) or at ids that no
+                        // longer exist (never ready → silently dropped).
+                        let id_map: std::collections::HashMap<usize, usize> = new_subtasks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, st)| (st.id, next_id + i))
+                            .collect();
                         for (i, mut st) in new_subtasks.into_iter().enumerate() {
                             st.id = next_id + i;
+                            st.dependencies = st
+                                .dependencies
+                                .iter()
+                                .filter_map(|d| id_map.get(d).copied())
+                                .filter(|d| *d != st.id)
+                                .collect();
                             st.status = SubtaskStatus::Pending;
                             subtasks.push(st);
                         }
@@ -439,6 +511,18 @@ impl AutoRunner {
                             pending_count = subtasks.iter().filter(|s| s.status == SubtaskStatus::Pending).count(),
                             "AutoRunner: re-decomposed remaining work"
                         );
+                    }
+                    Ok(_) => {
+                        consecutive_recompose_failures += 1;
+                        warn!(
+                            session = %session_id,
+                            consecutive_failures = consecutive_recompose_failures,
+                            "AutoRunner: re-decomposition produced no subtasks"
+                        );
+                        if consecutive_recompose_failures >= 3 {
+                            break;
+                        }
+                        stall_detector.reset();
                     }
                     Err(e) => {
                         consecutive_recompose_failures += 1;
@@ -464,6 +548,18 @@ impl AutoRunner {
             }
         }
 
+        // A cancelled run is not a successful run — report it as cancelled
+        // rather than as "all done" with everything marked Failed.
+        if self.is_cancelled() {
+            warn!(session = %session_id, "AutoRunner: run cancelled by user");
+            self.emit_token("\n⏹ /auto cancelled — stopping before the remaining subtasks.\n\n");
+            return Err(AutoError::Cancelled);
+        }
+
+        // Fold superseded subtasks back in so failures are not under-reported.
+        let archived_n = archived.len();
+        subtasks.extend(archived);
+
         let all_done = subtasks
             .iter()
             .all(|s| s.status == SubtaskStatus::Done);
@@ -488,7 +584,7 @@ impl AutoRunner {
             failed: fail_n,
         });
         self.emit_token(format!(
-            "\n---\n### /auto complete\n\n- Done: {done_n}\n- Failed: {fail_n}\n- Avg quality: {total_quality:.1}/100\n- Stalled: {stalled}\n\n"
+            "\n---\n### /auto complete\n\n- Done: {done_n}\n- Failed: {fail_n}\n- Avg quality: {total_quality:.1}/100\n- Stalled: {stalled}\n- Superseded by re-planning: {archived_n}\n\n"
         ));
 
         Ok(AutoRunResult {
@@ -519,6 +615,15 @@ impl AutoRunner {
 
         use futures::stream::{FuturesUnordered, StreamExt};
 
+        // Parallel spirals share this working directory; one lock serializes
+        // their write-capable tool calls so two subtasks cannot clobber the
+        // same files (last-writer-wins while both report success).
+        let write_lock: Option<Arc<tokio::sync::Mutex<()>>> = if jobs.len() > 1 {
+            Some(Arc::new(tokio::sync::Mutex::new(())))
+        } else {
+            None
+        };
+
         let mut futs = FuturesUnordered::new();
         for (task_idx, task_id, task_desc, agent_id) in jobs {
             let provider = Arc::clone(&self.provider);
@@ -537,6 +642,8 @@ impl AutoRunner {
             let task_id = *task_id;
             let task_desc = task_desc.clone();
             let agent_id = agent_id.clone();
+            let cancel = self.cancel_token.clone();
+            let lock = write_lock.clone();
 
             futs.push(async move {
                 let mut scheduler = MagiScheduler::from_arc_providers(
@@ -547,6 +654,12 @@ impl AutoRunner {
                 .with_safety_guard(safety)
                 .with_permission_hub(hub)
                 .with_permission_timeout(pto);
+                if let Some(t) = cancel {
+                    scheduler = scheduler.with_cancel_token(t);
+                }
+                if let Some(l) = lock {
+                    scheduler = scheduler.with_write_lock(l);
+                }
                 if let Some(tx) = progress {
                     scheduler = scheduler.with_progress(crate::magi::execute::MagiProgress {
                         tx,
@@ -586,6 +699,10 @@ impl AutoRunner {
         .with_safety_guard(Arc::clone(&self.safety_guard))
         .with_permission_hub(self.permission_hub.clone())
         .with_permission_timeout(self.permission_timeout_secs);
+
+        if let Some(ref t) = self.cancel_token {
+            scheduler = scheduler.with_cancel_token(t.clone());
+        }
 
         if let Some(ref tx) = self.progress {
             scheduler = scheduler.with_progress(crate::magi::execute::MagiProgress {
@@ -642,7 +759,7 @@ impl AutoRunner {
                     .map(|r| r.promotion.should_stop)
                     .unwrap_or(false);
 
-                if naturally_done || last_quality >= 70.0 {
+                if naturally_done || last_quality >= ACCEPT_QUALITY {
                     subtasks[task_idx].status = SubtaskStatus::Done;
                     info!(
                         session = %session_id,
@@ -689,7 +806,8 @@ impl AutoRunner {
                     .map(|r| r.promotion.quality_score)
                     .unwrap_or(0.0);
                 stall_detector.record(last_quality);
-                if last_quality >= 60.0 {
+                // Same quality bar as the natural-stop path.
+                if last_quality >= ACCEPT_QUALITY {
                     subtasks[task_idx].status = SubtaskStatus::Done;
                     self.emit(StreamEvent::TeamAgentEnd {
                         agent_id: agent_id.to_string(),
@@ -712,11 +830,20 @@ impl AutoRunner {
                 all_rounds.push(rounds);
             }
             Err(e) => {
+                // Provider/parse/cancel failures now carry the rounds that had
+                // already completed — keep them instead of wiping history.
+                let rounds = e.rounds().to_vec();
+                let last_quality = rounds
+                    .last()
+                    .map(|r| r.promotion.quality_score)
+                    .unwrap_or(0.0);
+                let salvaged = rounds.len();
                 subtasks[task_idx].status = SubtaskStatus::Failed(format!("auto error: {e}"));
                 warn!(
                     session = %session_id,
                     subtask_id = task_id,
                     error = %e,
+                    salvaged_rounds = salvaged,
                     "AutoRunner: subtask failed"
                 );
                 self.emit(StreamEvent::TeamAgentEnd {
@@ -724,10 +851,26 @@ impl AutoRunner {
                     success: false,
                     summary: e.to_string(),
                 });
-                all_rounds.push(vec![]);
-                stall_detector.record(0.0);
+                if salvaged > 0 {
+                    self.emit_token(format!(
+                        "⚠️ Subtask #{task_id} failed after {salvaged} completed round(s) (last quality {last_quality:.0}/100): {e}\n\n"
+                    ));
+                }
+                all_rounds.push(rounds);
+                stall_detector.record(if salvaged > 0 { last_quality } else { 0.0 });
             }
         }
+    }
+}
+
+/// Single-subtask fallback used when decomposition fails or yields nothing —
+/// the agent can still execute the raw PRD directly.
+fn single_task(prd: &str) -> Subtask {
+    Subtask {
+        id: 1,
+        description: prd.to_string(),
+        dependencies: Vec::new(),
+        status: SubtaskStatus::Pending,
     }
 }
 
@@ -766,6 +909,11 @@ fn find_all_ready(subtasks: &[Subtask]) -> Vec<usize> {
 }
 
 /// Find the next subtask that is ready to execute (all dependencies satisfied).
+///
+/// Only the tests call this — the run loop uses `find_all_ready` and schedules
+/// the whole batch — but the tests are the spec for `find_all_ready`'s
+/// semantics, so it stays alongside them rather than being deleted.
+#[cfg(test)]
 fn find_next_ready(subtasks: &[Subtask]) -> Option<usize> {
     find_all_ready(subtasks).into_iter().next()
 }

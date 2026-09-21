@@ -1,6 +1,8 @@
 //! TeamRuntime — sole production orchestrator for pure `/teams` mode (v2).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -25,6 +27,26 @@ use super::role::{tool_names_for_role, AgentRole, RoleToolPolicy};
 use super::schema::{
     fallback_task, parse_decompose, parse_synthesize, prefer_skip_research, SchemaError,
 };
+
+/// Removes this session's control-plane entry when `run` returns — normally,
+/// early, or by future-drop (abort/cancel). Without this, an aborted teams run
+/// leaves a stale `TeamControlPlane` (and phantom `AgentHandle`s) in the
+/// process-wide registry forever.
+struct ControlPlaneGuard {
+    session_id: String,
+}
+
+impl Drop for ControlPlaneGuard {
+    fn drop(&mut self) {
+        let sid = self.session_id.clone();
+        // Drop may run during runtime shutdown, where spawning would panic.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                global_control_planes().remove(&sid).await;
+            });
+        }
+    }
+}
 
 /// Runtime dependencies for a teams session.
 pub struct TeamRuntime {
@@ -87,6 +109,9 @@ impl TeamRuntime {
         }
 
         let cp = global_control_planes().get_or_create(session_id).await;
+        let _cp_guard = ControlPlaneGuard {
+            session_id: session_id.to_string(),
+        };
         let session_token = tokio_util::sync::CancellationToken::new();
         cp.begin_session(session_token.child_token()).await;
 
@@ -151,7 +176,27 @@ impl TeamRuntime {
             initial_tasks.push(fallback_task(task));
         }
         if initial_tasks.len() > max_agents {
-            initial_tasks.truncate(max_agents);
+            // Truncation can drop a task that surviving tasks name as a
+            // dependency → those dependents hit `is_schedulable`'s missing-dep
+            // path and are silently never scheduled. Drop dependents together
+            // with what they depend on.
+            warn!(
+                planned = initial_tasks.len(),
+                max_agents, "teams plan exceeds max_agents — dropping tail tasks and their dependents"
+            );
+            let mut keep: Vec<TaskSpec> = initial_tasks.drain(..max_agents).collect();
+            loop {
+                let kept_ids: HashSet<String> = keep.iter().map(|t| t.id.clone()).collect();
+                let before = keep.len();
+                keep.retain(|t| t.dependencies.iter().all(|d| kept_ids.contains(d)));
+                if keep.len() == before {
+                    break;
+                }
+            }
+            initial_tasks = keep;
+            if initial_tasks.is_empty() {
+                initial_tasks.push(fallback_task(task));
+            }
         }
 
         board.upsert_many(initial_tasks).map_err(|e| {
@@ -365,6 +410,7 @@ impl TeamRuntime {
                 );
                 let own = ownership.clone();
                 let cp_agent = cp.clone();
+                let teams_cfg = cfg.clone();
                 let (cancel, nudge, _notify) =
                     cp.register(agent_id.clone(), tid.clone()).await;
 
@@ -384,6 +430,7 @@ impl TeamRuntime {
                         tx.clone(),
                         cancel,
                         nudge,
+                        teams_cfg,
                     )
                     .await;
                     own.lock().await.release(&agent_id);
@@ -510,6 +557,7 @@ async fn run_sub_agent(
     event_tx: mpsc::UnboundedSender<StreamEvent>,
     cancel: tokio_util::sync::CancellationToken,
     nudge: Arc<tokio::sync::Mutex<Vec<String>>>,
+    teams_config: TeamsConfig,
 ) -> Result<String, String> {
     let mut forge = Forge::new(provider, tools, working_dir)
         .with_system_prompt(system)
@@ -517,7 +565,11 @@ async fn run_sub_agent(
         .with_max_iterations(max_iterations)
         .with_safety_guard(safety_guard)
         .with_cancel_token(cancel.clone())
-        .with_nudge_queue(nudge);
+        .with_nudge_queue(nudge)
+        // Ownership flags must reach Forge so `ToolContext` can enforce them;
+        // Forge currently reads none of these when building ToolContext (see
+        // report: needs agent/** change).
+        .with_teams_config(teams_config);
     if let Some(hub) = permission_hub {
         forge = forge.with_permission_hub(hub);
     }
@@ -525,7 +577,13 @@ async fn run_sub_agent(
 
     let (stx, mut srx) = mpsc::unbounded_channel();
     let out_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+    // Fatal diagnostics only — never counted as success evidence.
+    let err_buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+    // Only `StreamEvent::Token` proves the agent produced a real answer.
+    let had_token = Arc::new(AtomicBool::new(false));
     let out_for_drain = out_buf.clone();
+    let err_for_drain = err_buf.clone();
+    let tok_for_drain = had_token.clone();
     let aid = agent_id.clone();
     let tx_d = event_tx.clone();
 
@@ -533,6 +591,7 @@ async fn run_sub_agent(
         while let Some(ev) = srx.recv().await {
             match ev {
                 StreamEvent::Token { content } => {
+                    tok_for_drain.store(true, Ordering::Relaxed);
                     out_for_drain.lock().await.push_str(&content);
                     let _ = tx_d.send(StreamEvent::TeamAgentOutput {
                         agent_id: aid.clone(),
@@ -548,7 +607,14 @@ async fn run_sub_agent(
                     });
                 }
                 StreamEvent::Error { content } => {
-                    out_for_drain.lock().await.push_str(&content);
+                    // Record for the failure reason and surface it — previously
+                    // this text was pushed into `out_buf`, which made every
+                    // fatal sub-agent error look like non-empty "output".
+                    err_for_drain.lock().await.push_str(&content);
+                    let _ = tx_d.send(StreamEvent::TeamAgentOutput {
+                        agent_id: aid.clone(),
+                        content: format!("⚠️ {content}\n"),
+                    });
                 }
                 _ => {}
             }
@@ -575,14 +641,23 @@ async fn run_sub_agent(
             res
         } => {
             let out = out_buf.lock().await.clone();
+            let had = had_token.load(Ordering::Relaxed);
             match joined {
-                Ok(()) => Ok(out),
+                // Success requires either a real token stream or at least some
+                // observable output; an empty run is reported as empty.
+                Ok(()) if had || !out.trim().is_empty() => Ok(out),
+                Ok(()) => Ok("(sub-agent produced no output)".to_string()),
                 Err(crate::agent::forge::ForgeError::Cancelled) => Err("cancelled".into()),
                 Err(e) => {
-                    if out.is_empty() {
+                    let err = err_buf.lock().await.clone();
+                    let err = err.trim();
+                    if err.is_empty() {
                         Err(e.to_string())
                     } else {
-                        Ok(out)
+                        Err(format!(
+                            "{e} — {}",
+                            err.chars().take(500).collect::<String>()
+                        ))
                     }
                 }
             }

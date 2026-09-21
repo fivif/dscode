@@ -25,6 +25,17 @@ pub enum ServerEvent {
 }
 
 /// Fan-out bus. Cloning is cheap (it clones the underlying `broadcast::Sender`).
+///
+/// **Consumer contract:** the channel holds 8192 events for *all* sessions, so a
+/// slow consumer will eventually see [`broadcast::error::RecvError::Lagged`] —
+/// a chatty session's `ToolProgress` flood can evict a quiet session's
+/// `Complete`/`PermissionRequest`. `Lagged` is recoverable: every consumer must
+/// `continue` on it (and, where possible, tell its client it missed events) and
+/// only stop on `Closed`. A `while let Ok(..)` loop silently stops forwarding
+/// forever on the first lag — that was a real bug in both shells.
+///
+/// Session scoping (one buffer per session/owner) would remove the cross-session
+/// eviction entirely; it needs a per-session fan-out and is not implemented here.
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<ServerEvent>,

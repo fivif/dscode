@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use tracing::{debug, warn};
 
 #[allow(unused_imports)]
@@ -17,7 +18,7 @@ use crate::tools::registry::ToolRegistry;
 #[allow(unused_imports)]
 use crate::safety::guard::SafetyGuard;
 use crate::safety::permission::PermissionHub;
-use crate::tools::trait_def::{ToolContext, ToolError};
+use crate::tools::trait_def::ToolContext;
 
 const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 
@@ -94,8 +95,12 @@ pub async fn execute_subtask(
     safety_guard: Arc<SafetyGuard>,
     permission_hub: Option<Arc<PermissionHub>>,
     permission_timeout_secs: u64,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    write_lock: Option<&Arc<tokio::sync::Mutex<()>>>,
 ) -> Result<String, MagiError> {
     let tool_defs = tools.to_openai_tools();
+    // A zero step budget would silently do no work at all.
+    let max_steps = max_steps.max(1);
 
     // Build conversation messages
     let mut messages = Vec::new();
@@ -124,9 +129,15 @@ pub async fn execute_subtask(
         reasoning_content: None, created_at: 0, });
 
     let mut final_output = String::new();
+    let mut empty_responses = 0u32;
 
     // ── ReAct loop ──
     for step in 1..=max_steps {
+        // Cooperative cancel — checked before every LLM call and tool batch.
+        if cancel.map(|t| t.is_cancelled()).unwrap_or(false) {
+            return Err(MagiError::cancelled());
+        }
+
         // Shared position-aware validator (same fix as forge.rs) so the provider
         // never receives an assistant(tool_calls) without its Tool responses.
         messages = crate::agent::forge::validate_tool_chain_for_provider(messages);
@@ -150,7 +161,7 @@ pub async fn execute_subtask(
         .await
         {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(MagiError::Provider(e)),
+            Ok(Err(e)) => return Err(MagiError::provider(e)),
             Err(_) => {
                 warn!(
                     session = %session_id,
@@ -163,7 +174,7 @@ pub async fn execute_subtask(
                         "Auto step {step}: LLM call timed out after {CHAT_TIMEOUT_SECS}s"
                     ));
                 }
-                return Err(MagiError::Parse(format!(
+                return Err(MagiError::parse(format!(
                     "Auto LLM call timed out after {CHAT_TIMEOUT_SECS}s (step {step})"
                 )));
             }
@@ -230,6 +241,8 @@ pub async fn execute_subtask(
                     safety_guard.clone(),
                     permission_hub.clone(),
                     permission_timeout_secs,
+                    progress,
+                    write_lock,
                 )
                 .await;
 
@@ -280,28 +293,71 @@ pub async fn execute_subtask(
             return Ok(final_output);
         }
 
-        // Empty response (no content, no tool calls) — treat as a warning but continue.
+        // Empty response (no content, no tool calls) — nudge once with backoff
+        // instead of immediately re-sending the identical request.
+        empty_responses += 1;
         warn!(
             session = %session_id,
             step,
-            "Balthasar: model returned empty response, retrying"
+            empty_responses,
+            "Balthasar: model returned empty response, nudging"
         );
-        // Don't fail immediately — give the model another chance.
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text(
+                "(Your previous reply was empty. Either call a tool to make progress, \
+                 or write a concrete summary of the work. Do not reply with an empty message.)"
+                    .into(),
+            ),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            created_at: 0,
+        });
+        if let Some(p) = progress {
+            p.heartbeat(format!("Auto step {step}: empty response — retrying"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500 * empty_responses.min(4) as u64))
+            .await;
     }
 
-    // Max steps exhausted — return whatever output we have.
+    // Max steps exhausted without a final answer. This is a failure, not a
+    // successful execution — grading a placeholder as the work product is how
+    // silent zero-work rounds reached "done".
     warn!(
         session = %session_id,
         steps = max_steps,
-        "Balthasar: max steps reached, returning accumulated output"
+        "Balthasar: max steps reached without a final answer"
     );
-    if final_output.is_empty() {
-        final_output = "(Auto produced no output within the step budget)".to_string();
-    }
     if let Some(p) = progress {
         p.heartbeat(format!("Auto hit step budget ({max_steps})"));
     }
-    Ok(final_output)
+    if final_output.is_empty() {
+        Err(MagiError::parse(format!(
+            "no output within the step budget ({max_steps} steps)"
+        )))
+    } else {
+        Err(MagiError::parse(format!(
+            "no final answer within the step budget ({max_steps} steps); partial output: {}",
+            final_output.chars().take(300).collect::<String>()
+        )))
+    }
+}
+
+/// Conservative write classification: only known read-only tools skip the
+/// cross-spiral write lock (unknown tools are treated as writes).
+fn is_write_tool(name: &str) -> bool {
+    !matches!(
+        name,
+        "do_file_read"
+            | "do_web_fetch"
+            | "do_web_search"
+            | "do_deep_search"
+            | "do_rss_read"
+            | "do_skill_list"
+            | "do_task_status"
+    )
 }
 
 /// Execute a single tool call on behalf of Balthasar and return the
@@ -314,6 +370,8 @@ async fn execute_balthasar_tool(
     safety_guard: Arc<SafetyGuard>,
     permission_hub: Option<Arc<PermissionHub>>,
     permission_timeout_secs: u64,
+    progress: Option<&MagiProgress>,
+    write_lock: Option<&Arc<tokio::sync::Mutex<()>>>,
 ) -> String {
     let tool_name = &tc.function.name;
 
@@ -328,27 +386,40 @@ async fn execute_balthasar_tool(
         }
     };
 
-    // Forward permission events to progress channel if present via ctx.sender.
-    // Drain other tool-internal events (avoid "dropped receiver" warnings).
+    // Forward permission prompts to the live UI channel so a Confirm-level
+    // command can actually be approved; just draining them made every prompt
+    // block for `permission_timeout_secs` and then deny.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sid = session_id.to_string();
     let tname = tool_name.clone();
+    let fwd: Option<(MagiProgressTx, String)> =
+        progress.map(|p| (p.tx.clone(), p.agent_id.clone()));
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            // Permission requests need a live UI — log if dropped
-            if matches!(event, StreamEvent::PermissionRequest { .. }) {
-                warn!(
+            if matches!(&event, StreamEvent::PermissionRequest { .. }) {
+                match &fwd {
+                    Some((tx, agent_id)) => {
+                        let _ = tx.send(StreamEvent::TeamAgentOutput {
+                            agent_id: agent_id.clone(),
+                            content: "🔐 permission requested — awaiting confirmation\n".into(),
+                        });
+                        // The real prompt, so the UI can render + approve it.
+                        let _ = tx.send(event);
+                    }
+                    None => warn!(
+                        session = %sid,
+                        tool = %tname,
+                        "Balthasar: permission request with no UI channel — will be denied on timeout"
+                    ),
+                }
+            } else {
+                debug!(
                     session = %sid,
                     tool = %tname,
-                    "Balthasar: permission request in auto path (no interactive UI) — may deny"
+                    event = ?event,
+                    "Balthasar: tool event consumed"
                 );
             }
-            debug!(
-                session = %sid,
-                tool = %tname,
-                event = ?event,
-                "Balthasar: tool event consumed"
-            );
         }
     });
 
@@ -362,9 +433,19 @@ async fn execute_balthasar_tool(
     ctx.permission_hub = permission_hub;
     ctx.permission_timeout_secs = permission_timeout_secs;
 
+    // Parallel spirals share one checkout: serialize mutating tools so two
+    // Balthasar rounds cannot interleave writes to the same files.
+    let _write_guard = match (write_lock, is_write_tool(tool_name)) {
+        (Some(lock), true) => Some(lock.lock().await),
+        _ => None,
+    };
+
     let fut = tools.execute(tool_name, args, &ctx);
-    match tokio::time::timeout(std::time::Duration::from_secs(TOOL_TIMEOUT_SECS), fut).await {
-        Ok(Ok(result)) => {
+    // A panicking tool would otherwise unwind the whole concurrent batch,
+    // killing sibling spirals mid-write. Convert a panic into a tool error.
+    let guarded = std::panic::AssertUnwindSafe(fut).catch_unwind();
+    match tokio::time::timeout(std::time::Duration::from_secs(TOOL_TIMEOUT_SECS), guarded).await {
+        Ok(Ok(Ok(result))) => {
             let raw = if result.success {
                 result.output
             } else {
@@ -377,7 +458,8 @@ async fn execute_balthasar_tool(
                 raw
             }
         }
-        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(Err(e))) => e.to_string(),
+        Ok(Err(_panic)) => format!("Tool '{tool_name}' panicked while executing"),
         Err(_) => format!(
             "Tool '{}' timed out after {}s",
             tool_name, TOOL_TIMEOUT_SECS
@@ -515,6 +597,8 @@ mod tests {
             Arc::new(SafetyGuard::new(&[], true)),
             None,
             120,
+            None,
+            None,
         )
         .await;
 
@@ -563,6 +647,8 @@ mod tests {
             Arc::new(SafetyGuard::new(&[], true)),
             None,
             120,
+            None,
+            None,
         )
         .await;
 
@@ -607,15 +693,17 @@ mod tests {
             Arc::new(SafetyGuard::new(&[], true)),
             None,
             120,
+            None,
+            None,
         )
         .await;
 
-        // Should succeed but with accumulated output warning
-        assert!(result.is_ok());
-        let output = result.unwrap();
+        // Step-budget exhaustion is a failure, not a successful execution.
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
         assert!(
-            output.contains("step budget") || output.is_empty(),
-            "expected step budget warning or empty output"
+            msg.contains("step budget"),
+            "expected step budget error, got: {msg}"
         );
     }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -11,6 +12,12 @@ use dscode_core::safety::permission::PermissionHub;
 use dscode_core::session::manager::SessionManager;
 use dscode_core::tools::registry::ToolRegistry;
 use dscode_core::tools::background::TaskManager;
+
+/// How long a cancelled turn gets to persist its partial answer before the
+/// task is hard-aborted. The cancel branch in `commands::chat` writes the
+/// accumulated assistant/thinking content, so aborting immediately (as the
+/// old code did) reliably lost it.
+const ABORT_GRACE: Duration = Duration::from_secs(2);
 
 /// Handle to an in-progress forge task with cancellation support.
 pub struct ActiveForge {
@@ -55,6 +62,15 @@ pub struct AppState {
 
     /// Unified event bus (stream / title / task notifications) relayed by the shell.
     pub event_bus: EventBus,
+
+    /// The single background task-notification forwarder, so
+    /// `subscribe_task_events` is idempotent instead of spawning one
+    /// never-cancelled task per call.
+    pub(crate) task_forwarder: Mutex<Option<tokio::task::JoinHandle<()>>>,
+
+    /// Set when `session.retention_days` changed while a turn was in flight;
+    /// applied by [`AppState::ensure_session_manager`] once nothing is running.
+    pub(crate) retention_reset_pending: AtomicBool,
 }
 
 impl AppState {
@@ -69,7 +85,10 @@ impl AppState {
         let permission_hub = PermissionHub::shared();
 
         let mut tool_registry = ToolRegistry::new();
-        tool_registry.register_default_tools();
+        // Honour `[generation] image_enabled`: disabled means the tool is not
+        // registered at all, so it costs no definition tokens and the model
+        // cannot call it.
+        tool_registry.register_default_tools_with_image(config.generation.image_enabled);
         let live = task_manager.live_handle();
         tool_registry.register(dscode_core::tools::background::DoBackground::new(
             handle.clone(),
@@ -93,31 +112,56 @@ impl AppState {
             permission_hub,
             teams_mode: AtomicBool::new(false),
             event_bus: EventBus::new(),
+            task_forwarder: Mutex::new(None),
+            retention_reset_pending: AtomicBool::new(false),
         }
     }
 
     /// Register a forge for a session, cancelling only a previous run on the
     /// **same** session (other sessions keep running).
     pub async fn set_active_forge(&self, session_id: String, forge: ActiveForge) {
-        let mut map = self.active_forges.lock().await;
-        if let Some(old) = map.remove(&session_id) {
-            old.cancel.cancel();
-            old.handle.abort();
+        let old = {
+            let mut map = self.active_forges.lock().await;
+            let old = map.remove(&session_id);
+            map.insert(session_id, forge);
+            old
+        };
+        // Retire the replaced run outside the lock: cancel it, then let it
+        // persist its partial answer in the background so the new turn starts
+        // without waiting (the old code hard-aborted immediately, which made
+        // the cancel-branch persistence dead code and lost the partial answer).
+        if let Some(old) = old {
+            tokio::spawn(Self::retire(old));
         }
-        map.insert(session_id, forge);
     }
 
     /// Abort one session's forge (or all if `session_id` is None — unused).
     pub async fn abort_forge(&self, session_id: &str) -> bool {
-        let mut map = self.active_forges.lock().await;
-        if let Some(active) = map.remove(session_id) {
-            active.cancel.cancel();
-            if !active.handle.is_finished() {
-                active.handle.abort();
+        let active = {
+            let mut map = self.active_forges.lock().await;
+            map.remove(session_id)
+        };
+        match active {
+            Some(active) => {
+                Self::retire(active).await;
+                true
             }
-            true
-        } else {
-            false
+            None => false,
+        }
+    }
+
+    /// Cancel a forge and wait — bounded — for its event loop to persist the
+    /// accumulated partial answer, then hard-abort if it is still running.
+    /// Never called while holding `active_forges`.
+    async fn retire(active: ActiveForge) {
+        active.cancel.cancel();
+        let mut handle = active.handle;
+        if tokio::time::timeout(ABORT_GRACE, &mut handle).await.is_err() {
+            tracing::warn!(
+                grace_ms = ABORT_GRACE.as_millis() as u64,
+                "forge did not stop after cancel; aborting task"
+            );
+            handle.abort();
         }
     }
 
@@ -154,8 +198,16 @@ impl AppState {
     /// Uses `spawn_blocking` to avoid blocking the async runtime on
     /// synchronous SQLite I/O during initialization.
     pub async fn ensure_session_manager(&self) -> Result<(), String> {
+        // Apply a retention change that was deferred while a turn was running
+        // (see `commands::config::update_config`). Re-initialize in place
+        // rather than dropping to `None`: a concurrent persist that acquires
+        // the lock afterwards then still writes through a working connection
+        // instead of silently discarding the row.
+        let no_active_turns = self.active_forges.lock().await.is_empty();
+        let force = self.retention_reset_pending.load(Ordering::SeqCst) && no_active_turns;
+
         let mut guard = self.session_manager.lock().await;
-        if guard.is_none() {
+        if force || guard.is_none() {
             let retention_days = {
                 let cfg = self.config.lock().await;
                 cfg.session.retention_days
@@ -167,6 +219,10 @@ impl AppState {
             .map_err(|e| format!("spawn_blocking panicked: {}", e))?
             .map_err(|e| format!("SessionManager init failed: {}", e))?;
             *guard = Some(mgr);
+            if force {
+                self.retention_reset_pending.store(false, Ordering::SeqCst);
+                tracing::info!("session manager re-initialized for new retention setting");
+            }
         }
         Ok(())
     }

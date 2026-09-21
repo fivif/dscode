@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import type { ComponentType } from 'react';
 import { useChatStore } from '@/stores/chatStore';
 import { useConfigStore } from '@/stores/configStore';
 import { useSessionStore } from '@/stores/sessionStore';
@@ -10,7 +11,22 @@ import {
   resolveProviderForModel,
   type ModelOption,
 } from '@/lib/models';
-import { AttachmentKindIcon, IconPaperclip, IconX } from '@/components/icons';
+import {
+  AttachmentKindIcon,
+  IconClose16,
+  IconExpand16,
+  IconFileText16,
+  IconFolder16,
+  IconLock16,
+  IconPaperclip16,
+  IconRefresh16,
+  IconSend16,
+  IconSparkles16,
+  IconStop16,
+  IconSun16,
+  IconUnlock16,
+  IconUsers16,
+} from '@/components/icons';
 
 const MAX_ATTACH = 20;
 const MAX_BYTES = 40 * 1024 * 1024;
@@ -47,8 +63,8 @@ type SlashItem = {
   cmd: string;
   desc: string;
   kind: 'builtin' | 'skill';
-  /** Heroicon-style path d for builtin icons */
-  icon?: string;
+  /** Icon component for builtin commands (skills use the sparkles glyph). */
+  icon?: ComponentType<{ className?: string; size?: number }>;
 };
 
 const BUILTIN_COMMANDS: SlashItem[] = [
@@ -56,19 +72,27 @@ const BUILTIN_COMMANDS: SlashItem[] = [
     cmd: '/plan',
     desc: '五阶段需求评审 — 深度访谈生成 PRD',
     kind: 'builtin',
-    icon: 'M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z',
+    icon: IconFileText16,
   },
   {
     cmd: '/auto',
     desc: 'Auto 螺旋（开 TEAM 时并行子任务）',
     kind: 'builtin',
-    icon: 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15',
+    icon: IconRefresh16,
   },
   {
     cmd: '/teams',
     desc: 'Teams 多 Agent；与 /auto 可同时开',
     kind: 'builtin',
-    icon: 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z',
+    icon: IconUsers16,
+  },
+  {
+    // Kept last so adding it doesn't shift the position of the three mode
+    // commands users already reach by muscle memory (↓ × N + Enter).
+    cmd: '/compact',
+    desc: '立即压缩上下文 — 手动触发，不等自动阈值',
+    kind: 'builtin',
+    icon: IconExpand16,
   },
 ];
 
@@ -81,30 +105,6 @@ function skillToSlashItem(s: SkillInfo): SlashItem {
     desc: desc.length > 80 ? desc.slice(0, 80) + '…' : desc,
     kind: 'skill',
   };
-}
-
-/** Sparkles icon for Agent Skills (matches sidebar). */
-function SkillSparklesIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden
-    >
-      <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
-      <path d="M20 3v4" />
-      <path d="M22 5h-4" />
-      <path d="M4 17v2" />
-      <path d="M5 18H3" />
-    </svg>
-  );
 }
 
 export default function InputBox() {
@@ -166,10 +166,15 @@ export default function InputBox() {
     [messages],
   );
 
-  // Reset history browse + pending attachments when session changes
+  // Reset history browse + pending attachments when session changes.
+  // The draft goes too: keeping the text but dropping its attachments meant the
+  // next Enter sent "总结这个文件" to an agent that never received the file.
   useEffect(() => {
     setHistoryNav(-1);
     draftBeforeHistory.current = '';
+    setInput('');
+    setShowSlashMenu(false);
+    savedInputRef.current = '';
     setAttachments((prev) => {
       prev.forEach((a) => a.previewUrl?.startsWith('blob:') && URL.revokeObjectURL(a.previewUrl));
       return [];
@@ -369,7 +374,7 @@ export default function InputBox() {
     else label = String(Math.round(pct));
     return { ctxPct: pct, ctxTokens: tokens, ctxLabel: label };
   }, [messages, contextWindow, contextUsage]);
-  const ctxColor = ctxPct > 80 ? '#ef4444' : ctxPct > 50 ? '#f59e0b' : '#10b981';
+  const ctxStroke = ctxPct > 80 ? 'stroke-danger' : ctxPct > 50 ? 'stroke-warning' : 'stroke-success';
   const circumference = 2 * Math.PI * 7;
   const ringPct = ctxTokens === 0 ? 0 : Math.max(ctxPct, 2);
   const offset = circumference * (1 - ringPct / 100);
@@ -545,6 +550,14 @@ export default function InputBox() {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      // IME guard (Chinese/Japanese/Korean input): the Enter that commits a
+      // candidate — and the legacy keyCode 229 the IME fires while composing —
+      // must not send the half-composed message, nor pick a slash command.
+      const native = e.nativeEvent as KeyboardEvent & { isComposing?: boolean };
+      if (native?.isComposing || (e as unknown as { keyCode?: number }).keyCode === 229) {
+        return;
+      }
+
       if (showSlashMenu && filteredCommands.length > 0) {
         if (e.key === 'ArrowDown') {
           e.preventDefault();
@@ -618,7 +631,10 @@ export default function InputBox() {
 
       if (e.key === 'Escape' && isStreaming) {
         e.preventDefault();
-        if (savedInputRef.current) {
+        // Only restore the sent text when the box is empty — the textarea stays
+        // editable while streaming, so anything typed meanwhile is a new draft
+        // the user would otherwise lose.
+        if (!input.trim() && savedInputRef.current) {
           setInput(savedInputRef.current);
           savedInputRef.current = '';
         }
@@ -658,7 +674,7 @@ export default function InputBox() {
   if (!activeSessionId) {
     return (
       <div className="p-4 border-t border-border bg-main">
-        <div className="text-center text-gray-500 text-sm">选择或创建对话以开始</div>
+        <div className="text-center text-muted text-[13px]">选择或创建对话以开始</div>
       </div>
     );
   }
@@ -678,8 +694,8 @@ export default function InputBox() {
           }}
         />
         <div
-          className={`bg-input border rounded-xl focus-within:border-gray-500 transition-colors relative ${
-            dragOver ? 'border-sky-500/70 bg-sky-500/5 ring-1 ring-sky-500/30' : 'border-border'
+          className={`panel relative transition-colors focus-within:border-accent/60 focus-within:ring-1 focus-within:ring-accent/25 ${
+            dragOver ? 'border-accent/70 bg-accent-soft ring-1 ring-accent/30' : ''
           }`}
           onDragOver={(e) => {
             e.preventDefault();
@@ -700,8 +716,8 @@ export default function InputBox() {
           onDrop={onDrop}
         >
           {dragOver && (
-            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-sky-500/10 border border-dashed border-sky-400/50">
-              <span className="text-xs text-sky-300 font-medium">松开以添加文件</span>
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-card bg-accent/10 border border-dashed border-accent/50">
+              <span className="text-[13px] text-accent font-medium">松开以添加文件</span>
             </div>
           )}
           {attachments.length > 0 && (
@@ -709,33 +725,40 @@ export default function InputBox() {
               {attachments.map((a) => (
                 <div
                   key={a.id}
-                  className="group flex items-center gap-1.5 max-w-[11rem] pl-1.5 pr-1 py-1 rounded-lg bg-card border border-border text-[11px] text-gray-300"
+                  className="group flex items-center gap-1.5 max-w-[11rem] pl-1.5 pr-1 py-1 rounded-control bg-main border border-border text-[11px] text-secondary"
                   title={a.path}
                 >
                   {a.kind === 'image' && a.previewUrl ? (
                     <img src={a.previewUrl} alt="" className="w-6 h-6 rounded object-cover shrink-0" />
                   ) : (
-                    <AttachmentKindIcon kind={a.kind} className="text-gray-500 shrink-0" size={14} />
+                    <AttachmentKindIcon kind={a.kind} className="text-muted shrink-0" size={14} />
                   )}
                   <span className="truncate font-mono">{a.name}</span>
                   <button
                     type="button"
-                    className="text-gray-600 hover:text-red-400 p-0.5 shrink-0"
+                    className="text-faint hover:text-danger p-0.5 shrink-0 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
                     onClick={() => removeAttachment(a.id)}
                     title="移除"
                   >
-                    <IconX size={12} />
+                    <IconClose16 size={12} />
                   </button>
                 </div>
               ))}
             </div>
           )}
           {attachError && (
-            <div className="px-3 pt-1.5 text-[11px] text-red-400/90">{attachError}</div>
+            <div className="px-3 pt-1.5 text-[11px] text-danger">{attachError}</div>
           )}
+          {/*
+            Left exactly as it was: 60px floor, 14px above the text and 4px
+            below. An earlier pass shortened this box and balanced its padding,
+            which was the wrong reading of "the bottom area is too tall" — that
+            was about the toolbar strip's share of the composer, not the input
+            box, and the input box's height is not mine to trade away.
+          */}
           <textarea
             ref={inputRef}
-            className="w-full bg-transparent text-sm text-gray-100 placeholder-gray-500 resize-none focus:outline-none px-4 pt-3.5 pb-1 min-h-[60px] max-h-60"
+            className="w-full bg-transparent text-[13px] text-primary placeholder-muted resize-none focus:outline-none px-4 pt-3.5 pb-1 min-h-[60px] max-h-60"
             placeholder="输入消息… 可拖入/粘贴/附加文件 · / 命令"
             rows={1}
             value={input}
@@ -746,15 +769,17 @@ export default function InputBox() {
 
           {/* Slash command + skill menu */}
           {showSlashMenu && (
-            <div className="px-3 pb-1">
+            <div
+              className="menu absolute left-2 right-2 bottom-full mb-2 z-50 overflow-hidden"
+              role="listbox"
+              aria-label="命令与 Skills"
+            >
               <div
                 ref={slashListRef}
-                className="border-t border-border pt-1 flex flex-col gap-0.5 max-h-56 overflow-y-auto"
-                role="listbox"
-                aria-label="命令与 Skills"
+                className="flex flex-col gap-0.5 p-1 max-h-56 overflow-y-auto"
               >
                 {filteredCommands.length === 0 ? (
-                  <div className="px-2 py-2 text-[11px] text-gray-600">无匹配命令或 Skill</div>
+                  <div className="px-2 py-2 text-[11px] text-muted">无匹配命令或 Skill</div>
                 ) : (
                   filteredCommands.map((c, i) => {
                     const selected = i === slashIndex;
@@ -767,40 +792,32 @@ export default function InputBox() {
                         type="button"
                         role="option"
                         aria-selected={selected}
-                        className={`flex items-center gap-2 px-2 py-1.5 rounded text-xs text-left transition-colors ${
+                        className={`flex items-center gap-2 px-2 py-1.5 rounded-control text-[13px] text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
                           selected
-                            ? 'bg-gray-600 text-gray-100'
-                            : 'text-gray-300 hover:bg-gray-700/80'
+                            ? 'bg-accent-soft text-primary'
+                            : 'text-secondary hover:bg-hover hover:text-primary'
                         }`}
                         onMouseEnter={() => setSlashIndex(i)}
                         onClick={() => selectSlashCommand(c.cmd)}
                       >
                         {c.kind === 'skill' ? (
-                          <SkillSparklesIcon
-                            className={`shrink-0 ${selected ? 'text-violet-300' : 'text-violet-400/80'}`}
+                          <IconSparkles16
+                            size={14}
+                            className={`shrink-0 ${selected ? 'text-accent' : 'text-muted'}`}
                           />
-                        ) : (
-                          <svg
-                            width="14"
-                            height="14"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.8"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            className={`shrink-0 ${selected ? 'text-gray-200' : 'text-gray-500'}`}
-                          >
-                            <path d={c.icon || ''} />
-                          </svg>
-                        )}
-                        <span className="font-mono text-gray-100 shrink-0">{c.cmd}</span>
+                        ) : c.icon ? (
+                          <c.icon
+                            size={14}
+                            className={`shrink-0 ${selected ? 'text-primary' : 'text-muted'}`}
+                          />
+                        ) : null}
+                        <span className="font-mono text-primary shrink-0">{c.cmd}</span>
                         {c.kind === 'skill' && (
-                          <span className="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-400/90 shrink-0">
+                          <span className="text-[11px] px-1.5 py-px rounded-full bg-accent/15 text-accent shrink-0">
                             skill
                           </span>
                         )}
-                        <span className={`truncate ${selected ? 'text-gray-300' : 'text-gray-500'}`}>
+                        <span className={`truncate ${selected ? 'text-secondary' : 'text-muted'}`}>
                           {c.desc}
                         </span>
                       </button>
@@ -809,7 +826,7 @@ export default function InputBox() {
                 )}
               </div>
               {filteredCommands.length > 0 && (
-                <div className="px-2 pt-0.5 pb-0.5 text-[10px] text-gray-600 flex gap-3">
+                <div className="px-2.5 py-1.5 border-t border-divider text-[11px] text-muted flex gap-3">
                   <span>↑↓ 选择</span>
                   <span>Enter / Tab 填入</span>
                   <span>Esc 关闭</span>
@@ -818,19 +835,32 @@ export default function InputBox() {
             </div>
           )}
 
-          <div className="flex items-center justify-between px-3 pb-2.5">
+          {/*
+            `py-1`, not `py-2`: this strip is the composer's "bottom area", and
+            at 8px of padding it was 45px — taller than the input box above it
+            is comfortable with, for a row whose tallest control is a 28px round
+            send button. 4px takes the strip to 37px, so it reads as a strip
+            under the input rather than a second panel.
+
+            4px is also the floor: below it the send button starts to collide
+            with the divider over it. Shrinking the button itself is the only
+            way past that, and a smaller hit target is not a trade this row
+            should make. The buttons' hit targets come from their own classes,
+            so this padding costs them nothing.
+          */}
+          <div className="flex items-center justify-between gap-2 px-3 py-1 border-t border-divider">
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                className="p-1 rounded-md text-gray-500 hover:text-gray-200 hover:bg-card transition-colors"
+                className="icon-btn disabled:opacity-40"
                 onClick={() => void pickFiles()}
                 title="附加文件（多选）"
                 disabled={isStreaming || !activeSessionId}
               >
-                <IconPaperclip size={15} />
+                <IconPaperclip16 size={15} />
               </button>
               <button
-                className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1 transition-colors max-w-32 truncate"
+                className="btn btn-ghost px-2 py-1 text-[11px] max-w-32 truncate"
                 onClick={async () => {
                   try {
                     const { open } = await import('@tauri-apps/plugin-dialog');
@@ -844,30 +874,17 @@ export default function InputBox() {
                 }}
                 title={workspace || '未设置工作区'}
               >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                >
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                </svg>
+                <IconFolder16 size={12} />
                 <span className="truncate">{workspace ? workspace.split('/').pop() : '...'}</span>
               </button>
 
               <div className="relative">
                 <button
-                  className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1 transition-colors max-w-[10rem] truncate"
+                  className="btn btn-ghost px-2 py-1 text-[11px] max-w-[10rem] truncate"
                   onClick={() => setShowModelPicker(!showModelPicker)}
                   title={`${activeModel} · ${activeProvider}`}
                 >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="12" r="3" />
-                    <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83" />
-                  </svg>
+                  <IconSun16 size={12} />
                   <span className="truncate">
                     {activeModel
                       ? modelDisplayName(activeModel, modelOptions)
@@ -875,23 +892,23 @@ export default function InputBox() {
                   </span>
                 </button>
                 {showModelPicker && (
-                  <div className="absolute bottom-full left-0 mb-2 w-64 max-h-56 overflow-y-auto bg-card border border-border rounded-lg shadow-xl z-50">
+                  <div className="menu absolute bottom-full left-0 mb-2 w-64 max-h-56 overflow-y-auto z-50">
                     {modelOptions.map((m) => (
                       <button
                         key={`${m.provider}:${m.id}`}
-                        className={`w-full text-left px-3 py-2 text-xs hover:bg-gray-700 transition-colors ${
+                        className={`w-full text-left px-3 py-2 text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
                           activeModel === m.id && activeProvider === m.provider
-                            ? 'text-gray-100 bg-gray-700'
-                            : 'text-gray-400'
+                            ? 'bg-accent-soft text-primary'
+                            : 'text-secondary hover:bg-hover hover:text-primary'
                         }`}
                         onClick={() => handleSelectModel(m)}
                       >
                         {m.label}
-                        <span className="text-gray-500 ml-2">({m.provider})</span>
+                        <span className="text-muted ml-2">({m.provider})</span>
                       </button>
                     ))}
                     {modelOptions.length === 0 && (
-                      <div className="px-3 py-2 text-[11px] text-gray-600">
+                      <div className="px-3 py-2 text-[11px] text-muted">
                         没有可选模型：设置里启用渠道并点「获取列表」扫描真实模型
                       </div>
                     )}
@@ -908,29 +925,28 @@ export default function InputBox() {
                 }%）\n按消息字符估算，含思考/工具输出`}
               >
                 <svg width="20" height="20" viewBox="0 0 20 20" className="-rotate-90">
-                  <circle cx="10" cy="10" r="7" fill="none" stroke="#2a2d35" strokeWidth="2.5" />
+                  <circle cx="10" cy="10" r="7" fill="none" className="stroke-border" strokeWidth="2.5" />
                   <circle
                     cx="10"
                     cy="10"
                     r="7"
                     fill="none"
-                    stroke={ctxColor}
+                    className={`${ctxStroke} transition-all duration-500`}
                     strokeWidth="2.5"
                     strokeDasharray={circumference}
                     strokeDashoffset={offset}
                     strokeLinecap="round"
-                    className="transition-all duration-500"
                   />
                 </svg>
-                <span className="absolute text-[6px] text-gray-400 font-mono leading-none">{ctxLabel}</span>
+                <span className="absolute text-[6px] text-secondary font-mono leading-none">{ctxLabel}</span>
               </div>
 
               <button
                 type="button"
-                className={`text-xs px-1.5 py-0.5 rounded transition-colors flex items-center gap-1 ${
+                className={`text-[11px] px-1.5 py-0.5 rounded-control transition-colors flex items-center gap-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
                   absoluteTrust
-                    ? 'text-amber-400 bg-amber-400/10'
-                    : 'text-gray-500 hover:text-gray-300'
+                    ? 'text-warning bg-warning/10'
+                    : 'text-muted hover:text-primary hover:bg-hover'
                 }`}
                 title={
                   absoluteTrust
@@ -950,87 +966,41 @@ export default function InputBox() {
                   void updateConfig({ absolute_trust: !absoluteTrust });
                 }}
               >
-                <svg
-                  width="12"
-                  height="12"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.8"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden
-                >
-                  {absoluteTrust ? (
-                    <>
-                      <rect x="3" y="11" width="18" height="11" rx="2" />
-                      <path d="M7 11V7a5 5 0 0 1 9.9-1" />
-                    </>
-                  ) : (
-                    <>
-                      <rect x="3" y="11" width="18" height="11" rx="2" />
-                      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                    </>
-                  )}
-                </svg>
+                {absoluteTrust ? <IconUnlock16 size={12} /> : <IconLock16 size={12} />}
                 <span>{absoluteTrust ? '信任' : '安全'}</span>
               </button>
 
               <button
-                className={`text-xs px-1.5 py-0.5 rounded transition-colors flex items-center gap-0.5 ${
-                  teamsMode ? 'text-purple-400 bg-purple-400/10' : 'text-gray-500 hover:text-gray-300'
+                className={`text-[11px] px-1.5 py-0.5 rounded-control transition-colors flex items-center gap-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${
+                  teamsMode ? 'text-accent bg-accent-soft' : 'text-muted hover:text-primary hover:bg-hover'
                 }`}
                 title={
                   teamsMode ? '关闭 Teams（本会话记住）' : '开启 Teams 多 Agent（本会话记住）'
                 }
                 onClick={toggleTeams}
               >
-                <svg
-                  width="10"
-                  height="10"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                  <circle cx="9" cy="7" r="4" />
-                  <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-                  <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-                </svg>
+                {/* 12, matching the lock and the send glyph beside it. At 10 the
+                    two heads and two shoulders of this one merged into a single
+                    smudge — it is the densest glyph in the row and needs the
+                    pixels the others do not. */}
+                <IconUsers16 size={12} />
                 <span>{teamsMode ? 'ON' : 'TEAM'}</span>
               </button>
 
               {isStreaming ? (
                 <button
-                  className="w-7 h-7 rounded-full bg-red-700 hover:bg-red-600 flex items-center justify-center shrink-0 transition-colors"
+                  className="btn w-7 h-7 rounded-full p-0 bg-danger/15 text-danger hover:bg-danger/25 shrink-0"
                   onClick={abortStream}
                 >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="4" y="4" width="16" height="16" rx="2" />
-                  </svg>
+                  <IconStop16 size={12} />
                 </button>
               ) : (
                 <button
-                  className="w-7 h-7 rounded-full bg-gray-600 hover:bg-gray-500 disabled:opacity-30 flex items-center justify-center shrink-0 transition-colors"
+                  className="btn btn-primary w-7 h-7 rounded-full p-0 disabled:opacity-30 shrink-0"
                   onClick={handleSend}
                   disabled={!input.trim() && attachments.length === 0}
                 >
-                  <svg
-                    width="12"
-                    height="12"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <line x1="22" y1="2" x2="11" y2="13" />
-                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
-                  </svg>
+                  <IconSend16 size={12} />
                 </button>
               )}
             </div>

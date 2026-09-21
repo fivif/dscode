@@ -6,11 +6,34 @@ license.workspace = true
 authors.workspace = true
 description = "DS Code"
 
+[features]
+# DO NOT REMOVE — `tauri build` enables this for production builds, and it is
+# what decides whether the frontend is embedded.
+#
+# `tauri`'s build script computes `dev = !custom_protocol`, and tauri-build turns
+# that into `cfg(dev)`, which tauri-codegen uses to choose between embedding
+# `frontendDist` and loading `build.devUrl` at runtime. With no such feature
+# declared, `dev` is always true: every build — including a release one — points
+# the webview at http://localhost:27463 and ships no frontend at all, so the app
+# only runs while Vite happens to be serving it. Deliberately *not* a default
+# feature, so `tauri dev` keeps its dev-server hot reload.
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `protocol-asset` is required by `app.security.assetProtocol` in tauri.conf.json
+# (used to display generated images). Two independent reasons, same shape as the
+# `custom-protocol` trap above:
+#   1. `tauri-build`'s manifest check diffs `AppConfig::features()` against this
+#      feature list and aborts the build when they disagree — with the asset
+#      protocol enabled, that list is exactly ["protocol-asset"].
+#   2. Even past the check, tauri's asset-protocol scope registration is behind
+#      `#[cfg(feature = "protocol-asset")]`, so without it the configured scope
+#      is never read and `convertFileSrc` URLs simply fail to load — no compile
+#      error, just broken images.
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"

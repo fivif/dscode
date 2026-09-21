@@ -1,6 +1,7 @@
 //! MCP tools exposed to the agent as normal registry tools (`mcp_<server>_<tool>`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -10,6 +11,18 @@ use super::trait_def::{Tool, ToolContext, ToolError, ToolResult};
 use crate::config::settings::{Config, McpServerConfig};
 use crate::extensions::mcp::{McpClient, McpConnection, McpToolDef};
 use crate::tools::registry::ToolRegistry;
+
+/// How long a tool call waits for the per-server connection lock.
+///
+/// `execute` holds the connection guard across the whole `tools/call`, so a
+/// hung call blocks every other tool on the same server. Without a bound, N
+/// queued calls serialize into N × call-timeout and the agent looks frozen —
+/// failing fast with "server busy" is far more useful.
+///
+/// (Real per-request concurrency is possible in JSON-RPC — ids allow it — but
+/// needs a reader-demux task: `send_request_timeout` currently reads stdout
+/// itself and discards messages for other ids.)
+const CONN_LOCK_WAIT: Duration = Duration::from_secs(120);
 
 /// Sanitize server/tool name segments for registry keys.
 fn sanitize_segment(s: &str) -> String {
@@ -92,7 +105,16 @@ impl Tool for McpProxyTool {
         args: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let mut guard = self.conn.lock().await;
+        let mut guard = match tokio::time::timeout(CONN_LOCK_WAIT, self.conn.lock()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(ToolError::Internal(format!(
+                    "MCP server '{}' is busy: another call held the connection for over {}s",
+                    self.server_name,
+                    CONN_LOCK_WAIT.as_secs()
+                )))
+            }
+        };
         if !guard.is_alive() {
             return Err(ToolError::Internal(format!(
                 "MCP server '{}' is not running",

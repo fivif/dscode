@@ -106,7 +106,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     let model_rect = Rect {
         x: area.x + 1,
         y: area.y,
-        width: (state.model_name.len() + 2) as u16,
+        width: (state.model_name.chars().count() + 2) as u16,
         height: 1,
     };
     let model_paragraph = Paragraph::new(Span::styled(

@@ -55,29 +55,14 @@ impl ErrorWithholder {
     }
 
     /// Check whether a [`ProviderError`] is transient and therefore retryable.
+    ///
+    /// Delegates to [`ProviderError::is_retryable`] — the single source of truth
+    /// for this policy. This file used to carry its own copy with a narrower
+    /// word list and no arm for the newer variants, which is exactly how two
+    /// call sites end up disagreeing about whether the same failure is worth
+    /// retrying.
     pub fn is_retryable(error: &ProviderError) -> bool {
-        match error {
-            ProviderError::Api { status, message } => {
-                matches!(*status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
-                    || message_looks_transient(message)
-            }
-            ProviderError::Http(e) => {
-                let lower = e.to_lowercase();
-                lower.contains("timeout")
-                    || lower.contains("timed out")
-                    || lower.contains("connection")
-                    || lower.contains("reset")
-                    || lower.contains("broken pipe")
-                    || lower.contains("temporarily")
-                    || lower.contains("429")
-                    || lower.contains("502")
-                    || lower.contains("503")
-                    || lower.contains("504")
-                    || lower.contains("529")
-            }
-            // Parse errors and missing keys are permanent — don't retry.
-            ProviderError::Parse(_) | ProviderError::NoApiKey | ProviderError::StreamInterrupted(_) => false,
-        }
+        error.is_retryable()
     }
 
     /// Evaluate a provider error.
@@ -128,16 +113,6 @@ impl ErrorWithholder {
     pub async fn sleep_backoff(&self) {
         sleep(self.current_backoff()).await;
     }
-}
-
-fn message_looks_transient(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    lower.contains("rate limit")
-        || lower.contains("overloaded")
-        || lower.contains("timeout")
-        || lower.contains("temporarily")
-        || lower.contains("try again")
-        || lower.contains("capacity")
 }
 
 impl Default for ErrorWithholder {
@@ -212,6 +187,15 @@ mod tests {
     fn test_non_retryable_no_api_key() {
         let err = ProviderError::NoApiKey;
         assert!(!ErrorWithholder::is_retryable(&err));
+    }
+
+    #[test]
+    fn test_stream_interrupted_is_retryable() {
+        // The provider contract says a cut stream may be retried by the agent.
+        let err = ProviderError::StreamInterrupted("connection reset".into());
+        assert!(ErrorWithholder::is_retryable(&err));
+        let mut wh = ErrorWithholder::new();
+        assert!(wh.tolerate(err).is_ok(), "first interruption should retry");
     }
 
     #[test]

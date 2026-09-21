@@ -286,25 +286,40 @@ impl TaskBoard {
         Ok(())
     }
 
-    /// deps Failed/Cancelled → Blocked for still-Pending tasks.
+    /// deps Failed/Cancelled/Blocked → Blocked for still-Pending tasks.
+    ///
+    /// Iterated to a fixpoint so blocking cascades: `t1` fails → `t2` becomes
+    /// Blocked → `t3` (deps: t2) must also become Blocked rather than staying
+    /// Pending forever (which the scheduler reports as an eternal PENDING).
     pub fn refresh_blocked(&mut self) {
         let now = chrono::Utc::now().timestamp();
-        let terminal_fail: HashSet<String> = self
-            .tasks
-            .iter()
-            .filter(|(_, t)| {
-                matches!(t.status, TaskStatus::Failed | TaskStatus::Cancelled)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        loop {
+            // Blocked counts as a terminal failure for propagation purposes.
+            let terminal_fail: HashSet<String> = self
+                .tasks
+                .iter()
+                .filter(|(_, t)| {
+                    matches!(
+                        t.status,
+                        TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Blocked
+                    )
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
 
-        for t in self.tasks.values_mut() {
-            if t.status != TaskStatus::Pending {
-                continue;
+            let mut changed = false;
+            for t in self.tasks.values_mut() {
+                if t.status != TaskStatus::Pending {
+                    continue;
+                }
+                if t.dependencies.iter().any(|d| terminal_fail.contains(d)) {
+                    t.status = TaskStatus::Blocked;
+                    t.updated_at = now;
+                    changed = true;
+                }
             }
-            if t.dependencies.iter().any(|d| terminal_fail.contains(d)) {
-                t.status = TaskStatus::Blocked;
-                t.updated_at = now;
+            if !changed {
+                break;
             }
         }
     }
@@ -446,7 +461,7 @@ mod tests {
     #[test]
     fn parallel_layers_and_cycle() {
         let mut b = TaskBoard::new("s");
-        let mut t1 = TaskSpec::new("1", "1", "p", AgentRole::Implement);
+        let t1 = TaskSpec::new("1", "1", "p", AgentRole::Implement);
         let mut t2 = TaskSpec::new("2", "2", "p", AgentRole::Implement);
         t2.dependencies = vec!["1".into()];
         b.upsert(t1).unwrap();
@@ -479,5 +494,24 @@ mod tests {
         b.claim("a", "x").unwrap();
         b.mark_failed("a", "boom".into()).unwrap();
         assert_eq!(b.get("c").unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn blocking_cascades_to_grandchildren() {
+        let mut b = TaskBoard::new("s");
+        let t1 = TaskSpec::new("t1", "T1", "p", AgentRole::Implement);
+        let mut t2 = TaskSpec::new("t2", "T2", "p", AgentRole::Implement);
+        t2.dependencies = vec!["t1".into()];
+        let mut t3 = TaskSpec::new("t3", "T3", "p", AgentRole::Implement);
+        t3.dependencies = vec!["t2".into()];
+        b.upsert(t1).unwrap();
+        b.upsert(t2).unwrap();
+        b.upsert(t3).unwrap();
+        b.claim("t1", "x").unwrap();
+        b.mark_failed("t1", "boom".into()).unwrap();
+        assert_eq!(b.get("t2").unwrap().status, TaskStatus::Blocked);
+        // Grandchild must not stay Pending forever.
+        assert_eq!(b.get("t3").unwrap().status, TaskStatus::Blocked);
+        assert!(b.all_terminal());
     }
 }

@@ -4,8 +4,8 @@
 //! driven by phase + project snapshot + prior answers — not a fixed question bank.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tracing::info;
+use std::path::{Path, PathBuf};
+use tracing::{error, info, warn};
 
 use super::llm_interview::{
     next_llm_turn, project_snapshot, LlmInterviewAction, PendingQuestion,
@@ -14,6 +14,25 @@ use super::phases::{PlanPhase, PlanState};
 use super::prd::{PrdDocument, PrdError, PrdGenerator};
 use crate::agent::stream::StreamEvent;
 use crate::providers::trait_def::LlmProvider;
+
+/// On-disk format version of [`ActivePlanSession`].
+///
+/// Bump this whenever the serialized shape changes incompatibly (a field
+/// renamed or removed, a `PlanPhase` variant renamed, …). A file written by a
+/// newer build is then reported as an error instead of silently collapsing to
+/// "no active plan" — which used to make an in-progress interview disappear on
+/// upgrade with nothing to show the user.
+pub const PLAN_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    PLAN_SCHEMA_VERSION
+}
+
+/// An interview file untouched for longer than this is treated as abandoned.
+///
+/// Without a TTL, a user who starts `/plan`, quits, and comes back the next day
+/// has their first ordinary message consumed as the answer to a stale question.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
 /// Result of one plan turn (start or answer).
 #[derive(Debug, Clone)]
@@ -56,6 +75,10 @@ pub struct ActivePlanSession {
     /// Cached project snapshot (rebuilt if empty on load).
     #[serde(default)]
     pub project_snapshot: String,
+    /// On-disk format version; see [`PLAN_SCHEMA_VERSION`]. Files written
+    /// before the field existed default to the current version.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
 }
 
 impl ActivePlanSession {
@@ -72,24 +95,152 @@ impl ActivePlanSession {
     }
 
     /// Load an active plan for this chat session, if any.
+    ///
+    /// A file that exists but is unusable (truncated/corrupt JSON, a future
+    /// schema version, or a stale session) is **not** silently ignored: it is
+    /// logged at error level. Use [`Self::load_strict`] to react to it
+    /// programmatically.
     pub fn load(session_id: &str) -> Option<Self> {
-        let path = Self::path_for(session_id).ok()?;
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        match Self::load_strict(session_id) {
+            Ok(session) => session,
+            Err(e) => {
+                error!(session = %session_id, %e, "plan interview could not be loaded");
+                None
+            }
+        }
+    }
+
+    /// Load an active plan, distinguishing "absent" from "unusable".
+    ///
+    /// * `Ok(None)` — there is no interview to resume.
+    /// * `Ok(Some)` — a valid, fresh interview.
+    /// * `Err`      — a file exists but cannot be used. Callers that only need
+    ///   a yes/no answer should use [`Self::load`], which logs this.
+    ///
+    /// This is what makes a torn write visible: the old `load()` collapsed
+    /// *every* failure mode into `None`, so a partially written file looked
+    /// exactly like "no interview in progress".
+    pub fn load_strict(session_id: &str) -> Result<Option<Self>, String> {
+        let path = Self::path_for(session_id)?;
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        if data.trim().is_empty() {
+            return Err(format!(
+                "{} is empty — the previous write did not complete",
+                path.display()
+            ));
+        }
+        let session: Self = serde_json::from_str(&data)
+            .map_err(|e| format!("{} is corrupt: {e}", path.display()))?;
+        if session.schema_version > PLAN_SCHEMA_VERSION {
+            return Err(format!(
+                "{} uses plan schema v{} but this build understands v{} — upgrade dscode to resume it",
+                path.display(),
+                session.schema_version,
+                PLAN_SCHEMA_VERSION
+            ));
+        }
+        if let Some(age) = Self::age_of(&path) {
+            if age > SESSION_TTL {
+                return Err(format!(
+                    "{} was last updated {}h ago (TTL {}h) — treating the interview as abandoned",
+                    path.display(),
+                    age.as_secs() / 3600,
+                    SESSION_TTL.as_secs() / 3600
+                ));
+            }
+        }
+        Ok(Some(session))
+    }
+
+    /// How long ago the file backing a session was last written.
+    fn age_of(path: &Path) -> Option<std::time::Duration> {
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+        std::time::SystemTime::now().duration_since(modified).ok()
     }
 
     /// Persist this plan session.
+    ///
+    /// Writes a temporary file and renames it over the target: `fs::write`
+    /// opens with `CREATE_ALWAYS`, so a crash (or power loss) between truncate
+    /// and write used to leave a 0-byte file where the interview used to be.
     pub fn save(&self) -> Result<(), String> {
         let path = Self::path_for(&self.session_id)?;
         let data =
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize plan: {e}"))?;
-        std::fs::write(path, data).map_err(|e| format!("write plan: {e}"))
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &data).map_err(|e| format!("write plan tmp: {e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("replace plan file: {e}")
+        })
     }
 
     /// Remove active plan state for a session.
     pub fn clear(session_id: &str) {
         if let Ok(path) = Self::path_for(session_id) {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+        }
+    }
+
+    /// Cancel an in-progress interview, returning the terminal turn result.
+    ///
+    /// `/plan cancel` in `agent/forge.rs` currently calls [`Self::clear`]
+    /// directly, so [`PlanTurnResult::Cancelled`] is never constructed and the
+    /// UI gets a hand-written string instead of a real result object. This is
+    /// the drop-in replacement for that call site.
+    pub fn cancel(session_id: &str) -> PlanTurnResult {
+        Self::clear(session_id);
+        PlanTurnResult::Cancelled
+    }
+
+    /// Move an existing interview file to `<session>.json.bak` so that
+    /// replacing it is recoverable.
+    ///
+    /// Returns the backup path when there was something to preserve.
+    fn snapshot_existing(session_id: &str) -> Option<PathBuf> {
+        let path = Self::path_for(session_id).ok()?;
+        if !path.exists() {
+            return None;
+        }
+        let backup = path.with_extension("json.bak");
+        match std::fs::rename(&path, &backup) {
+            Ok(()) => {
+                warn!(
+                    path = %path.display(),
+                    backup = %backup.display(),
+                    "starting a new /plan interview over an existing one — previous answers kept as .bak"
+                );
+                Some(backup)
+            }
+            Err(e) => {
+                error!(
+                    %e,
+                    path = %path.display(),
+                    "could not back up the existing plan interview; it will be overwritten"
+                );
+                None
+            }
+        }
+    }
+
+    /// Undo [`Self::snapshot_existing`] after a failed restart.
+    fn restore_backup(session_id: &str, backup: &Path) {
+        match Self::path_for(session_id) {
+            Ok(path) => {
+                if let Err(e) = std::fs::rename(backup, &path) {
+                    error!(
+                        %e,
+                        backup = %backup.display(),
+                        "could not restore the previous plan interview (it is still on disk)"
+                    );
+                }
+            }
+            Err(e) => error!(%e, backup = %backup.display(), "could not restore plan interview"),
         }
     }
 
@@ -106,13 +257,22 @@ impl ActivePlanSession {
         working_dir: PathBuf,
         progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
     ) -> Result<(Self, PlanTurnResult), String> {
-        Self::clear(session_id);
-
-        let task_id = uuid::Uuid::new_v4().to_string();
+        // Validate *before* touching on-disk state: an empty goal must not be
+        // able to destroy the interview that is already in progress.
         let title: String = user_goal.chars().take(80).collect();
         if title.trim().is_empty() {
             return Err("Usage: /plan <describe what you want to build>".into());
         }
+
+        // Replacing an active interview is destructive, and this path is
+        // reachable with something that is not really a restart: answering
+        // "What should the CLI subcommand be?" with `/plan status` lands here
+        // (the command check in forge.rs is a `starts_with`). Keep the previous
+        // answers as `<session>.json.bak` — one file per session, discoverable —
+        // and restore them if the new interview fails to start.
+        let backup = Self::snapshot_existing(session_id);
+
+        let task_id = uuid::Uuid::new_v4().to_string();
 
         if let Some(tx) = progress {
             let _ = tx.send(StreamEvent::Token {
@@ -140,6 +300,7 @@ impl ActivePlanSession {
             current_question: None,
             questions_in_phase: 0,
             project_snapshot: snapshot,
+            schema_version: PLAN_SCHEMA_VERSION,
         };
 
         if let Some(tx) = progress {
@@ -148,8 +309,24 @@ impl ActivePlanSession {
             });
         }
 
-        let result = session.drive_llm(provider, progress).await?;
-        session.persist_for_result(&result)?;
+        let result = match session.drive_llm(provider, progress).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Nothing was started — put the previous interview back.
+                if let Some(backup) = &backup {
+                    Self::restore_backup(session_id, backup);
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = session.persist_for_result(&result) {
+            if let Some(backup) = &backup {
+                Self::restore_backup(session_id, backup);
+            }
+            return Err(e);
+        }
+        // On success the `.bak` is left in place on purpose: it is the only copy
+        // of the interview that was just replaced.
         Ok((session, result))
     }
 
@@ -170,7 +347,13 @@ impl ActivePlanSession {
             .clone()
             .ok_or_else(|| "No pending question — restart with /plan <goal>".to_string())?;
 
-        let final_answer = if answer.eq_ignore_ascii_case("y")
+        // `format_question` prints the options as `1. …`, and a bare number is
+        // the only affordance the TUI offers — but nothing used to resolve it,
+        // so `qa_history` recorded the literal "2" and the model (and the PRD's
+        // Context block) never learned which option that was.
+        let final_answer = if let Some(option) = resolve_numbered_option(answer, &pending.options) {
+            option
+        } else if answer.eq_ignore_ascii_case("y")
             || answer.eq_ignore_ascii_case("yes")
             || answer.eq_ignore_ascii_case("ok")
             || answer == "推荐"
@@ -310,25 +493,34 @@ impl ActivePlanSession {
         &mut self,
         progress: Option<&tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
     ) -> Result<PlanTurnResult, String> {
+        // A model that answers `complete` on the very first turn (small/fast
+        // models do) would otherwise emit a full PRD having asked the user
+        // nothing at all. Require at least one recorded answer.
+        if self.qa_history.is_empty() {
+            warn!(
+                phase = ?self.plan_state.phase,
+                "plan interview reached PRD generation with no answers — refusing"
+            );
+            return Err(
+                "plan interview recorded no answers — refusing to write a PRD; \
+                 restart with /plan <goal>"
+                    .into(),
+            );
+        }
         if let Some(tx) = progress {
             let _ = tx.send(StreamEvent::Token {
                 content: "_访谈完成，正在生成 PRD…_\n".into(),
             });
         }
         let generator = PrdGenerator::new(self.working_dir.clone());
+        // The guard above guarantees at least one answer, so prefixing the goal
+        // always yields >= 2 pairs and `PrdGenerator::generate` always finds a
+        // goal question ("What is the overall goal?") to extract.
         let mut answers = self.qa_history.clone();
         answers.insert(
             0,
             ("What is the overall goal?".into(), self.user_goal.clone()),
         );
-
-        // Ensure at least one goal-like answer so PrdGenerator::generate succeeds
-        if answers.len() == 1 {
-            answers.push((
-                "Primary deliverable".into(),
-                self.user_goal.clone(),
-            ));
-        }
 
         let prd = generator
             .generate(&answers, &self.task_id, &self.title)
@@ -350,6 +542,18 @@ impl ActivePlanSession {
             markdown,
         })
     }
+}
+
+/// Map a bare option number (`"2"`) onto the option text it labelled.
+///
+/// Returns `None` for anything that is not a 1-based in-range integer, so free
+/// text (including a number written as prose) is recorded verbatim.
+fn resolve_numbered_option(answer: &str, options: &[String]) -> Option<String> {
+    let n: usize = answer.trim().parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    options.get(n - 1).cloned()
 }
 
 /// Render a PRD as markdown for the chat UI.
@@ -412,7 +616,7 @@ pub fn format_question(result: &PlanTurnResult) -> String {
         } => {
             let mut out = String::new();
             out.push_str(&format!("## /plan — {}\n\n", phase.label()));
-            out.push_str("_Auto interview — one question at a time. Use the buttons below or type a custom answer._\n\n");
+            out.push_str("_Auto interview — one question at a time. Reply with an option number, use the buttons below, or type a custom answer._\n\n");
             if !auto_notes.is_empty() {
                 out.push_str("### Notes from project context\n\n");
                 for n in auto_notes {

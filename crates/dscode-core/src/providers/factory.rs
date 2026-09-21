@@ -9,28 +9,40 @@ use crate::config::settings::Config;
 /// Create an [`LlmProvider`] for the given model using the app config.
 ///
 /// Routing rules:
-/// - `anthropic/*` or `claude-*` → native Anthropic Messages API
 /// - `api_format = "responses"` channel → OpenAI Responses API (DeepSeek /responses)
+/// - `anthropic` channel, `anthropic/*` or `claude-*` → native Anthropic Messages API
 /// - everything else (DeepSeek / OpenAI / Ollama / custom) → OpenAI-compatible
+///
+/// A channel with `enabled = false` never routes, whatever its key looks like.
 pub fn create_provider(model: &str, conf: &Config) -> Result<Box<dyn LlmProvider>, ProviderError> {
+    let channel = conf.provider_key_for_model(model);
     let pc = conf
         .provider_for_model(model)
         .ok_or(ProviderError::NoApiKey)?;
 
-    if pc.api_key.trim().is_empty() && !model.starts_with("ollama/") {
+    if !pc.enabled {
+        return Err(ProviderError::Disabled(format!(
+            "the '{channel}' provider channel is disabled \
+             ([providers.{channel}] enabled = false)"
+        )));
+    }
+
+    // Ollama needs no API key; every other channel does.
+    if pc.api_key.trim().is_empty() && channel != "ollama" && !model.starts_with("ollama/") {
         return Err(ProviderError::NoApiKey);
     }
 
-    let is_anthropic = model.starts_with("anthropic/")
+    let is_anthropic = channel == "anthropic"
+        || model.starts_with("anthropic/")
         || model.starts_with("claude-")
         || pc.base_url.contains("anthropic.com");
 
     let use_responses = pc.api_format.trim().eq_ignore_ascii_case("responses");
 
-    if is_anthropic {
-        Ok(Box::new(AnthropicProvider::from_config(model, conf)))
-    } else if use_responses {
+    if use_responses {
         Ok(Box::new(ResponsesProvider::from_config(model, conf)))
+    } else if is_anthropic {
+        Ok(Box::new(AnthropicProvider::from_config(model, conf)))
     } else {
         Ok(Box::new(OpenAiProvider::from_config(model, conf)))
     }
